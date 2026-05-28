@@ -1,0 +1,12 @@
+{
+  "name": "kaycomm-mcp",
+  "version": "2.0.0",
+  "description": "KayComm Google Ads + Meta + GA4 MCP Server",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0"
+  }
+}
