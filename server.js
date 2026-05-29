@@ -47,6 +47,8 @@ const META_ACCOUNTS = {
     "act_6128243883951018": { name: "Warrior Advocates",    budget: 300  },
     "act_866700669704203":  { name: "Spartan Exteriors",    budget: 1000 },
     "act_482088457883195":  { name: "Summit Express",       budget: 0    },
+    // Two flights: Revive Day $425 (May 25–Jun 4), Domestic Abuse Training $1,020 (May 25–Jun 5)
+    "act_1527255801416040": { name: "Florida DOH Monroe County", budget: 1445, flight_end: "2026-06-05" },
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
