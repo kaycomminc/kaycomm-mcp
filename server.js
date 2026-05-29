@@ -1160,19 +1160,23 @@ async function getGoogleAccountSpend(token, customerId, mccId) {
     } catch (_) { return 0; }
 }
 
+function googleAdsError(data) {
+    return data?.error?.details?.[0]?.errors?.[0]?.message
+        || data?.error?.message
+        || JSON.stringify(data);
+}
+
 async function addKeywordsToAdGroup(token, customerId, mccId, adGroupResourceName, keywords) {
-    // Add keywords to an existing ad group (separate call, uses real resource name)
-    const mutateOperations = keywords.map(kw => ({
-        adGroupCriterionOperation: {
-            create: {
-                adGroup: adGroupResourceName,
-                keyword: { text: kw.text, matchType: (kw.match_type || "EXACT").toUpperCase() },
-                status:  "ENABLED",
-            },
+    // Use service-level adGroupCriteria:mutate endpoint (different format from batch googleAds:mutate)
+    const operations = keywords.map(kw => ({
+        create: {
+            adGroup: adGroupResourceName,
+            status:  "ENABLED",
+            keyword: { text: kw.text, matchType: (kw.match_type || "EXACT").toUpperCase() },
         },
     }));
     const resp = await fetchFn(
-        `https://googleads.googleapis.com/${GOOGLE_API_VERSION}/customers/${customerId}/googleAds:mutate`,
+        `https://googleads.googleapis.com/${GOOGLE_API_VERSION}/customers/${customerId}/adGroupCriteria:mutate`,
         {
             method: "POST",
             headers: {
@@ -1181,18 +1185,18 @@ async function addKeywordsToAdGroup(token, customerId, mccId, adGroupResourceNam
                 "login-customer-id": mccId,
                 "Content-Type":      "application/json",
             },
-            body: JSON.stringify({ mutateOperations }),
+            body: JSON.stringify({ operations }),
         }
     );
     const data = await resp.json();
-    if (!resp.ok) throw new Error(data?.error?.message || JSON.stringify(data));
-    return (data.mutateOperationResponses || []).map(r => r.adGroupCriterionResult?.resourceName).filter(Boolean);
+    if (!resp.ok) throw new Error(googleAdsError(data));
+    return (data.results || []).map(r => r.resourceName).filter(Boolean);
 }
 
 async function addRSAToAdGroup(token, customerId, mccId, adGroupResourceName, headlines, descriptions, finalUrl) {
-    // Add a responsive search ad to an existing ad group
+    // Use service-level adGroupAds:mutate endpoint
     const resp = await fetchFn(
-        `https://googleads.googleapis.com/${GOOGLE_API_VERSION}/customers/${customerId}/googleAds:mutate`,
+        `https://googleads.googleapis.com/${GOOGLE_API_VERSION}/customers/${customerId}/adGroupAds:mutate`,
         {
             method: "POST",
             headers: {
@@ -1202,17 +1206,15 @@ async function addRSAToAdGroup(token, customerId, mccId, adGroupResourceName, he
                 "Content-Type":      "application/json",
             },
             body: JSON.stringify({
-                mutateOperations: [{
-                    adGroupAdOperation: {
-                        create: {
-                            adGroup: adGroupResourceName,
-                            status:  "ENABLED",
-                            ad: {
-                                finalUrls: [finalUrl],
-                                responsiveSearchAd: {
-                                    headlines:    headlines.map(h => ({ text: h.text, ...(h.pinned_field ? { pinnedField: h.pinned_field } : {}) })),
-                                    descriptions: descriptions.map(d => ({ text: d.text, ...(d.pinned_field ? { pinnedField: d.pinned_field } : {}) })),
-                                },
+                operations: [{
+                    create: {
+                        adGroup: adGroupResourceName,
+                        status:  "ENABLED",
+                        ad: {
+                            finalUrls: [finalUrl],
+                            responsiveSearchAd: {
+                                headlines:    headlines.map(h => ({ text: h.text, ...(h.pinned_field ? { pinnedField: h.pinned_field } : {}) })),
+                                descriptions: descriptions.map(d => ({ text: d.text, ...(d.pinned_field ? { pinnedField: d.pinned_field } : {}) })),
                             },
                         },
                     },
@@ -1221,8 +1223,8 @@ async function addRSAToAdGroup(token, customerId, mccId, adGroupResourceName, he
         }
     );
     const data = await resp.json();
-    if (!resp.ok) throw new Error(data?.error?.message || JSON.stringify(data));
-    return (data.mutateOperationResponses || [])[0]?.adGroupAdResult?.resourceName;
+    if (!resp.ok) throw new Error(googleAdsError(data));
+    return (data.results || [])[0]?.resourceName;
 }
 
 async function createAdGroupInCampaign(token, customerId, mccId, campaignResourceName, config) {
@@ -1230,9 +1232,9 @@ async function createAdGroupInCampaign(token, customerId, mccId, campaignResourc
     // Creates ad group first, then keywords and RSA in separate calls (more reliable than one big batch)
     const status = (config.status || "PAUSED").toUpperCase();
 
-    // Step 1: Create the ad group
+    // Step 1: Create the ad group via service endpoint
     const agResp = await fetchFn(
-        `https://googleads.googleapis.com/${GOOGLE_API_VERSION}/customers/${customerId}/googleAds:mutate`,
+        `https://googleads.googleapis.com/${GOOGLE_API_VERSION}/customers/${customerId}/adGroups:mutate`,
         {
             method: "POST",
             headers: {
@@ -1242,17 +1244,13 @@ async function createAdGroupInCampaign(token, customerId, mccId, campaignResourc
                 "Content-Type":      "application/json",
             },
             body: JSON.stringify({
-                mutateOperations: [{
-                    adGroupOperation: {
-                        create: { name: config.name, campaign: campaignResourceName, status },
-                    },
-                }],
+                operations: [{ create: { name: config.name, campaign: campaignResourceName, status } }],
             }),
         }
     );
     const agData = await agResp.json();
-    if (!agResp.ok) throw new Error(agData?.error?.message || JSON.stringify(agData));
-    const agResource = agData.mutateOperationResponses?.[0]?.adGroupResult?.resourceName;
+    if (!agResp.ok) throw new Error(googleAdsError(agData));
+    const agResource = agData.results?.[0]?.resourceName;
     if (!agResource) throw new Error("Ad group created but no resource name returned");
 
     // Step 2: Add keywords (separate call with real resource name)
