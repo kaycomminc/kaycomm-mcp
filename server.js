@@ -37,7 +37,7 @@ const GOOGLE_ACCOUNTS = {
     "8459391760": { name: "Outside The Breadbox",    budget: 375,  mcc: "7631184147" },
     "1481569045": { name: "Woca Woodcare",           budget: 2500, mcc: "7631184147" },
     "2696762909": { name: "Warrior Advocates",       budget: 300,  mcc: "8621281595", ga4: "14591178781" },
-    "8184463966": { name: "Spartan Exteriors",       budget: 2000, mcc: "8184463966" },
+    "8184463966": { name: "Spartan Exteriors",       budget: 500,  mcc: "8184463966", budget_schedule: [{ from: "2026-06-01", budget: 2000 }] },
     "6631800329": { name: "Summit Express",          budget: 0,    mcc: "7631184147" },
     "2275371078": { name: "Childrens Therapy Services of Colorado", budget: 1000, mcc: "7631184147" },
 };
@@ -53,6 +53,27 @@ const META_ACCOUNTS = {
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+// Resolve an account's budget (and nc_budget) for a given date, honoring an
+// optional budget_schedule. Schedule entries: [{ from: "YYYY-MM-DD", budget, nc_budget? }]
+// The latest entry whose `from` is on or before `today` wins; otherwise the base budget.
+function getEffectiveBudget(info, today) {
+    let budget    = info.budget;
+    let ncBudget  = info.nc_budget;
+    let effective = null;
+    if (Array.isArray(info.budget_schedule)) {
+        const applicable = info.budget_schedule
+            .filter(s => s.from <= today)
+            .sort((a, b) => a.from.localeCompare(b.from));
+        for (const s of applicable) {
+            if (s.budget    != null) budget   = s.budget;
+            if (s.nc_budget != null) ncBudget = s.nc_budget;
+            effective = s.from;
+        }
+    }
+    return { budget, nc_budget: ncBudget, effective_from: effective };
+}
+
 function getPacingLabel(spent, budget, dom, dim) {
     if (!budget) return { status: "no_cap" };
     const expected    = budget * (dom / dim);
@@ -158,19 +179,20 @@ async function fetchMetaMTD(accountId) {
 }
 
 // ── Row builders ──────────────────────────────────────────────────────────────
-async function buildGoogleRows(token, dom, dim) {
+async function buildGoogleRows(token, dom, dim, today) {
     const rows = [];
     for (const [cid, info] of Object.entries(GOOGLE_ACCOUNTS)) {
-        if (info.nc_budget) {
+        const { budget, nc_budget } = getEffectiveBudget(info, today);
+        if (nc_budget) {
             // Boulevard Carroll: show total + NC/non-NC split
             const { nc, other, error } = await fetchGoogleMTDbyNC(token, cid, info.mcc);
             if (error) { rows.push({ account: info.name, error }); continue; }
-            const total      = nc + other;
-            const ncBudget   = info.nc_budget;
-            const otherBudget = info.budget - ncBudget;
+            const total       = nc + other;
+            const ncBudget    = nc_budget;
+            const otherBudget = budget - ncBudget;
             rows.push({
                 account: info.name, mtd_spend: Math.round(total * 100) / 100,
-                budget: info.budget, ...getPacingLabel(total, info.budget, dom, dim),
+                budget, ...getPacingLabel(total, budget, dom, dim),
                 breakdown: {
                     nc:    { spend: Math.round(nc * 100) / 100,    budget: ncBudget,    ...getPacingLabel(nc, ncBudget, dom, dim) },
                     other: { spend: Math.round(other * 100) / 100, budget: otherBudget, ...getPacingLabel(other, otherBudget, dom, dim) },
@@ -181,21 +203,22 @@ async function buildGoogleRows(token, dom, dim) {
             if (error) { rows.push({ account: info.name, error }); continue; }
             rows.push({
                 account: info.name, mtd_spend: Math.round(spend * 100) / 100,
-                budget: info.budget, ...getPacingLabel(spend, info.budget, dom, dim),
+                budget, ...getPacingLabel(spend, budget, dom, dim),
             });
         }
     }
     return rows;
 }
 
-async function buildMetaRows(dom, dim) {
+async function buildMetaRows(dom, dim, today) {
     const rows = [];
     for (const [id, info] of Object.entries(META_ACCOUNTS)) {
+        const { budget } = getEffectiveBudget(info, today);
         const { spend, error } = await fetchMetaMTD(id);
         if (error) { rows.push({ account: info.name, error }); continue; }
         rows.push({
             account: info.name, mtd_spend: Math.round(spend * 100) / 100,
-            budget: info.budget, ...getPacingLabel(spend, info.budget, dom, dim),
+            budget, ...getPacingLabel(spend, budget, dom, dim),
         });
     }
     return rows;
@@ -1894,15 +1917,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     if (name === "get_google_pacing") {
         const { token, error } = await getGoogleAccessToken();
         if (error) return { content: [{ type: "text", text: JSON.stringify({ error: `Auth failed: ${error}` }) }] };
-        result = { date: today, day: dom, days_in_month: dim, platform: "Google Ads", accounts: await buildGoogleRows(token, dom, dim) };
+        result = { date: today, day: dom, days_in_month: dim, platform: "Google Ads", accounts: await buildGoogleRows(token, dom, dim, today) };
 
     } else if (name === "get_meta_pacing") {
-        result = { date: today, day: dom, days_in_month: dim, platform: "Meta", accounts: await buildMetaRows(dom, dim) };
+        result = { date: today, day: dom, days_in_month: dim, platform: "Meta", accounts: await buildMetaRows(dom, dim, today) };
 
     } else if (name === "get_full_pacing") {
         const { token, error } = await getGoogleAccessToken();
-        const googleRows = error ? [{ error: `Auth failed: ${error}` }] : await buildGoogleRows(token, dom, dim);
-        result = { date: today, day: dom, days_in_month: dim, google: googleRows, meta: await buildMetaRows(dom, dim) };
+        const googleRows = error ? [{ error: `Auth failed: ${error}` }] : await buildGoogleRows(token, dom, dim, today);
+        result = { date: today, day: dom, days_in_month: dim, google: googleRows, meta: await buildMetaRows(dom, dim, today) };
 
     } else if (name === "get_account_detail") {
         const search = (args.account_name || "").toLowerCase();
@@ -1911,11 +1934,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         // Meta
         for (const [id, info] of Object.entries(META_ACCOUNTS)) {
             if (info.name.toLowerCase().includes(search)) {
+                const { budget } = getEffectiveBudget(info, today);
                 const { spend, error } = await fetchMetaMTD(id);
                 if (error) results.push({ platform: "Meta", account: info.name, error });
                 else results.push({ platform: "Meta", account: info.name,
-                    mtd_spend: Math.round(spend * 100) / 100, budget: info.budget,
-                    ...getPacingLabel(spend, info.budget, dom, dim) });
+                    mtd_spend: Math.round(spend * 100) / 100, budget,
+                    ...getPacingLabel(spend, budget, dom, dim) });
             }
         }
 
@@ -1924,11 +1948,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (token) {
             for (const [cid, info] of Object.entries(GOOGLE_ACCOUNTS)) {
                 if (info.name.toLowerCase().includes(search)) {
+                    const { budget } = getEffectiveBudget(info, today);
                     const { spend, error } = await fetchGoogleMTD(token, cid, info.mcc);
                     if (error) results.push({ platform: "Google", account: info.name, error });
                     else results.push({ platform: "Google", account: info.name,
-                        mtd_spend: Math.round(spend * 100) / 100, budget: info.budget,
-                        ...getPacingLabel(spend, info.budget, dom, dim) });
+                        mtd_spend: Math.round(spend * 100) / 100, budget,
+                        ...getPacingLabel(spend, budget, dom, dim) });
                 }
             }
         }
