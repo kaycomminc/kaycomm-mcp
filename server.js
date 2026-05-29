@@ -1160,57 +1160,17 @@ async function getGoogleAccountSpend(token, customerId, mccId) {
     } catch (_) { return 0; }
 }
 
-async function createAdGroupInCampaign(token, customerId, mccId, campaignResourceName, config) {
-    // config: { name, status, keywords:[{text, match_type}], headlines:[{text,pinned_field?}], descriptions:[{text,pinned_field?}] }
-    const status    = (config.status || "PAUSED").toUpperCase();
-    const agTempName = `customers/${customerId}/adGroups/-1`;
-    const mutateOperations = [];
-
-    // Op 0: Ad group
-    mutateOperations.push({
-        adGroupOperation: {
+async function addKeywordsToAdGroup(token, customerId, mccId, adGroupResourceName, keywords) {
+    // Add keywords to an existing ad group (separate call, uses real resource name)
+    const mutateOperations = keywords.map(kw => ({
+        adGroupCriterionOperation: {
             create: {
-                resourceName: agTempName,
-                name:         config.name,
-                campaign:     campaignResourceName,
-                status,
+                adGroup: adGroupResourceName,
+                keyword: { text: kw.text, matchType: (kw.match_type || "EXACT").toUpperCase() },
+                status:  "ENABLED",
             },
         },
-    });
-
-    // Ops 1+: Keywords
-    for (const kw of (config.keywords || [])) {
-        mutateOperations.push({
-            adGroupCriterionOperation: {
-                create: {
-                    adGroup: agTempName,
-                    keyword: { text: kw.text, matchType: (kw.match_type || "EXACT").toUpperCase() },
-                    status:  "ENABLED",
-                },
-            },
-        });
-    }
-
-    // RSA if headlines provided
-    let adOp = null;
-    if (config.headlines?.length >= 3 && config.descriptions?.length >= 2) {
-        adOp = {
-            adGroupAdOperation: {
-                create: {
-                    adGroup: agTempName,
-                    status:  "ENABLED",
-                    ad: {
-                        responsiveSearchAd: {
-                            headlines:    config.headlines.map(h => ({ text: h.text, ...(h.pinned_field ? { pinnedField: h.pinned_field } : {}) })),
-                            descriptions: config.descriptions.map(d => ({ text: d.text, ...(d.pinned_field ? { pinnedField: d.pinned_field } : {}) })),
-                        },
-                    },
-                },
-            },
-        };
-        mutateOperations.push(adOp);
-    }
-
+    }));
     const resp = await fetchFn(
         `https://googleads.googleapis.com/${GOOGLE_API_VERSION}/customers/${customerId}/googleAds:mutate`,
         {
@@ -1226,11 +1186,86 @@ async function createAdGroupInCampaign(token, customerId, mccId, campaignResourc
     );
     const data = await resp.json();
     if (!resp.ok) throw new Error(data?.error?.message || JSON.stringify(data));
+    return (data.mutateOperationResponses || []).map(r => r.adGroupCriterionResult?.resourceName).filter(Boolean);
+}
 
-    const results    = data.mutateOperationResponses || [];
-    const agResource = results[0]?.adGroupResult?.resourceName;
-    const kwResults  = results.slice(1, 1 + (config.keywords || []).length).map(r => r.adGroupCriterionResult?.resourceName).filter(Boolean);
-    const adResource = adOp ? results[results.length - 1]?.adGroupAdResult?.resourceName : null;
+async function addRSAToAdGroup(token, customerId, mccId, adGroupResourceName, headlines, descriptions, finalUrl) {
+    // Add a responsive search ad to an existing ad group
+    const resp = await fetchFn(
+        `https://googleads.googleapis.com/${GOOGLE_API_VERSION}/customers/${customerId}/googleAds:mutate`,
+        {
+            method: "POST",
+            headers: {
+                "Authorization":     `Bearer ${token}`,
+                "developer-token":   GOOGLE_DEVELOPER_TOKEN,
+                "login-customer-id": mccId,
+                "Content-Type":      "application/json",
+            },
+            body: JSON.stringify({
+                mutateOperations: [{
+                    adGroupAdOperation: {
+                        create: {
+                            adGroup: adGroupResourceName,
+                            status:  "ENABLED",
+                            ad: {
+                                finalUrls: [finalUrl],
+                                responsiveSearchAd: {
+                                    headlines:    headlines.map(h => ({ text: h.text, ...(h.pinned_field ? { pinnedField: h.pinned_field } : {}) })),
+                                    descriptions: descriptions.map(d => ({ text: d.text, ...(d.pinned_field ? { pinnedField: d.pinned_field } : {}) })),
+                                },
+                            },
+                        },
+                    },
+                }],
+            }),
+        }
+    );
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data?.error?.message || JSON.stringify(data));
+    return (data.mutateOperationResponses || [])[0]?.adGroupAdResult?.resourceName;
+}
+
+async function createAdGroupInCampaign(token, customerId, mccId, campaignResourceName, config) {
+    // config: { name, status, keywords:[{text, match_type}], headlines:[{text,pinned_field?}], descriptions:[{text,pinned_field?}], final_url }
+    // Creates ad group first, then keywords and RSA in separate calls (more reliable than one big batch)
+    const status = (config.status || "PAUSED").toUpperCase();
+
+    // Step 1: Create the ad group
+    const agResp = await fetchFn(
+        `https://googleads.googleapis.com/${GOOGLE_API_VERSION}/customers/${customerId}/googleAds:mutate`,
+        {
+            method: "POST",
+            headers: {
+                "Authorization":     `Bearer ${token}`,
+                "developer-token":   GOOGLE_DEVELOPER_TOKEN,
+                "login-customer-id": mccId,
+                "Content-Type":      "application/json",
+            },
+            body: JSON.stringify({
+                mutateOperations: [{
+                    adGroupOperation: {
+                        create: { name: config.name, campaign: campaignResourceName, status },
+                    },
+                }],
+            }),
+        }
+    );
+    const agData = await agResp.json();
+    if (!agResp.ok) throw new Error(agData?.error?.message || JSON.stringify(agData));
+    const agResource = agData.mutateOperationResponses?.[0]?.adGroupResult?.resourceName;
+    if (!agResource) throw new Error("Ad group created but no resource name returned");
+
+    // Step 2: Add keywords (separate call with real resource name)
+    let kwResults = [];
+    if (config.keywords?.length) {
+        kwResults = await addKeywordsToAdGroup(token, customerId, mccId, agResource, config.keywords);
+    }
+
+    // Step 3: Add RSA if provided (requires final_url)
+    let adResource = null;
+    if (config.headlines?.length >= 3 && config.descriptions?.length >= 2 && config.final_url) {
+        adResource = await addRSAToAdGroup(token, customerId, mccId, agResource, config.headlines, config.descriptions, config.final_url);
+    }
 
     return {
         ad_group_resource: agResource,
@@ -1886,6 +1921,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
                             required: ["text"],
                         },
                     },
+                    final_url:  { type: "string", description: "Final URL for the RSA (required if headlines/descriptions provided)" },
                     confirm: { type: "boolean", description: "Set true to create. Omit for dry run." },
                 },
                 required: ["account_name", "campaign_name", "ad_group_name"],
@@ -2925,6 +2961,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                                 keywords,
                                 headlines,
                                 descriptions: descs,
+                                final_url:    args.final_url || null,
                             });
                             result = {
                                 success:  true,
