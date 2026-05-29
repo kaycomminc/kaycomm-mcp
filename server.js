@@ -1160,6 +1160,86 @@ async function getGoogleAccountSpend(token, customerId, mccId) {
     } catch (_) { return 0; }
 }
 
+async function createAdGroupInCampaign(token, customerId, mccId, campaignResourceName, config) {
+    // config: { name, status, keywords:[{text, match_type}], headlines:[{text,pinned_field?}], descriptions:[{text,pinned_field?}] }
+    const status    = (config.status || "PAUSED").toUpperCase();
+    const agTempName = `customers/${customerId}/adGroups/-1`;
+    const mutateOperations = [];
+
+    // Op 0: Ad group
+    mutateOperations.push({
+        adGroupOperation: {
+            create: {
+                resourceName: agTempName,
+                name:         config.name,
+                campaign:     campaignResourceName,
+                status,
+            },
+        },
+    });
+
+    // Ops 1+: Keywords
+    for (const kw of (config.keywords || [])) {
+        mutateOperations.push({
+            adGroupCriterionOperation: {
+                create: {
+                    adGroup: agTempName,
+                    keyword: { text: kw.text, matchType: (kw.match_type || "EXACT").toUpperCase() },
+                    status:  "ENABLED",
+                },
+            },
+        });
+    }
+
+    // RSA if headlines provided
+    let adOp = null;
+    if (config.headlines?.length >= 3 && config.descriptions?.length >= 2) {
+        adOp = {
+            adGroupAdOperation: {
+                create: {
+                    adGroup: agTempName,
+                    status:  "ENABLED",
+                    ad: {
+                        responsiveSearchAd: {
+                            headlines:    config.headlines.map(h => ({ text: h.text, ...(h.pinned_field ? { pinnedField: h.pinned_field } : {}) })),
+                            descriptions: config.descriptions.map(d => ({ text: d.text, ...(d.pinned_field ? { pinnedField: d.pinned_field } : {}) })),
+                        },
+                    },
+                },
+            },
+        };
+        mutateOperations.push(adOp);
+    }
+
+    const resp = await fetchFn(
+        `https://googleads.googleapis.com/${GOOGLE_API_VERSION}/customers/${customerId}/googleAds:mutate`,
+        {
+            method: "POST",
+            headers: {
+                "Authorization":     `Bearer ${token}`,
+                "developer-token":   GOOGLE_DEVELOPER_TOKEN,
+                "login-customer-id": mccId,
+                "Content-Type":      "application/json",
+            },
+            body: JSON.stringify({ mutateOperations }),
+        }
+    );
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data?.error?.message || JSON.stringify(data));
+
+    const results    = data.mutateOperationResponses || [];
+    const agResource = results[0]?.adGroupResult?.resourceName;
+    const kwResults  = results.slice(1, 1 + (config.keywords || []).length).map(r => r.adGroupCriterionResult?.resourceName).filter(Boolean);
+    const adResource = adOp ? results[results.length - 1]?.adGroupAdResult?.resourceName : null;
+
+    return {
+        ad_group_resource: agResource,
+        keywords_created:  kwResults.length,
+        ad_created:        !!adResource,
+        ad_resource:       adResource,
+    };
+}
+
 // ── Write helpers: bidding, campaign create, RSA update, extensions ──────────
 
 function buildBiddingUpdateBody(strategy, options = {}) {
@@ -1755,6 +1835,60 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
                     },
                 },
                 required: [],
+            },
+        },
+        {
+            name: "create_ad_group",
+            description: "Create a new ad group inside an existing Google Ads campaign. " +
+                "Adds keywords and optionally an RSA in the same batch. " +
+                "Status defaults to PAUSED for review before launch. " +
+                "Dry run by default — set confirm=true to create.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    account_name:   { type: "string", description: "Client name (partial match ok)" },
+                    campaign_name:  { type: "string", description: "Existing campaign name (partial match ok)" },
+                    ad_group_name:  { type: "string", description: "Name for the new ad group" },
+                    status:         { type: "string", enum: ["PAUSED", "ENABLED"], description: "Ad group status (default: PAUSED)" },
+                    keywords: {
+                        type: "array",
+                        description: "Keywords to add to the ad group",
+                        items: {
+                            type: "object",
+                            properties: {
+                                text:       { type: "string" },
+                                match_type: { type: "string", enum: ["EXACT", "PHRASE", "BROAD"] },
+                            },
+                            required: ["text"],
+                        },
+                    },
+                    headlines: {
+                        type: "array",
+                        description: "RSA headlines (3–15, max 30 chars each). Omit to skip creating an ad.",
+                        items: {
+                            type: "object",
+                            properties: {
+                                text:         { type: "string" },
+                                pinned_field: { type: "string", enum: ["HEADLINE_1", "HEADLINE_2", "HEADLINE_3"] },
+                            },
+                            required: ["text"],
+                        },
+                    },
+                    descriptions: {
+                        type: "array",
+                        description: "RSA descriptions (2–4, max 90 chars each). Required if headlines provided.",
+                        items: {
+                            type: "object",
+                            properties: {
+                                text:         { type: "string" },
+                                pinned_field: { type: "string", enum: ["DESCRIPTION_1", "DESCRIPTION_2"] },
+                            },
+                            required: ["text"],
+                        },
+                    },
+                    confirm: { type: "boolean", description: "Set true to create. Omit for dry run." },
+                },
+                required: ["account_name", "campaign_name", "ad_group_name"],
             },
         },
         {
@@ -2741,6 +2875,69 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                     })),
                 };
             } catch (e) { result.meta_error = e.message; }
+        }
+
+    } else if (name === "create_ad_group") {
+        const search     = (args.account_name || "").toLowerCase();
+        const campSearch = (args.campaign_name || "").toLowerCase();
+        const confirm    = !!args.confirm;
+        const status     = (args.status || "PAUSED").toUpperCase();
+        const keywords   = args.keywords   || [];
+        const headlines  = args.headlines  || [];
+        const descs      = args.descriptions || [];
+
+        if (!args.ad_group_name) {
+            result = { error: "ad_group_name is required." };
+        } else {
+            const match = Object.entries(GOOGLE_ACCOUNTS).find(([, i]) => i.name.toLowerCase().includes(search));
+            if (!match) {
+                result = { error: `No Google account matching '${args.account_name}'` };
+            } else {
+                const [cid, info] = match;
+                const { token, error: authErr } = await getGoogleAccessToken();
+                if (authErr) { result = { error: `Auth: ${authErr}` }; }
+                else {
+                    try {
+                        const campaigns = await listGoogleCampaignsFull(token, cid, info.mcc);
+                        const camp = campaigns.find(c => c.name.toLowerCase().includes(campSearch));
+                        if (!camp) {
+                            result = { error: `No campaign matching '${args.campaign_name}'`, available: campaigns.map(c => c.name) };
+                        } else if (!confirm) {
+                            result = {
+                                dry_run: true,
+                                message: "DRY RUN — set confirm=true to create",
+                                account:       info.name,
+                                campaign:      camp.name,
+                                planned_ad_group: {
+                                    name:          args.ad_group_name,
+                                    status,
+                                    keyword_count: keywords.length,
+                                    keywords:      keywords.map(k => `[${k.match_type || "EXACT"}] ${k.text}`),
+                                    has_rsa:       headlines.length >= 3 && descs.length >= 2,
+                                    headlines:     headlines.map(h => h.text),
+                                    descriptions:  descs.map(d => d.text),
+                                },
+                            };
+                        } else {
+                            const res = await createAdGroupInCampaign(token, cid, info.mcc, camp.resource_name, {
+                                name:         args.ad_group_name,
+                                status,
+                                keywords,
+                                headlines,
+                                descriptions: descs,
+                            });
+                            result = {
+                                success:  true,
+                                account:  info.name,
+                                campaign: camp.name,
+                                ad_group: args.ad_group_name,
+                                status,
+                                ...res,
+                            };
+                        }
+                    } catch (e) { result = { error: e.message }; }
+                }
+            }
         }
 
     } else if (name === "set_bidding_strategy") {
