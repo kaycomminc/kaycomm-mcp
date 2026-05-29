@@ -1018,16 +1018,84 @@ async function listMCCChildren(token, mccId) {
 }
 
 async function listMetaAdAccountsAll() {
-    const resp = await fetchFn(
-        `https://graph.facebook.com/${META_API_VERSION}/me/adaccounts?fields=id,name,account_status&limit=100&access_token=${META_ACCESS_TOKEN}`
-    );
-    const data = await resp.json();
-    if (data.error) throw new Error(data.error.message);
-    return (data.data || []).map(a => ({
-        id:     a.id,   // already in act_XXXX format
-        name:   a.name,
-        status: a.account_status === 1 ? "ACTIVE" : String(a.account_status),
-    }));
+    // Paginate through all accessible ad accounts
+    let url = `https://graph.facebook.com/${META_API_VERSION}/me/adaccounts?fields=id,name,account_status&limit=200&access_token=${META_ACCESS_TOKEN}`;
+    const accounts = [];
+    while (url) {
+        const resp = await fetchFn(url);
+        const data = await resp.json();
+        if (data.error) throw new Error(data.error.message);
+        for (const a of (data.data || [])) {
+            accounts.push({
+                id:     a.id,
+                name:   a.name,
+                status: a.account_status === 1 ? "ACTIVE" : String(a.account_status),
+            });
+        }
+        url = data.paging?.next || null;
+    }
+    return accounts;
+}
+
+async function getMetaBusinessAdAccountIds(businessId) {
+    // Returns all ad account IDs (act_XXX) owned or managed by a business manager
+    const ids = new Set();
+    for (const edge of ["owned_ad_accounts", "client_ad_accounts"]) {
+        try {
+            let url = `https://graph.facebook.com/${META_API_VERSION}/${businessId}/${edge}?fields=id&limit=200&access_token=${META_ACCESS_TOKEN}`;
+            while (url) {
+                const resp = await fetchFn(url);
+                const data = await resp.json();
+                if (data.error) break;
+                for (const a of (data.data || [])) ids.add(a.id);
+                url = data.paging?.next || null;
+            }
+        } catch (_) {}
+    }
+    return ids;
+}
+
+async function getMetaAccountSpend(accountId) {
+    // Returns spend in last 30 days for a single ad account (0 if no data)
+    try {
+        const resp = await fetchFn(
+            `https://graph.facebook.com/${META_API_VERSION}/${accountId}/insights?fields=spend&date_preset=last_30_days&access_token=${META_ACCESS_TOKEN}`
+        );
+        const data = await resp.json();
+        if (data.error) return 0;
+        return parseFloat((data.data || [])[0]?.spend || 0);
+    } catch (_) { return 0; }
+}
+
+async function getGoogleAccountName(token, customerId) {
+    // Direct lookup for self-managed accounts with no MCC parent
+    try {
+        const resp = await fetchFn(
+            `https://googleads.googleapis.com/${GOOGLE_API_VERSION}/customers/${customerId}`,
+            {
+                headers: {
+                    "Authorization":     `Bearer ${token}`,
+                    "developer-token":   GOOGLE_DEVELOPER_TOKEN,
+                    "login-customer-id": customerId,
+                },
+            }
+        );
+        const data = await resp.json();
+        if (!resp.ok) return null;
+        return data.descriptiveName || data.id || null;
+    } catch (_) { return null; }
+}
+
+async function getGoogleAccountSpend(token, customerId, mccId) {
+    // Returns MTD spend for a single Google Ads account (0 if error)
+    try {
+        const rows = await googleSearch(token, customerId, mccId, `
+            SELECT metrics.cost_micros
+            FROM customer
+            WHERE segments.date DURING LAST_30_DAYS`);
+        const total = rows.reduce((s, r) => s + parseInt(r.metrics?.costMicros || 0), 0);
+        return total / 1_000_000;
+    } catch (_) { return 0; }
 }
 
 // ── Write helpers: bidding, campaign create, RSA update, extensions ──────────
@@ -1603,8 +1671,9 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         {
             name: "sync_accounts",
             description: "Discover all Google Ads and Meta ad accounts you have access to and compare against what's currently tracked. " +
-                "Shows new accounts not yet in the server so they can be added. " +
-                "Queries all accessible MCCs and Meta ad accounts.",
+                "Filters out accounts under specified Meta business managers. " +
+                "Checks spend in the last 30 days and skips accounts with zero activity. " +
+                "Returns only new active accounts ready to be added.",
             inputSchema: {
                 type: "object",
                 properties: {
@@ -1612,6 +1681,15 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
                         type: "string",
                         enum: ["google", "meta", "both"],
                         description: "Which platform to scan (default: both)",
+                    },
+                    exclude_business_ids: {
+                        type: "array",
+                        items: { type: "string" },
+                        description: "Meta Business Manager IDs to exclude (all their ad accounts will be filtered out)",
+                    },
+                    check_spend: {
+                        type: "boolean",
+                        description: "Check last 30 days spend and skip accounts with $0 activity (default: true)",
                     },
                 },
                 required: [],
@@ -2483,7 +2561,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
 
     } else if (name === "sync_accounts") {
-        const platform = args.platform || "both";
+        const platform           = args.platform || "both";
+        const excludeBizIds      = args.exclude_business_ids || [];
+        const checkSpend         = args.check_spend !== false; // default true
         result = {};
 
         if (platform === "google" || platform === "both") {
@@ -2491,45 +2571,58 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             if (authErr) { result.google_error = `Auth: ${authErr}`; }
             else {
                 try {
-                    // Step 1: get all customer IDs accessible to this token
                     const accessibleIds = await listAccessibleCustomers(token);
-
-                    // Step 2: for each one, check if it's an MCC and list children
                     const discovered = {};
+
                     for (const cid of accessibleIds) {
-                        // Add the account itself
                         discovered[cid] = discovered[cid] || { id: cid, name: null, mcc: cid, isMCC: false };
-                        // Try to get children (will return [] if not an MCC)
                         const children = await listMCCChildren(token, cid);
                         if (children.length) {
                             discovered[cid].isMCC = true;
                             for (const child of children) {
-                                if (!child.manager) { // skip sub-MCCs
+                                if (!child.manager) {
                                     discovered[child.id] = { id: child.id, name: child.name, mcc: cid, isMCC: false };
                                 }
                             }
                         }
                     }
 
-                    const trackedIds = new Set(Object.keys(GOOGLE_ACCOUNTS));
+                    const trackedIds  = new Set(Object.keys(GOOGLE_ACCOUNTS));
                     const allAccounts = Object.values(discovered).filter(a => !a.isMCC);
                     const newAccounts = allAccounts.filter(a => !trackedIds.has(a.id));
-                    const existingAccounts = allAccounts.filter(a => trackedIds.has(a.id));
+
+                    // Resolve names for accounts that came back without one
+                    for (const acct of newAccounts) {
+                        if (!acct.name || acct.name === "(name not fetched)") {
+                            acct.name = await getGoogleAccountName(token, acct.id) || "(unknown)";
+                        }
+                    }
+
+                    // Check spend and filter out $0 accounts
+                    const withSpend = [];
+                    const noSpend   = [];
+                    if (checkSpend) {
+                        for (const acct of newAccounts) {
+                            const spend = await getGoogleAccountSpend(token, acct.id, acct.mcc);
+                            if (spend > 0) withSpend.push({ ...acct, last_30d_spend: "$" + spend.toFixed(2) });
+                            else noSpend.push(acct.name);
+                        }
+                    } else {
+                        withSpend.push(...newAccounts);
+                    }
 
                     result.google = {
-                        total_discovered: allAccounts.length,
-                        already_tracked:  existingAccounts.length,
-                        new_accounts:     newAccounts.length,
-                        new: newAccounts.map(a => ({
-                            id:   a.id,
-                            name: a.name || GOOGLE_ACCOUNTS[a.id]?.name || "(name not fetched)",
-                            mcc:  a.mcc,
-                            note: "Not yet tracked — tell me to add it with a budget",
-                        })),
-                        tracked: existingAccounts.map(a => ({
-                            id:     a.id,
-                            name:   GOOGLE_ACCOUNTS[a.id]?.name,
-                            budget: GOOGLE_ACCOUNTS[a.id]?.budget,
+                        total_discovered:  allAccounts.length,
+                        already_tracked:   trackedIds.size,
+                        new_with_spend:    withSpend.length,
+                        new_no_spend:      noSpend.length,
+                        skipped_no_spend:  noSpend,
+                        new: withSpend.map(a => ({
+                            id:            a.id,
+                            name:          a.name,
+                            mcc:           a.mcc,
+                            last_30d_spend: a.last_30d_spend,
+                            note:          "Tell me to add it with a budget",
                         })),
                     };
                 } catch (e) { result.google_error = e.message; }
@@ -2538,25 +2631,46 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         if (platform === "meta" || platform === "both") {
             try {
-                const allAccounts   = await listMetaAdAccountsAll();
-                const trackedIds    = new Set(Object.keys(META_ACCOUNTS));
-                const newAccounts   = allAccounts.filter(a => !trackedIds.has(a.id));
-                const existingAccounts = allAccounts.filter(a => trackedIds.has(a.id));
+                // Build exclusion set from business manager IDs
+                const excludedAccountIds = new Set();
+                for (const bizId of excludeBizIds) {
+                    const ids = await getMetaBusinessAdAccountIds(bizId);
+                    for (const id of ids) excludedAccountIds.add(id);
+                }
+
+                const allAccounts  = await listMetaAdAccountsAll();
+                const trackedIds   = new Set(Object.keys(META_ACCOUNTS));
+                const candidates   = allAccounts.filter(a =>
+                    !trackedIds.has(a.id) &&
+                    !excludedAccountIds.has(a.id) &&
+                    a.status === "ACTIVE"
+                );
+
+                // Check spend and filter out $0 accounts
+                const withSpend = [];
+                const noSpend   = [];
+                if (checkSpend) {
+                    for (const acct of candidates) {
+                        const spend = await getMetaAccountSpend(acct.id);
+                        if (spend > 0) withSpend.push({ ...acct, last_30d_spend: "$" + spend.toFixed(2) });
+                        else noSpend.push(acct.name);
+                    }
+                } else {
+                    withSpend.push(...candidates);
+                }
 
                 result.meta = {
-                    total_discovered: allAccounts.length,
-                    already_tracked:  existingAccounts.length,
-                    new_accounts:     newAccounts.length,
-                    new: newAccounts.map(a => ({
-                        id:     a.id,
-                        name:   a.name,
-                        status: a.status,
-                        note:   "Not yet tracked — tell me to add it with a budget",
-                    })),
-                    tracked: existingAccounts.map(a => ({
-                        id:     a.id,
-                        name:   META_ACCOUNTS[a.id]?.name,
-                        budget: META_ACCOUNTS[a.id]?.budget,
+                    total_discovered:  allAccounts.length,
+                    excluded_by_biz:   excludedAccountIds.size,
+                    already_tracked:   trackedIds.size,
+                    new_with_spend:    withSpend.length,
+                    new_no_spend:      noSpend.length,
+                    skipped_no_spend:  noSpend,
+                    new: withSpend.map(a => ({
+                        id:             a.id,
+                        name:           a.name,
+                        last_30d_spend: a.last_30d_spend,
+                        note:           "Tell me to add it with a budget",
                     })),
                 };
             } catch (e) { result.meta_error = e.message; }
