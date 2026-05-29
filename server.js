@@ -1928,6 +1928,57 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             },
         },
         {
+            name: "populate_ad_group",
+            description: "Add keywords and/or an RSA to an existing Google Ads ad group using its resource name. " +
+                "Use after create_ad_group to finish setting up an ad group. Dry run by default — set confirm=true to apply.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    account_name:     { type: "string", description: "Client name (partial match ok)" },
+                    ad_group_resource: { type: "string", description: "Full ad group resource name (e.g. customers/123/adGroups/456)" },
+                    keywords: {
+                        type: "array",
+                        description: "Keywords to add",
+                        items: {
+                            type: "object",
+                            properties: {
+                                text:       { type: "string" },
+                                match_type: { type: "string", enum: ["EXACT", "PHRASE", "BROAD"] },
+                            },
+                            required: ["text"],
+                        },
+                    },
+                    headlines: {
+                        type: "array",
+                        description: "RSA headlines (3–15, max 30 chars each)",
+                        items: {
+                            type: "object",
+                            properties: {
+                                text:         { type: "string" },
+                                pinned_field: { type: "string", enum: ["HEADLINE_1", "HEADLINE_2", "HEADLINE_3"] },
+                            },
+                            required: ["text"],
+                        },
+                    },
+                    descriptions: {
+                        type: "array",
+                        description: "RSA descriptions (2–4, max 90 chars each)",
+                        items: {
+                            type: "object",
+                            properties: {
+                                text:         { type: "string" },
+                                pinned_field: { type: "string", enum: ["DESCRIPTION_1", "DESCRIPTION_2"] },
+                            },
+                            required: ["text"],
+                        },
+                    },
+                    final_url: { type: "string", description: "Final URL for the RSA (required if providing headlines)" },
+                    confirm:   { type: "boolean", description: "Set true to apply. Omit for dry run." },
+                },
+                required: ["account_name", "ad_group_resource"],
+            },
+        },
+        {
             name: "set_bidding_strategy",
             description: "Change the bidding strategy on a Google Ads campaign. Supports MANUAL_CPC, ENHANCED_CPC, MAXIMIZE_CLICKS, MAXIMIZE_CONVERSIONS, TARGET_CPA, TARGET_ROAS. Dry run by default — set confirm=true to apply.",
             inputSchema: {
@@ -2973,6 +3024,62 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                             };
                         }
                     } catch (e) { result = { error: e.message }; }
+                }
+            }
+        }
+
+    } else if (name === "populate_ad_group") {
+        const search      = (args.account_name || "").toLowerCase();
+        const agResource  = args.ad_group_resource || "";
+        const keywords    = args.keywords    || [];
+        const headlines   = args.headlines   || [];
+        const descs       = args.descriptions || [];
+        const finalUrl    = args.final_url   || null;
+        const confirm     = !!args.confirm;
+        const hasRsa      = headlines.length >= 3 && descs.length >= 2 && finalUrl;
+
+        if (!agResource) {
+            result = { error: "ad_group_resource is required (e.g. customers/123/adGroups/456)" };
+        } else if (!keywords.length && !hasRsa) {
+            result = { error: "Provide keywords, or headlines + descriptions + final_url for an RSA." };
+        } else {
+            const match = Object.entries(GOOGLE_ACCOUNTS).find(([, i]) => i.name.toLowerCase().includes(search));
+            if (!match) {
+                result = { error: `No Google account matching '${args.account_name}'` };
+            } else {
+                const [cid, info] = match;
+                const { token, error: authErr } = await getGoogleAccessToken();
+                if (authErr) { result = { error: `Auth: ${authErr}` }; }
+                else {
+                    if (!confirm) {
+                        result = {
+                            dry_run: true,
+                            message: "DRY RUN — set confirm=true to apply",
+                            account:          info.name,
+                            ad_group_resource: agResource,
+                            keywords_to_add:  keywords.map(k => `[${k.match_type || "EXACT"}] ${k.text}`),
+                            rsa_to_add:       hasRsa ? { headlines: headlines.map(h => h.text), descriptions: descs.map(d => d.text), final_url: finalUrl } : null,
+                        };
+                    } else {
+                        try {
+                            let kwCount = 0, adResource = null;
+                            if (keywords.length) {
+                                const kwRes = await addKeywordsToAdGroup(token, cid, info.mcc, agResource, keywords);
+                                kwCount = kwRes.length;
+                            }
+                            if (hasRsa) {
+                                adResource = await addRSAToAdGroup(token, cid, info.mcc, agResource, headlines, descs, finalUrl);
+                            }
+                            result = {
+                                success:           true,
+                                account:           info.name,
+                                ad_group_resource: agResource,
+                                keywords_added:    kwCount,
+                                rsa_created:       !!adResource,
+                                ad_resource:       adResource,
+                            };
+                        } catch (e) { result = { error: e.message }; }
+                    }
                 }
             }
         }
