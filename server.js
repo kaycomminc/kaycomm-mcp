@@ -39,6 +39,7 @@ const GOOGLE_ACCOUNTS = {
     "2696762909": { name: "Warrior Advocates",       budget: 300,  mcc: "8621281595", ga4: "14591178781" },
     "8184463966": { name: "Spartan Exteriors",       budget: 500,  mcc: "8184463966" },
     "6631800329": { name: "Summit Express",          budget: 0,    mcc: "7631184147" },
+    "2275371078": { name: "Childrens Therapy Services of Colorado", budget: 1000, mcc: "7631184147" },
 };
 
 // ── Meta Accounts ─────────────────────────────────────────────────────────────
