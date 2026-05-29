@@ -1067,6 +1067,44 @@ async function getMetaAccountSpend(accountId) {
     } catch (_) { return 0; }
 }
 
+async function batchMetaSpend(accountIds) {
+    // Returns a Map of accountId -> spend using Meta batch API (50 per request)
+    const spendMap = new Map();
+    const BATCH_SIZE = 50;
+    for (let i = 0; i < accountIds.length; i += BATCH_SIZE) {
+        const chunk = accountIds.slice(i, i + BATCH_SIZE);
+        const batch = chunk.map(id => ({
+            method:       "GET",
+            relative_url: `${id}/insights?fields=spend&date_preset=last_30_days`,
+        }));
+        try {
+            const resp = await fetchFn(
+                `https://graph.facebook.com/${META_API_VERSION}/?include_headers=false&access_token=${META_ACCESS_TOKEN}`,
+                {
+                    method:  "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body:    JSON.stringify({ batch }),
+                }
+            );
+            const results = await resp.json();
+            if (!Array.isArray(results)) continue;
+            for (let j = 0; j < results.length; j++) {
+                const item = results[j];
+                const id   = chunk[j];
+                if (!item || item.code !== 200) { spendMap.set(id, 0); continue; }
+                try {
+                    const body  = JSON.parse(item.body);
+                    const spend = parseFloat((body.data || [])[0]?.spend || 0);
+                    spendMap.set(id, spend);
+                } catch (_) { spendMap.set(id, 0); }
+            }
+        } catch (_) {
+            for (const id of chunk) spendMap.set(id, 0);
+        }
+    }
+    return spendMap;
+}
+
 async function getGoogleAccountName(token, customerId) {
     // Direct lookup for self-managed accounts with no MCC parent
     try {
@@ -2598,14 +2636,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                         }
                     }
 
-                    // Check spend and filter out $0 accounts
+                    // Check spend in parallel and filter out $0 accounts
                     const withSpend = [];
                     const noSpend   = [];
-                    if (checkSpend) {
-                        for (const acct of newAccounts) {
-                            const spend = await getGoogleAccountSpend(token, acct.id, acct.mcc);
-                            if (spend > 0) withSpend.push({ ...acct, last_30d_spend: "$" + spend.toFixed(2) });
-                            else noSpend.push(acct.name);
+                    if (checkSpend && newAccounts.length) {
+                        const spends = await Promise.all(
+                            newAccounts.map(a => getGoogleAccountSpend(token, a.id, a.mcc))
+                        );
+                        for (let i = 0; i < newAccounts.length; i++) {
+                            if (spends[i] > 0) withSpend.push({ ...newAccounts[i], last_30d_spend: "$" + spends[i].toFixed(2) });
+                            else noSpend.push(newAccounts[i].name);
                         }
                     } else {
                         withSpend.push(...newAccounts);
@@ -2646,12 +2686,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                     a.status === "ACTIVE"
                 );
 
-                // Check spend and filter out $0 accounts
+                // Check spend in batch and filter out $0 accounts
                 const withSpend = [];
                 const noSpend   = [];
-                if (checkSpend) {
+                if (checkSpend && candidates.length) {
+                    const spendMap = await batchMetaSpend(candidates.map(a => a.id));
                     for (const acct of candidates) {
-                        const spend = await getMetaAccountSpend(acct.id);
+                        const spend = spendMap.get(acct.id) || 0;
                         if (spend > 0) withSpend.push({ ...acct, last_30d_spend: "$" + spend.toFixed(2) });
                         else noSpend.push(acct.name);
                     }
