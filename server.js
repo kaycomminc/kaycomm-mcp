@@ -1166,30 +1166,59 @@ function googleAdsError(data) {
         || JSON.stringify(data);
 }
 
+function extractPolicyViolationKeys(data) {
+    // Pull PolicyViolationKey objects from a Google Ads error response for retry with exemptions
+    const keys = [];
+    const errors = data?.error?.details || [];
+    for (const detail of errors) {
+        for (const err of (detail.errors || [])) {
+            for (const d of (err.details || [])) {
+                if (d.key) keys.push(d.key);
+            }
+        }
+    }
+    return keys;
+}
+
 async function addKeywordsToAdGroup(token, customerId, mccId, adGroupResourceName, keywords) {
-    // Use service-level adGroupCriteria:mutate endpoint (different format from batch googleAds:mutate)
-    const operations = keywords.map(kw => ({
+    // Use service-level adGroupCriteria:mutate endpoint
+    // Auto-retries with policy exemption keys for healthcare/restricted keyword categories
+    const makeOps = (exemptKeys = []) => keywords.map(kw => ({
         create: {
             adGroup: adGroupResourceName,
             status:  "ENABLED",
             keyword: { text: kw.text, matchType: (kw.match_type || "EXACT").toUpperCase() },
         },
+        ...(exemptKeys.length ? { exemptPolicyViolationKeys: exemptKeys } : {}),
     }));
-    const resp = await fetchFn(
-        `https://googleads.googleapis.com/${GOOGLE_API_VERSION}/customers/${customerId}/adGroupCriteria:mutate`,
-        {
-            method: "POST",
-            headers: {
-                "Authorization":     `Bearer ${token}`,
-                "developer-token":   GOOGLE_DEVELOPER_TOKEN,
-                "login-customer-id": mccId,
-                "Content-Type":      "application/json",
-            },
-            body: JSON.stringify({ operations }),
+
+    const doRequest = async (ops) => {
+        const resp = await fetchFn(
+            `https://googleads.googleapis.com/${GOOGLE_API_VERSION}/customers/${customerId}/adGroupCriteria:mutate`,
+            {
+                method: "POST",
+                headers: {
+                    "Authorization":     `Bearer ${token}`,
+                    "developer-token":   GOOGLE_DEVELOPER_TOKEN,
+                    "login-customer-id": mccId,
+                    "Content-Type":      "application/json",
+                },
+                body: JSON.stringify({ operations: ops }),
+            }
+        );
+        return { resp, data: await resp.json() };
+    };
+
+    // First attempt
+    let { resp, data } = await doRequest(makeOps());
+    if (!resp.ok) {
+        const policyKeys = extractPolicyViolationKeys(data);
+        if (policyKeys.length) {
+            // Retry with exemptions for already-approved policy violations
+            ({ resp, data } = await doRequest(makeOps(policyKeys)));
         }
-    );
-    const data = await resp.json();
-    if (!resp.ok) throw new Error(googleAdsError(data));
+        if (!resp.ok) throw new Error(googleAdsError(data));
+    }
     return (data.results || []).map(r => r.resourceName).filter(Boolean);
 }
 
