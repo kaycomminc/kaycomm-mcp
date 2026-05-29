@@ -1168,13 +1168,13 @@ function googleAdsError(data) {
 
 function extractPolicyViolationKeys(data) {
     // Pull PolicyViolationKey objects from a Google Ads error response for retry with exemptions
+    // err.details is an object (not array) with shape { policyViolationDetails: { key: {...} } }
     const keys = [];
-    const errors = data?.error?.details || [];
-    for (const detail of errors) {
+    const details = data?.error?.details || [];
+    for (const detail of Array.isArray(details) ? details : []) {
         for (const err of (detail.errors || [])) {
-            for (const d of (err.details || [])) {
-                if (d.key) keys.push(d.key);
-            }
+            const pvKey = err.details?.policyViolationDetails?.key;
+            if (pvKey) keys.push(pvKey);
         }
     }
     return keys;
