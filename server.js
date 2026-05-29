@@ -975,6 +975,61 @@ async function updateGoogleCampaignBudget(token, customerId, mccId, campaignReso
     return { budget_resource: budgetResourceName, new_daily_budget: "$" + dailyBudgetDollars.toFixed(2) };
 }
 
+// ── Account discovery ─────────────────────────────────────────────────────────
+
+async function listAccessibleCustomers(token) {
+    const resp = await fetchFn(
+        `https://googleads.googleapis.com/${GOOGLE_API_VERSION}/customers:listAccessibleCustomers`,
+        {
+            headers: {
+                "Authorization":   `Bearer ${token}`,
+                "developer-token": GOOGLE_DEVELOPER_TOKEN,
+            },
+        }
+    );
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data?.error?.message || JSON.stringify(data));
+    // Returns resource names like "customers/1234567890"
+    return (data.resourceNames || []).map(r => r.replace("customers/", ""));
+}
+
+async function listMCCChildren(token, mccId) {
+    // Query customer_client at level 1 (direct children only)
+    try {
+        const rows = await googleSearch(token, mccId, mccId, `
+            SELECT
+                customer_client.id,
+                customer_client.descriptive_name,
+                customer_client.status,
+                customer_client.manager,
+                customer_client.level
+            FROM customer_client
+            WHERE customer_client.level = 1
+              AND customer_client.status = 'ENABLED'`);
+        return rows.map(r => ({
+            id:      String(r.customerClient.id),
+            name:    r.customerClient.descriptiveName || "(no name)",
+            manager: !!r.customerClient.manager,
+            mcc:     mccId,
+        }));
+    } catch (_) {
+        return []; // Not an MCC or no access
+    }
+}
+
+async function listMetaAdAccountsAll() {
+    const resp = await fetchFn(
+        `https://graph.facebook.com/${META_API_VERSION}/me/adaccounts?fields=id,name,account_status&limit=100&access_token=${META_ACCESS_TOKEN}`
+    );
+    const data = await resp.json();
+    if (data.error) throw new Error(data.error.message);
+    return (data.data || []).map(a => ({
+        id:     a.id,   // already in act_XXXX format
+        name:   a.name,
+        status: a.account_status === 1 ? "ACTIVE" : String(a.account_status),
+    }));
+}
+
 // ── Write helpers: bidding, campaign create, RSA update, extensions ──────────
 
 function buildBiddingUpdateBody(strategy, options = {}) {
@@ -1543,6 +1598,23 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
                     confirm:       { type: "boolean", description: "Set true to apply. Omit for dry run." },
                 },
                 required: ["account_name", "campaign_name", "daily_budget"],
+            },
+        },
+        {
+            name: "sync_accounts",
+            description: "Discover all Google Ads and Meta ad accounts you have access to and compare against what's currently tracked. " +
+                "Shows new accounts not yet in the server so they can be added. " +
+                "Queries all accessible MCCs and Meta ad accounts.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    platform: {
+                        type: "string",
+                        enum: ["google", "meta", "both"],
+                        description: "Which platform to scan (default: both)",
+                    },
+                },
+                required: [],
             },
         },
         {
@@ -2408,6 +2480,86 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                     result = { error: e.message };
                 }
             }
+        }
+
+    } else if (name === "sync_accounts") {
+        const platform = args.platform || "both";
+        result = {};
+
+        if (platform === "google" || platform === "both") {
+            const { token, error: authErr } = await getGoogleAccessToken();
+            if (authErr) { result.google_error = `Auth: ${authErr}`; }
+            else {
+                try {
+                    // Step 1: get all customer IDs accessible to this token
+                    const accessibleIds = await listAccessibleCustomers(token);
+
+                    // Step 2: for each one, check if it's an MCC and list children
+                    const discovered = {};
+                    for (const cid of accessibleIds) {
+                        // Add the account itself
+                        discovered[cid] = discovered[cid] || { id: cid, name: null, mcc: cid, isMCC: false };
+                        // Try to get children (will return [] if not an MCC)
+                        const children = await listMCCChildren(token, cid);
+                        if (children.length) {
+                            discovered[cid].isMCC = true;
+                            for (const child of children) {
+                                if (!child.manager) { // skip sub-MCCs
+                                    discovered[child.id] = { id: child.id, name: child.name, mcc: cid, isMCC: false };
+                                }
+                            }
+                        }
+                    }
+
+                    const trackedIds = new Set(Object.keys(GOOGLE_ACCOUNTS));
+                    const allAccounts = Object.values(discovered).filter(a => !a.isMCC);
+                    const newAccounts = allAccounts.filter(a => !trackedIds.has(a.id));
+                    const existingAccounts = allAccounts.filter(a => trackedIds.has(a.id));
+
+                    result.google = {
+                        total_discovered: allAccounts.length,
+                        already_tracked:  existingAccounts.length,
+                        new_accounts:     newAccounts.length,
+                        new: newAccounts.map(a => ({
+                            id:   a.id,
+                            name: a.name || GOOGLE_ACCOUNTS[a.id]?.name || "(name not fetched)",
+                            mcc:  a.mcc,
+                            note: "Not yet tracked — tell me to add it with a budget",
+                        })),
+                        tracked: existingAccounts.map(a => ({
+                            id:     a.id,
+                            name:   GOOGLE_ACCOUNTS[a.id]?.name,
+                            budget: GOOGLE_ACCOUNTS[a.id]?.budget,
+                        })),
+                    };
+                } catch (e) { result.google_error = e.message; }
+            }
+        }
+
+        if (platform === "meta" || platform === "both") {
+            try {
+                const allAccounts   = await listMetaAdAccountsAll();
+                const trackedIds    = new Set(Object.keys(META_ACCOUNTS));
+                const newAccounts   = allAccounts.filter(a => !trackedIds.has(a.id));
+                const existingAccounts = allAccounts.filter(a => trackedIds.has(a.id));
+
+                result.meta = {
+                    total_discovered: allAccounts.length,
+                    already_tracked:  existingAccounts.length,
+                    new_accounts:     newAccounts.length,
+                    new: newAccounts.map(a => ({
+                        id:     a.id,
+                        name:   a.name,
+                        status: a.status,
+                        note:   "Not yet tracked — tell me to add it with a budget",
+                    })),
+                    tracked: existingAccounts.map(a => ({
+                        id:     a.id,
+                        name:   META_ACCOUNTS[a.id]?.name,
+                        budget: META_ACCOUNTS[a.id]?.budget,
+                    })),
+                };
+            } catch (e) { result.meta_error = e.message; }
         }
 
     } else if (name === "set_bidding_strategy") {
