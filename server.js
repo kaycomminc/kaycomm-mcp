@@ -2006,6 +2006,19 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             },
         },
         {
+            name: "get_budget_overview",
+            description: "Pull daily and lifetime budgets for all campaigns across all tracked Google Ads and Meta accounts. Shows which campaigns use daily vs lifetime budgets and current amounts.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    platform: { type: "string", enum: ["google", "meta", "both"], description: "Platform to pull (default: both)" },
+                    account_name: { type: "string", description: "Filter to a specific account (partial match ok). Omit for all accounts." },
+                    active_only: { type: "boolean", description: "Only show enabled/active campaigns (default: false)" },
+                },
+                required: [],
+            },
+        },
+        {
             name: "set_bidding_strategy",
             description: "Change the bidding strategy on a Google Ads campaign. Supports MANUAL_CPC, ENHANCED_CPC, MAXIMIZE_CLICKS, MAXIMIZE_CONVERSIONS, TARGET_CPA, TARGET_ROAS. Dry run by default — set confirm=true to apply.",
             inputSchema: {
@@ -3107,6 +3120,73 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                             };
                         } catch (e) { result = { error: e.message }; }
                     }
+                }
+            }
+        }
+
+    } else if (name === "get_budget_overview") {
+        const platform    = args.platform    || "both";
+        const acctFilter  = (args.account_name || "").toLowerCase();
+        const activeOnly  = !!args.active_only;
+        result = { google: [], meta: [] };
+
+        if (platform === "google" || platform === "both") {
+            const { token, error: authErr } = await getGoogleAccessToken();
+            if (authErr) { result.google_error = `Auth: ${authErr}`; }
+            else {
+                for (const [cid, info] of Object.entries(GOOGLE_ACCOUNTS)) {
+                    if (acctFilter && !info.name.toLowerCase().includes(acctFilter)) continue;
+                    try {
+                        const campaigns = await listGoogleCampaignsFull(token, cid, info.mcc);
+                        const filtered  = activeOnly ? campaigns.filter(c => c.status === "ENABLED") : campaigns;
+                        if (filtered.length) {
+                            result.google.push({
+                                account: info.name,
+                                campaigns: filtered.map(c => ({
+                                    name:         c.name,
+                                    status:       c.status,
+                                    type:         c.type,
+                                    daily_budget: c.daily_budget || null,
+                                    mtd_spend:    c.mtd_spend,
+                                })),
+                            });
+                        }
+                    } catch (e) {
+                        result.google.push({ account: info.name, error: e.message });
+                    }
+                }
+            }
+        }
+
+        if (platform === "meta" || platform === "both") {
+            for (const [accountId, info] of Object.entries(META_ACCOUNTS)) {
+                if (acctFilter && !info.name.toLowerCase().includes(acctFilter)) continue;
+                try {
+                    const campaigns = await getMetaCampaigns(accountId);
+                    const adsets    = await getMetaAdsets(accountId);
+                    const filtCamp  = activeOnly ? campaigns.filter(c => c.status === "ACTIVE") : campaigns;
+                    const filtAds   = activeOnly ? adsets.filter(s => s.status === "ACTIVE") : adsets;
+                    result.meta.push({
+                        account: info.name,
+                        campaigns: filtCamp.map(c => ({
+                            name:             c.name,
+                            status:           c.status,
+                            budget_type:      c.daily_budget ? "daily" : c.lifetime_budget ? "lifetime" : "none",
+                            daily_budget:     c.daily_budget    ? "$" + c.daily_budget.toFixed(2)    : null,
+                            lifetime_budget:  c.lifetime_budget ? "$" + c.lifetime_budget.toFixed(2) : null,
+                            note:             !c.daily_budget && !c.lifetime_budget ? "Budget set at ad set level" : null,
+                        })),
+                        adsets: filtAds.map(s => ({
+                            name:            s.name,
+                            campaign:        s.campaign,
+                            status:          s.status,
+                            budget_type:     s.daily_budget ? "daily" : s.lifetime_budget ? "lifetime" : "inherited",
+                            daily_budget:    s.daily_budget    ? "$" + s.daily_budget.toFixed(2)    : null,
+                            lifetime_budget: s.lifetime_budget ? "$" + s.lifetime_budget.toFixed(2) : null,
+                        })),
+                    });
+                } catch (e) {
+                    result.meta.push({ account: info.name, error: e.message });
                 }
             }
         }
