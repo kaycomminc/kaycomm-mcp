@@ -85,10 +85,19 @@ function getPacingLabel(spent, budget, dom, dim) {
 }
 
 function getDateInfo() {
-    const today = new Date();
-    const dom   = today.getDate();
-    const dim   = new Date(today.getFullYear(), today.getMonth() + 1, 0).getDate();
-    return { today: today.toISOString().split("T")[0], dom, dim };
+    const now  = new Date();
+    const yday = new Date(now); yday.setDate(yday.getDate() - 1);
+    const fmt  = d => d.toISOString().split("T")[0];
+    const dim  = new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate();
+    const monthStart = fmt(new Date(now.getFullYear(), now.getMonth(), 1));
+    return {
+        today:      fmt(now),
+        yesterday:  fmt(yday),
+        month_start: monthStart,
+        dom:        now.getDate(),         // actual calendar day (for display)
+        pace_dom:   yday.getDate(),        // complete days elapsed (for pacing math)
+        dim,
+    };
 }
 
 // ── Google Auth ───────────────────────────────────────────────────────────────
@@ -135,10 +144,11 @@ async function googleSearch(token, customerId, mccId, query) {
     return data.results || [];
 }
 
-async function fetchGoogleMTD(token, customerId, mccId) {
+async function fetchGoogleMTD(token, customerId, mccId, monthStart, yesterday) {
+    // Pull spend from 1st of month through yesterday (complete days only — excludes today's partial data)
     try {
         const rows = await googleSearch(token, customerId, mccId,
-            "SELECT metrics.cost_micros FROM campaign WHERE segments.date DURING THIS_MONTH");
+            `SELECT metrics.cost_micros FROM campaign WHERE segments.date BETWEEN '${monthStart}' AND '${yesterday}'`);
         const micros = rows.reduce((sum, r) => sum + parseInt(r?.metrics?.costMicros || 0), 0);
         return { spend: micros / 1_000_000, error: null };
     } catch (e) {
@@ -146,12 +156,12 @@ async function fetchGoogleMTD(token, customerId, mccId) {
     }
 }
 
-async function fetchGoogleMTDbyNC(token, customerId, mccId) {
+async function fetchGoogleMTDbyNC(token, customerId, mccId, monthStart, yesterday) {
     // Returns { nc, other } where nc = NC-tagged campaigns (no PMax), other = everything else incl PMax
     try {
         const rows = await googleSearch(token, customerId, mccId, `
             SELECT campaign.name, campaign.advertising_channel_type, metrics.cost_micros
-            FROM campaign WHERE segments.date DURING THIS_MONTH`);
+            FROM campaign WHERE segments.date BETWEEN '${monthStart}' AND '${yesterday}'`);
         let nc = 0, other = 0;
         for (const row of rows) {
             const micros  = parseInt(row.metrics?.costMicros || 0);
@@ -166,10 +176,13 @@ async function fetchGoogleMTDbyNC(token, customerId, mccId) {
 }
 
 // ── Meta API ──────────────────────────────────────────────────────────────────
-async function fetchMetaMTD(accountId) {
+async function fetchMetaMTD(accountId, monthStart, yesterday) {
+    // Pull spend from 1st of month through yesterday (complete days only)
     const params = new URLSearchParams({
         access_token: META_ACCESS_TOKEN,
-        fields: "spend", date_preset: "this_month", level: "account",
+        fields: "spend",
+        time_range: JSON.stringify({ since: monthStart, until: yesterday }),
+        level: "account",
     });
     const resp = await fetchFn(`https://graph.facebook.com/${META_API_VERSION}/${accountId}/insights?${params}`);
     const data = await resp.json();
@@ -179,46 +192,45 @@ async function fetchMetaMTD(accountId) {
 }
 
 // ── Row builders ──────────────────────────────────────────────────────────────
-async function buildGoogleRows(token, dom, dim, today) {
+async function buildGoogleRows(token, pace_dom, dim, today, monthStart, yesterday) {
     const rows = [];
     for (const [cid, info] of Object.entries(GOOGLE_ACCOUNTS)) {
         const { budget, nc_budget } = getEffectiveBudget(info, today);
         if (nc_budget) {
-            // Boulevard Carroll: show total + NC/non-NC split
-            const { nc, other, error } = await fetchGoogleMTDbyNC(token, cid, info.mcc);
+            const { nc, other, error } = await fetchGoogleMTDbyNC(token, cid, info.mcc, monthStart, yesterday);
             if (error) { rows.push({ account: info.name, error }); continue; }
             const total       = nc + other;
             const ncBudget    = nc_budget;
             const otherBudget = budget - ncBudget;
             rows.push({
                 account: info.name, mtd_spend: Math.round(total * 100) / 100,
-                budget, ...getPacingLabel(total, budget, dom, dim),
+                budget, ...getPacingLabel(total, budget, pace_dom, dim),
                 breakdown: {
-                    nc:    { spend: Math.round(nc * 100) / 100,    budget: ncBudget,    ...getPacingLabel(nc, ncBudget, dom, dim) },
-                    other: { spend: Math.round(other * 100) / 100, budget: otherBudget, ...getPacingLabel(other, otherBudget, dom, dim) },
+                    nc:    { spend: Math.round(nc * 100) / 100,    budget: ncBudget,    ...getPacingLabel(nc, ncBudget, pace_dom, dim) },
+                    other: { spend: Math.round(other * 100) / 100, budget: otherBudget, ...getPacingLabel(other, otherBudget, pace_dom, dim) },
                 },
             });
         } else {
-            const { spend, error } = await fetchGoogleMTD(token, cid, info.mcc);
+            const { spend, error } = await fetchGoogleMTD(token, cid, info.mcc, monthStart, yesterday);
             if (error) { rows.push({ account: info.name, error }); continue; }
             rows.push({
                 account: info.name, mtd_spend: Math.round(spend * 100) / 100,
-                budget, ...getPacingLabel(spend, budget, dom, dim),
+                budget, ...getPacingLabel(spend, budget, pace_dom, dim),
             });
         }
     }
     return rows;
 }
 
-async function buildMetaRows(dom, dim, today) {
+async function buildMetaRows(pace_dom, dim, today, monthStart, yesterday) {
     const rows = [];
     for (const [id, info] of Object.entries(META_ACCOUNTS)) {
         const { budget } = getEffectiveBudget(info, today);
-        const { spend, error } = await fetchMetaMTD(id);
+        const { spend, error } = await fetchMetaMTD(id, monthStart, yesterday);
         if (error) { rows.push({ account: info.name, error }); continue; }
         rows.push({
             account: info.name, mtd_spend: Math.round(spend * 100) / 100,
-            budget, ...getPacingLabel(spend, budget, dom, dim),
+            budget, ...getPacingLabel(spend, budget, pace_dom, dim),
         });
     }
     return rows;
@@ -2172,21 +2184,21 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
-    const { today, dom, dim } = getDateInfo();
+    const { today, yesterday, month_start, dom, pace_dom, dim } = getDateInfo();
     let result;
 
     if (name === "get_google_pacing") {
         const { token, error } = await getGoogleAccessToken();
         if (error) return { content: [{ type: "text", text: JSON.stringify({ error: `Auth failed: ${error}` }) }] };
-        result = { date: today, day: dom, days_in_month: dim, platform: "Google Ads", accounts: await buildGoogleRows(token, dom, dim, today) };
+        result = { date: today, spend_through: yesterday, day: dom, days_in_month: dim, platform: "Google Ads", accounts: await buildGoogleRows(token, pace_dom, dim, today, month_start, yesterday) };
 
     } else if (name === "get_meta_pacing") {
-        result = { date: today, day: dom, days_in_month: dim, platform: "Meta", accounts: await buildMetaRows(dom, dim, today) };
+        result = { date: today, spend_through: yesterday, day: dom, days_in_month: dim, platform: "Meta", accounts: await buildMetaRows(pace_dom, dim, today, month_start, yesterday) };
 
     } else if (name === "get_full_pacing") {
         const { token, error } = await getGoogleAccessToken();
-        const googleRows = error ? [{ error: `Auth failed: ${error}` }] : await buildGoogleRows(token, dom, dim, today);
-        result = { date: today, day: dom, days_in_month: dim, google: googleRows, meta: await buildMetaRows(dom, dim, today) };
+        const googleRows = error ? [{ error: `Auth failed: ${error}` }] : await buildGoogleRows(token, pace_dom, dim, today, month_start, yesterday);
+        result = { date: today, spend_through: yesterday, day: dom, days_in_month: dim, google: googleRows, meta: await buildMetaRows(pace_dom, dim, today, month_start, yesterday) };
 
     } else if (name === "get_account_detail") {
         const search = (args.account_name || "").toLowerCase();
@@ -2196,11 +2208,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         for (const [id, info] of Object.entries(META_ACCOUNTS)) {
             if (info.name.toLowerCase().includes(search)) {
                 const { budget } = getEffectiveBudget(info, today);
-                const { spend, error } = await fetchMetaMTD(id);
+                const { spend, error } = await fetchMetaMTD(id, month_start, yesterday);
                 if (error) results.push({ platform: "Meta", account: info.name, error });
                 else results.push({ platform: "Meta", account: info.name,
                     mtd_spend: Math.round(spend * 100) / 100, budget,
-                    ...getPacingLabel(spend, budget, dom, dim) });
+                    ...getPacingLabel(spend, budget, pace_dom, dim) });
             }
         }
 
@@ -2210,17 +2222,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             for (const [cid, info] of Object.entries(GOOGLE_ACCOUNTS)) {
                 if (info.name.toLowerCase().includes(search)) {
                     const { budget } = getEffectiveBudget(info, today);
-                    const { spend, error } = await fetchGoogleMTD(token, cid, info.mcc);
+                    const { spend, error } = await fetchGoogleMTD(token, cid, info.mcc, month_start, yesterday);
                     if (error) results.push({ platform: "Google", account: info.name, error });
                     else results.push({ platform: "Google", account: info.name,
                         mtd_spend: Math.round(spend * 100) / 100, budget,
-                        ...getPacingLabel(spend, budget, dom, dim) });
+                        ...getPacingLabel(spend, budget, pace_dom, dim) });
                 }
             }
         }
 
         result = results.length
-            ? { date: today, day: dom, days_in_month: dim, results }
+            ? { date: today, spend_through: yesterday, day: dom, days_in_month: dim, results }
             : { error: `No account found matching '${args.account_name}'` };
 
     } else if (name === "get_search_terms") {
