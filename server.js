@@ -284,6 +284,41 @@ async function mutateNegativeKeywords(token, customerId, mccId, campaignResource
 }
 
 // ── Meta write helpers ────────────────────────────────────────────────────────
+async function metaDuplicate(id, level, newName, status = "PAUSED") {
+    // Uses Meta's /copies endpoint to deep-copy a campaign or ad set
+    const body = {
+        access_token:  META_ACCESS_TOKEN,
+        deep_copy:     true,
+        status_option: status.toUpperCase(),
+    };
+    if (newName) {
+        body.rename_options = { rename_prefix: "", rename_suffix: "" };
+        // Meta's copies endpoint doesn't directly set the name, so we'll rename after
+    }
+    const resp = await fetchFn(
+        `https://graph.facebook.com/${META_API_VERSION}/${id}/copies`,
+        {
+            method:  "POST",
+            headers: { "Content-Type": "application/json" },
+            body:    JSON.stringify(body),
+        }
+    );
+    const data = await resp.json();
+    if (data.error) throw new Error(data.error.message);
+    const newId = (data.copied_campaign_id || data.copied_adset_id || data.id);
+    // Rename if a new name was provided
+    if (newName && newId) {
+        await fetchFn(
+            `https://graph.facebook.com/${META_API_VERSION}/${newId}`,
+            {
+                method:  "POST",
+                headers: { "Content-Type": "application/json" },
+                body:    JSON.stringify({ access_token: META_ACCESS_TOKEN, name: newName }),
+            }
+        );
+    }
+    return { new_id: newId, new_name: newName || null };
+}
 async function metaGet(path, extraParams = {}) {
     const params = new URLSearchParams({ access_token: META_ACCESS_TOKEN, ...extraParams });
     const resp = await fetchFn(`https://graph.facebook.com/${META_API_VERSION}/${path}?${params}`);
@@ -1739,24 +1774,26 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         },
         {
             name: "manage_meta",
-            description: "View and manage Meta Ads campaigns and ad sets — list, pause, resume, or update budgets. " +
+            description: "View and manage Meta Ads campaigns and ad sets — list, pause, resume, update budgets, or duplicate. " +
                 "Dry run by default. Set confirm=true to apply changes. " +
-                "Actions: list_campaigns, list_adsets, pause, resume, set_daily_budget.",
+                "Actions: list_campaigns, list_adsets, pause, resume, set_daily_budget, duplicate.",
             inputSchema: {
                 type: "object",
                 properties: {
                     account_name: { type: "string", description: "Meta account name (partial match ok)" },
                     action: {
                         type: "string",
-                        description: "list_campaigns | list_adsets | pause | resume | set_daily_budget",
-                        enum: ["list_campaigns", "list_adsets", "pause", "resume", "set_daily_budget"],
+                        description: "list_campaigns | list_adsets | pause | resume | set_daily_budget | duplicate",
+                        enum: ["list_campaigns", "list_adsets", "pause", "resume", "set_daily_budget", "duplicate"],
                     },
-                    target: { type: "string", description: "Campaign or ad set name to target (partial match ok). Required for pause/resume/set_daily_budget." },
+                    target: { type: "string", description: "Campaign or ad set name to target (partial match ok). Required for pause/resume/set_daily_budget/duplicate." },
                     level: {
                         type: "string",
-                        description: "Whether target is a campaign or adset (default: adset)",
+                        description: "Whether target is a campaign or adset (default: campaign for duplicate, adset for others)",
                         enum: ["campaign", "adset"],
                     },
+                    new_name: { type: "string", description: "Name for the duplicated campaign or ad set. Optional for duplicate — defaults to 'Copy of [original name]'." },
+                    status:   { type: "string", enum: ["PAUSED", "ACTIVE", "INHERITED_FROM_SOURCE"], description: "Status for the duplicate (default: PAUSED)." },
                     budget: { type: "number", description: "New daily budget in dollars. Required for set_daily_budget." },
                     confirm: { type: "boolean", description: "Set true to apply changes. Omit for dry-run preview." },
                 },
@@ -2771,6 +2808,43 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 } else if (action === "list_adsets") {
                     const adsets = await getMetaAdsets(accountId);
                     result = { account: acctInfo.name, adsets };
+
+                } else if (action === "duplicate") {
+                    const dupLevel  = args.level || "campaign";
+                    const dupStatus = (args.status || "PAUSED").toUpperCase();
+                    if (!args.target) {
+                        result = { error: "'target' is required for duplicate. Run list_campaigns or list_adsets first to find the name." };
+                    } else {
+                        const targetSearch = args.target.toLowerCase();
+                        const all  = dupLevel === "campaign" ? await getMetaCampaigns(accountId) : await getMetaAdsets(accountId);
+                        const item = all.find(i => i.name.toLowerCase().includes(targetSearch));
+                        if (!item) {
+                            result = { error: `No ${dupLevel} matching '${args.target}'`, available: all.map(i => i.name) };
+                        } else {
+                            const copyName = args.new_name || `Copy of ${item.name}`;
+                            if (!confirm) {
+                                result = {
+                                    dry_run: true,
+                                    message: "DRY RUN — set confirm=true to duplicate",
+                                    account:      acctInfo.name,
+                                    source:       { id: item.id, name: item.name, level: dupLevel },
+                                    new_name:     copyName,
+                                    new_status:   dupStatus,
+                                    note:         "deep_copy=true — ad sets and ads will be copied too (for campaign level)",
+                                };
+                            } else {
+                                const res = await metaDuplicate(item.id, dupLevel, copyName, dupStatus);
+                                result = {
+                                    success:    true,
+                                    account:    acctInfo.name,
+                                    source:     { id: item.id, name: item.name },
+                                    new_id:     res.new_id,
+                                    new_name:   copyName,
+                                    new_status: dupStatus,
+                                };
+                            }
+                        }
+                    }
 
                 } else {
                     // pause / resume / set_daily_budget — need a target
