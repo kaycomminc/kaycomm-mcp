@@ -6,6 +6,8 @@
  */
 
 const http    = require("http");
+const fs      = require("fs");
+const path    = require("path");
 const { Server } = require("@modelcontextprotocol/sdk/server/index.js");
 const { StdioServerTransport } = require("@modelcontextprotocol/sdk/server/stdio.js");
 const { SSEServerTransport }   = require("@modelcontextprotocol/sdk/server/sse.js");
@@ -20,37 +22,39 @@ const GOOGLE_DEVELOPER_TOKEN = process.env.GOOGLE_DEVELOPER_TOKEN;
 const GOOGLE_CLIENT_ID       = process.env.GOOGLE_CLIENT_ID;
 const GOOGLE_CLIENT_SECRET   = process.env.GOOGLE_CLIENT_SECRET;
 const GOOGLE_REFRESH_TOKEN   = process.env.GOOGLE_REFRESH_TOKEN;
-const GOOGLE_API_VERSION     = "v20";
+const GOOGLE_API_VERSION     = "v21";
 
 const META_ACCESS_TOKEN = process.env.META_ACCESS_TOKEN;
 const META_API_VERSION  = "v21.0";
 
-// ── Google Accounts ───────────────────────────────────────────────────────────
-// mcc = login-customer-id (managing MCC, or account itself if self-managed)
-// nc_budget = if set, Boulevard Carroll NC sub-budget (excludes PMax)
-const GOOGLE_ACCOUNTS = {
-    "9547060400": { name: "Eye Associates of NF",   budget: 2500, mcc: "9547060400" },
-    "5976116321": { name: "Nationwide Southwest",    budget: 1000, mcc: "7631184147" },
-    "9694376492": { name: "Enzoic",                  budget: 1800, mcc: "9694376492" },
-    "9040402786": { name: "Alderwood Psychological", budget: 650,  mcc: "7631184147" },
-    "2908157845": { name: "Boulevard Carroll",       budget: 3500, mcc: "7631184147", nc_budget: 1000 },
-    "8459391760": { name: "Outside The Breadbox",    budget: 375,  mcc: "7631184147" },
-    "1481569045": { name: "Woca Woodcare",           budget: 2500, mcc: "7631184147" },
-    "2696762909": { name: "Warrior Advocates",       budget: 300,  mcc: "8621281595", ga4: "14591178781" },
-    "8184463966": { name: "Spartan Exteriors",       budget: 500,  mcc: "8184463966", budget_schedule: [{ from: "2026-06-01", budget: 2000 }] },
-    "6631800329": { name: "Summit Express",          budget: 0,    mcc: "7631184147" },
-    "2275371078": { name: "Childrens Therapy Services of Colorado", budget: 1000, mcc: "7631184147" },
-};
+const STACKADAPT_API_KEY = process.env.STACKADAPT_API_KEY;
+const STACKADAPT_URL     = "https://api.stackadapt.com/graphql";
 
-// ── Meta Accounts ─────────────────────────────────────────────────────────────
-const META_ACCOUNTS = {
-    "act_287139600343581":  { name: "Nationwide Southwest", budget: 1000 },
-    "act_6128243883951018": { name: "Warrior Advocates",    budget: 300  },
-    "act_866700669704203":  { name: "Spartan Exteriors",    budget: 1000 },
-    "act_482088457883195":  { name: "Summit Express",       budget: 0    },
-    // Two flights: Revive Day $425 (May 25–Jun 4), Domestic Abuse Training $1,020 (May 25–Jun 5)
-    "act_1527255801416040": { name: "Florida DOH Monroe County", budget: 1445, flight_end: "2026-06-05" },
-};
+// ── Accounts — loaded from accounts.json ─────────────────────────────────────
+// Google fields: name, budget, mcc (login-customer-id), nc_budget?, ga4?,
+//                budget_schedule? [{from, budget, nc_budget?}], flight_start?, flight_end?
+// Meta fields:   name, budget, budget_schedule?, flight_start?, flight_end?
+// Edit via the manage_accounts tool — changes persist to accounts.json.
+// NOTE: on Railway the filesystem is ephemeral; commit accounts.json to git
+// so cloud deploys pick up account changes.
+const ACCOUNTS_FILE = path.join(__dirname, "accounts.json");
+let GOOGLE_ACCOUNTS = {};
+let META_ACCOUNTS = {};
+let STACKADAPT_ADVERTISERS = {};
+
+function loadAccounts() {
+    const data = JSON.parse(fs.readFileSync(ACCOUNTS_FILE, "utf8"));
+    GOOGLE_ACCOUNTS        = data.google     || {};
+    META_ACCOUNTS          = data.meta       || {};
+    STACKADAPT_ADVERTISERS = data.stackadapt || {};
+}
+
+function saveAccounts() {
+    const data = { google: GOOGLE_ACCOUNTS, meta: META_ACCOUNTS, stackadapt: STACKADAPT_ADVERTISERS };
+    fs.writeFileSync(ACCOUNTS_FILE, JSON.stringify(data, null, 2) + "\n");
+}
+
+loadAccounts();
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -76,27 +80,69 @@ function getEffectiveBudget(info, today) {
 
 function getPacingLabel(spent, budget, dom, dim) {
     if (!budget) return { status: "no_cap" };
+    if (!dom)    return { status: "NO_COMPLETE_DAYS_YET", note: "First day of the month — no complete days to pace against yet.", remaining: Math.round((budget - spent) * 100) / 100 };
     const expected    = budget * (dom / dim);
     const pctBudget   = Math.round((spent / budget) * 100 * 10) / 10;
     const pctExpected = expected > 0 ? Math.round((spent / expected) * 100 * 10) / 10 : 0;
     const remaining   = Math.round((budget - spent) * 100) / 100;
     const status      = pctExpected >= 105 ? "OVERPACING" : pctExpected <= 85 ? "UNDERPACING" : "ON PACE";
-    return { status, pct_budget: pctBudget, pct_expected: pctExpected, remaining };
+    const projected   = Math.round((spent / dom) * dim * 100) / 100;
+    return {
+        status, pct_budget: pctBudget, pct_expected: pctExpected, remaining,
+        projected_month_end: projected,
+        projected_vs_budget: Math.round((projected - budget) * 100) / 100,
+    };
+}
+
+// Pacing for flight-based budgets (fixed start/end dates instead of calendar months)
+function getFlightPacing(spent, budget, flightStart, flightEnd, yesterday) {
+    const day = s => Date.UTC(+s.slice(0, 4), +s.slice(5, 7) - 1, +s.slice(8, 10)) / 86400000;
+    const totalDays   = day(flightEnd) - day(flightStart) + 1;
+    const elapsedDays = Math.max(0, Math.min(totalDays, day(yesterday) - day(flightStart) + 1));
+    const remaining   = Math.round((budget - spent) * 100) / 100;
+    const base = {
+        flight: `${flightStart} → ${flightEnd}`,
+        flight_days: totalDays,
+        complete_days_elapsed: elapsedDays,
+        budget, remaining,
+        pct_budget: budget ? Math.round((spent / budget) * 100 * 10) / 10 : null,
+    };
+    if (elapsedDays <= 0) return { status: "FLIGHT_NOT_STARTED", ...base };
+    if (day(yesterday) >= day(flightEnd)) {
+        return { status: "FLIGHT_ENDED", ...base, note: spent < budget * 0.95 ? "Flight ended under budget." : "Flight delivered in full." };
+    }
+    const expected    = budget * (elapsedDays / totalDays);
+    const pctExpected = expected > 0 ? Math.round((spent / expected) * 100 * 10) / 10 : 0;
+    const daysLeft    = totalDays - elapsedDays;
+    const status      = pctExpected >= 105 ? "OVERPACING" : pctExpected <= 85 ? "UNDERPACING" : "ON PACE";
+    return {
+        status, ...base,
+        pct_expected: pctExpected,
+        days_remaining: daysLeft,
+        needed_per_day: daysLeft > 0 ? Math.round((remaining / daysLeft) * 100) / 100 : null,
+        projected_flight_end: Math.round((spent / elapsedDays) * totalDays * 100) / 100,
+    };
 }
 
 function getDateInfo() {
-    const now  = new Date();
-    const yday = new Date(now); yday.setDate(yday.getDate() - 1);
-    const fmt  = d => d.toISOString().split("T")[0];
-    const dim  = new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate();
-    const monthStart = fmt(new Date(now.getFullYear(), now.getMonth(), 1));
+    // All date math pinned to the agency timezone so the local Mac (ET) and
+    // Railway (UTC) produce identical reports, and "yesterday" matches the
+    // ad platforms' reporting day.
+    const TZ = process.env.REPORT_TIMEZONE || "America/New_York";
+    const today = new Intl.DateTimeFormat("en-CA", { timeZone: TZ, year: "numeric", month: "2-digit", day: "2-digit" })
+        .format(new Date()); // en-CA → YYYY-MM-DD
+    const [y, m, d] = today.split("-").map(Number);
+    const yday = new Date(Date.UTC(y, m - 1, d - 1));
+    const fmt  = dt => dt.toISOString().split("T")[0];
     return {
-        today:      fmt(now),
-        yesterday:  fmt(yday),
-        month_start: monthStart,
-        dom:        now.getDate(),         // actual calendar day (for display)
-        pace_dom:   yday.getDate(),        // complete days elapsed (for pacing math)
-        dim,
+        today,
+        yesterday:   fmt(yday),
+        month_start: `${y}-${String(m).padStart(2, "0")}-01`,
+        dom:         d,                                  // actual calendar day (for display)
+        // Complete days elapsed this month. On the 1st, yesterday belongs to the
+        // previous month — 0 complete days, not yesterday's date (which would be 28-31).
+        pace_dom:    d === 1 ? 0 : yday.getUTCDate(),
+        dim:         new Date(Date.UTC(y, m, 0)).getUTCDate(),
     };
 }
 
@@ -196,7 +242,16 @@ async function buildGoogleRows(token, pace_dom, dim, today, monthStart, yesterda
     const rows = [];
     for (const [cid, info] of Object.entries(GOOGLE_ACCOUNTS)) {
         const { budget, nc_budget } = getEffectiveBudget(info, today);
-        if (nc_budget) {
+        if (info.flight_start && info.flight_end) {
+            // Flight-based budget: spend over the flight window, paced against flight days
+            const until = yesterday < info.flight_end ? yesterday : info.flight_end;
+            const { spend, error } = await fetchGoogleMTD(token, cid, info.mcc, info.flight_start, until);
+            if (error) { rows.push({ account: info.name, error }); continue; }
+            rows.push({
+                account: info.name, flight_spend: Math.round(spend * 100) / 100,
+                ...getFlightPacing(spend, budget, info.flight_start, info.flight_end, yesterday),
+            });
+        } else if (nc_budget) {
             const { nc, other, error } = await fetchGoogleMTDbyNC(token, cid, info.mcc, monthStart, yesterday);
             if (error) { rows.push({ account: info.name, error }); continue; }
             const total       = nc + other;
@@ -226,6 +281,17 @@ async function buildMetaRows(pace_dom, dim, today, monthStart, yesterday) {
     const rows = [];
     for (const [id, info] of Object.entries(META_ACCOUNTS)) {
         const { budget } = getEffectiveBudget(info, today);
+        if (info.flight_start && info.flight_end) {
+            // Flight-based budget: spend over the flight window, paced against flight days
+            const until = yesterday < info.flight_end ? yesterday : info.flight_end;
+            const { spend, error } = await fetchMetaMTD(id, info.flight_start, until);
+            if (error) { rows.push({ account: info.name, error }); continue; }
+            rows.push({
+                account: info.name, flight_spend: Math.round(spend * 100) / 100,
+                ...getFlightPacing(spend, budget, info.flight_start, info.flight_end, yesterday),
+            });
+            continue;
+        }
         const { spend, error } = await fetchMetaMTD(id, monthStart, yesterday);
         if (error) { rows.push({ account: info.name, error }); continue; }
         rows.push({
@@ -1349,6 +1415,179 @@ async function createAdGroupInCampaign(token, customerId, mccId, campaignResourc
     };
 }
 
+// ── StackAdapt ────────────────────────────────────────────────────────────────
+async function stackAdaptGQL(query) {
+    if (!STACKADAPT_API_KEY) throw new Error("STACKADAPT_API_KEY env var not set.");
+    const resp = await fetchFn(STACKADAPT_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${STACKADAPT_API_KEY}` },
+        body: JSON.stringify({ query }),
+    });
+    if (!resp.ok) throw new Error(`StackAdapt API ${resp.status}: ${await resp.text()}`);
+    const json = await resp.json();
+    if (json.errors?.length) throw new Error(json.errors.map(e => e.message).join("; "));
+    return json.data;
+}
+
+async function fetchStackAdaptSpend(advertiserId, from, to) {
+    const data = await stackAdaptGQL(`{
+        campaignDelivery(
+            dataType: TABLE
+            granularity: TOTAL
+            date: { from: "${from}", to: "${to}" }
+            filterBy: { advertiserIds: [${parseInt(advertiserId)}] }
+        ) {
+            ... on CampaignDeliveryOutcome {
+                records { nodes { campaign { id name } metrics { cost } } }
+            }
+        }
+    }`);
+    const nodes = data?.campaignDelivery?.records?.nodes || [];
+    const spend = nodes.reduce((s, n) => s + parseFloat(n.metrics?.cost || 0), 0);
+    return { spend, campaigns: nodes.map(n => ({ name: n.campaign?.name, cost: parseFloat(n.metrics?.cost || 0) })) };
+}
+
+async function buildStackAdaptRows(pace_dom, dim, today, monthStart, yesterday) {
+    const rows = [];
+    for (const [advId, info] of Object.entries(STACKADAPT_ADVERTISERS)) {
+        const { budget } = getEffectiveBudget(info, today);
+        try {
+            if (info.flight_start && info.flight_end) {
+                const until = yesterday < info.flight_end ? yesterday : info.flight_end;
+                const { spend } = await fetchStackAdaptSpend(advId, info.flight_start, until);
+                rows.push({ account: info.name, flight_spend: Math.round(spend * 100) / 100,
+                    ...getFlightPacing(spend, budget, info.flight_start, info.flight_end, yesterday) });
+            } else {
+                const { spend } = await fetchStackAdaptSpend(advId, monthStart, yesterday);
+                rows.push({ account: info.name, mtd_spend: Math.round(spend * 100) / 100,
+                    budget, ...getPacingLabel(spend, budget, pace_dom, dim) });
+            }
+        } catch (e) { rows.push({ account: info.name, error: e.message }); }
+    }
+    return rows;
+}
+
+// ── Account health helpers ────────────────────────────────────────────────────
+
+function gaqlEsc(s) {
+    return String(s).replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+}
+
+function daysAgo(n, fromDate) {
+    const [y, m, d] = fromDate.split("-").map(Number);
+    return new Date(Date.UTC(y, m - 1, d - n)).toISOString().split("T")[0];
+}
+
+async function fetchConversionHealth(token, customerId, mccId) {
+    // All enabled conversion actions, then 30d/7d volume to spot ones that went silent
+    const actions = await googleSearch(token, customerId, mccId, `
+        SELECT conversion_action.name, conversion_action.type, conversion_action.category,
+               conversion_action.primary_for_goal
+        FROM conversion_action
+        WHERE conversion_action.status = 'ENABLED'`);
+    const volumeQuery = range => googleSearch(token, customerId, mccId, `
+        SELECT conversion_action.name, metrics.all_conversions
+        FROM conversion_action
+        WHERE segments.date DURING ${range}`).catch(() => []);
+    const [d30, d7] = await Promise.all([volumeQuery("LAST_30_DAYS"), volumeQuery("LAST_7_DAYS")]);
+    const vol = rows => Object.fromEntries(rows.map(r => [r.conversionAction.name, parseFloat(r.metrics?.allConversions || 0)]));
+    const v30 = vol(d30), v7 = vol(d7);
+
+    return actions.map(r => {
+        const name = r.conversionAction.name;
+        const c30 = v30[name] || 0, c7 = v7[name] || 0;
+        let health;
+        if (c7 > 0)       health = "OK";
+        else if (c30 > 0) health = "GONE_SILENT";   // fired in the last 30d but not the last 7d
+        else              health = "INACTIVE_30D";  // nothing in 30 days
+        return {
+            conversion_action: name,
+            type:     r.conversionAction.type,
+            category: r.conversionAction.category,
+            primary:  !!r.conversionAction.primaryForGoal,
+            conversions_30d: c30,
+            conversions_7d:  c7,
+            health,
+        };
+    });
+}
+
+async function fetchAdDisapprovals(token, customerId, mccId) {
+    // Ads in enabled campaigns whose policy status is anything other than clean APPROVED
+    const rows = await googleSearch(token, customerId, mccId, `
+        SELECT campaign.name, ad_group.name, ad_group_ad.ad.id, ad_group_ad.ad.type,
+               ad_group_ad.status,
+               ad_group_ad.policy_summary.approval_status,
+               ad_group_ad.policy_summary.review_status,
+               ad_group_ad.policy_summary.policy_topic_entries
+        FROM ad_group_ad
+        WHERE ad_group_ad.status != 'REMOVED'
+          AND campaign.status = 'ENABLED'
+          AND ad_group.status != 'REMOVED'`);
+    return rows
+        .filter(r => (r.adGroupAd.policySummary?.approvalStatus || "APPROVED") !== "APPROVED")
+        .map(r => ({
+            campaign:        r.campaign.name,
+            ad_group:        r.adGroup.name,
+            ad_id:           r.adGroupAd.ad.id,
+            ad_type:         r.adGroupAd.ad.type,
+            ad_status:       r.adGroupAd.status,
+            approval_status: r.adGroupAd.policySummary?.approvalStatus,
+            review_status:   r.adGroupAd.policySummary?.reviewStatus,
+            policy_topics:   (r.adGroupAd.policySummary?.policyTopicEntries || []).map(t => ({ topic: t.topic, type: t.type })),
+        }));
+}
+
+async function fetchGoogleDailySpend(token, customerId, mccId, startDate, endDate) {
+    const rows = await googleSearch(token, customerId, mccId, `
+        SELECT segments.date, metrics.cost_micros, metrics.clicks
+        FROM customer
+        WHERE segments.date BETWEEN '${startDate}' AND '${endDate}'`);
+    const byDate = {};
+    for (const r of rows) {
+        byDate[r.segments.date] = (byDate[r.segments.date] || 0) + parseInt(r.metrics?.costMicros || 0) / 1_000_000;
+    }
+    return byDate;
+}
+
+async function fetchMetaDailySpend(accountId, startDate, endDate) {
+    const params = new URLSearchParams({
+        access_token: META_ACCESS_TOKEN,
+        fields: "spend",
+        time_range: JSON.stringify({ since: startDate, until: endDate }),
+        time_increment: "1",
+        level: "account",
+    });
+    const resp = await fetchFn(`https://graph.facebook.com/${META_API_VERSION}/${accountId}/insights?${params}`);
+    const data = await resp.json();
+    if (data.error) throw new Error(data.error.message);
+    const byDate = {};
+    for (const row of (data.data || [])) byDate[row.date_start] = parseFloat(row.spend || 0);
+    return byDate;
+}
+
+function detectSpendAnomaly(byDate, yesterday) {
+    // Compare yesterday against the trailing 7-day average before it
+    const ydaySpend = byDate[yesterday] || 0;
+    const prior = [];
+    for (let i = 1; i <= 7; i++) prior.push(byDate[daysAgo(i, yesterday)] ?? 0);
+    const avg = prior.reduce((s, v) => s + v, 0) / prior.length;
+    if (avg < 5 && ydaySpend < 5) return null; // too small to be meaningful
+    const pct = avg > 0 ? Math.round(((ydaySpend - avg) / avg) * 100) : (ydaySpend > 0 ? Infinity : 0);
+    if (pct >= 75)  return { type: "SPEND_SPIKE", yesterday: ydaySpend, trailing_7d_avg: Math.round(avg * 100) / 100, change: `+${pct}%` };
+    if (pct <= -60) return { type: "SPEND_DROP",  yesterday: ydaySpend, trailing_7d_avg: Math.round(avg * 100) / 100, change: `${pct}%` };
+    return null;
+}
+
+async function fetchZeroImpressionCampaigns(token, customerId, mccId, yesterday) {
+    const rows = await googleSearch(token, customerId, mccId, `
+        SELECT campaign.name, campaign.status, metrics.impressions
+        FROM campaign
+        WHERE segments.date = '${yesterday}'
+          AND campaign.status = 'ENABLED'`);
+    return rows.filter(r => parseInt(r.metrics?.impressions || 0) === 0).map(r => r.campaign.name);
+}
+
 // ── Write helpers: bidding, campaign create, RSA update, extensions ──────────
 
 function buildBiddingUpdateBody(strategy, options = {}) {
@@ -2041,6 +2280,72 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             },
         },
         {
+            name: "get_conversion_health",
+            description: "Check Google Ads conversion tracking health — lists every enabled conversion action with 30-day and 7-day volume and flags actions that have GONE_SILENT (fired in 30d but not 7d — possible broken tag) or are INACTIVE_30D. Run across all accounts or one.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    account_name: { type: "string", description: "Client name (partial match ok). Omit to check all accounts." },
+                },
+                required: [],
+            },
+        },
+        {
+            name: "get_ad_disapprovals",
+            description: "Find disapproved or limited ads across Google Ads accounts — pulls policy approval status and policy topics for every ad in enabled campaigns. Run across all accounts or one.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    account_name: { type: "string", description: "Client name (partial match ok). Omit to check all accounts." },
+                },
+                required: [],
+            },
+        },
+        {
+            name: "check_anomalies",
+            description: "Scan all accounts for spend anomalies — yesterday's spend vs trailing 7-day average (spikes ≥ +75%, drops ≤ -60%) on Google and Meta, plus enabled Google campaigns that served zero impressions yesterday.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    platform: { type: "string", enum: ["google", "meta", "both"], description: "Platform to scan (default: both)" },
+                },
+                required: [],
+            },
+        },
+        {
+            name: "health_check",
+            description: "Verify API credentials are working — Google Ads token refresh, Meta token validity and expiration date (Meta tokens expire ~every 60 days). Run this if tools start failing, or weekly as a precaution.",
+            inputSchema: { type: "object", properties: {}, required: [] },
+        },
+        {
+            name: "manage_accounts",
+            description: "List, add, update, or remove tracked client accounts (Google Ads, Meta, StackAdapt) without code changes. " +
+                "Writes to accounts.json. Dry run by default — set confirm=true to save. " +
+                "After saving, commit accounts.json to git so Railway picks up the change.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    action:   { type: "string", enum: ["list", "add", "update", "remove"], description: "What to do (default: list)" },
+                    platform: { type: "string", enum: ["google", "meta", "stackadapt"], description: "Which platform the account belongs to. Required for add/update/remove." },
+                    id:       { type: "string", description: "Account ID — Google customer ID (10 digits), Meta act_XXX, or StackAdapt advertiser ID. Required for add/update/remove." },
+                    name:     { type: "string", description: "Client display name (required for add)" },
+                    budget:   { type: "number", description: "Monthly budget in dollars (required for add; flights use total flight budget)" },
+                    mcc:      { type: "string", description: "Google only: managing MCC login-customer-id (defaults to the account ID itself)" },
+                    ga4:      { type: "string", description: "Google only: GA4 property ID" },
+                    nc_budget: { type: "number", description: "Google only: NC sub-budget (Boulevard Carroll pattern)" },
+                    flight_start: { type: "string", description: "YYYY-MM-DD — set with flight_end for flight-based pacing instead of monthly" },
+                    flight_end:   { type: "string", description: "YYYY-MM-DD — last day of the flight" },
+                    budget_schedule: {
+                        type: "array",
+                        description: "Future budget changes: [{from: 'YYYY-MM-DD', budget: 2000}]",
+                        items: { type: "object", properties: { from: { type: "string" }, budget: { type: "number" }, nc_budget: { type: "number" } }, required: ["from"] },
+                    },
+                    confirm: { type: "boolean", description: "Set true to write accounts.json. Omit for dry run." },
+                },
+                required: [],
+            },
+        },
+        {
             name: "sync_accounts",
             description: "Discover all Google Ads and Meta ad accounts you have access to and compare against what's currently tracked. " +
                 "Filters out accounts under specified Meta business managers. " +
@@ -2417,8 +2722,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     ],
 }));
 
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-    const { name, arguments: args } = request.params;
+async function handleToolCall(name, args = {}) {
     const { today, yesterday, month_start, dom, pace_dom, dim } = getDateInfo();
     let result;
 
@@ -2434,6 +2738,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const { token, error } = await getGoogleAccessToken();
         const googleRows = error ? [{ error: `Auth failed: ${error}` }] : await buildGoogleRows(token, pace_dom, dim, today, month_start, yesterday);
         result = { date: today, spend_through: yesterday, day: dom, days_in_month: dim, google: googleRows, meta: await buildMetaRows(pace_dom, dim, today, month_start, yesterday) };
+        if (Object.keys(STACKADAPT_ADVERTISERS).length) {
+            result.stackadapt = await buildStackAdaptRows(pace_dom, dim, today, month_start, yesterday);
+        }
 
     } else if (name === "get_account_detail") {
         const search = (args.account_name || "").toLowerCase();
@@ -3169,6 +3476,226 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             }
         }
 
+    } else if (name === "get_conversion_health") {
+        const search = (args.account_name || "").toLowerCase();
+        const { token, error: authErr } = await getGoogleAccessToken();
+        if (authErr) { result = { error: `Auth: ${authErr}` }; }
+        else {
+            const targets = Object.entries(GOOGLE_ACCOUNTS)
+                .filter(([, i]) => !search || i.name.toLowerCase().includes(search));
+            if (!targets.length) { result = { error: `No Google account matching '${args.account_name}'` }; }
+            else {
+                const accounts = [];
+                for (const [cid, info] of targets) {
+                    try {
+                        const actions = await fetchConversionHealth(token, cid, info.mcc);
+                        const silent   = actions.filter(a => a.health === "GONE_SILENT");
+                        const inactive = actions.filter(a => a.health === "INACTIVE_30D");
+                        const allSilent = actions.length > 0 && actions.every(a => a.conversions_7d === 0);
+                        accounts.push({
+                            account: info.name,
+                            total_actions: actions.length,
+                            alert: allSilent ? "⚠️ NO conversion action fired in 7 days — tracking may be broken account-wide"
+                                 : silent.length ? `${silent.length} action(s) gone silent in the last 7 days`
+                                 : null,
+                            gone_silent: silent,
+                            inactive_30d: inactive,
+                            healthy: actions.filter(a => a.health === "OK"),
+                        });
+                    } catch (e) { accounts.push({ account: info.name, error: e.message }); }
+                }
+                result = { checked: accounts.length, accounts };
+            }
+        }
+
+    } else if (name === "get_ad_disapprovals") {
+        const search = (args.account_name || "").toLowerCase();
+        const { token, error: authErr } = await getGoogleAccessToken();
+        if (authErr) { result = { error: `Auth: ${authErr}` }; }
+        else {
+            const targets = Object.entries(GOOGLE_ACCOUNTS)
+                .filter(([, i]) => !search || i.name.toLowerCase().includes(search));
+            if (!targets.length) { result = { error: `No Google account matching '${args.account_name}'` }; }
+            else {
+                const accounts = [];
+                let totalIssues = 0;
+                for (const [cid, info] of targets) {
+                    try {
+                        const issues = await fetchAdDisapprovals(token, cid, info.mcc);
+                        totalIssues += issues.length;
+                        if (issues.length) accounts.push({ account: info.name, issue_count: issues.length, ads: issues });
+                    } catch (e) { accounts.push({ account: info.name, error: e.message }); }
+                }
+                result = {
+                    checked: targets.length,
+                    total_flagged_ads: totalIssues,
+                    message: totalIssues === 0 ? "✅ All ads in enabled campaigns are fully approved." : `${totalIssues} ad(s) need attention.`,
+                    accounts,
+                };
+            }
+        }
+
+    } else if (name === "check_anomalies") {
+        const platform = args.platform || "both";
+        const start8   = daysAgo(8, yesterday);
+        const flags    = [];
+        const errors   = [];
+
+        if (platform === "google" || platform === "both") {
+            const { token, error: authErr } = await getGoogleAccessToken();
+            if (authErr) { errors.push(`Google auth: ${authErr}`); }
+            else {
+                for (const [cid, info] of Object.entries(GOOGLE_ACCOUNTS)) {
+                    if (info.flight_end && info.flight_end < yesterday) continue; // flight over — spend stopping is expected
+                    try {
+                        const [byDate, zeroImp] = await Promise.all([
+                            fetchGoogleDailySpend(token, cid, info.mcc, start8, yesterday),
+                            fetchZeroImpressionCampaigns(token, cid, info.mcc, yesterday),
+                        ]);
+                        const anomaly = detectSpendAnomaly(byDate, yesterday);
+                        if (anomaly) flags.push({ platform: "Google", account: info.name, ...anomaly });
+                        if (zeroImp.length) flags.push({ platform: "Google", account: info.name, type: "ZERO_IMPRESSIONS_YESTERDAY", campaigns: zeroImp });
+                    } catch (e) { errors.push(`${info.name} (Google): ${e.message}`); }
+                }
+            }
+        }
+
+        if (platform === "meta" || platform === "both") {
+            for (const [accountId, info] of Object.entries(META_ACCOUNTS)) {
+                if (info.flight_end && info.flight_end < yesterday) continue; // flight over — spend stopping is expected
+                try {
+                    const byDate  = await fetchMetaDailySpend(accountId, start8, yesterday);
+                    const anomaly = detectSpendAnomaly(byDate, yesterday);
+                    if (anomaly) flags.push({ platform: "Meta", account: info.name, ...anomaly });
+                } catch (e) { errors.push(`${info.name} (Meta): ${e.message}`); }
+            }
+        }
+
+        result = {
+            date_checked: yesterday,
+            anomalies_found: flags.length,
+            message: flags.length === 0 ? "✅ No spend anomalies detected." : `${flags.length} anomaly(ies) found — review below.`,
+            anomalies: flags,
+            ...(errors.length ? { errors } : {}),
+        };
+
+    } else if (name === "health_check") {
+        const checks = {};
+
+        // Google: token refresh + a trivial query against the first account
+        const { token, error: gErr } = await getGoogleAccessToken();
+        if (gErr) {
+            checks.google = { status: "❌ FAILING", error: gErr };
+        } else {
+            try {
+                const [cid, info] = Object.entries(GOOGLE_ACCOUNTS)[0];
+                await googleSearch(token, cid, info.mcc, "SELECT customer.id FROM customer LIMIT 1");
+                checks.google = { status: "✅ OK", note: "Token refresh and API query both working." };
+            } catch (e) {
+                checks.google = { status: "⚠️ TOKEN OK, QUERY FAILING", error: e.message };
+            }
+        }
+
+        // Meta: identity + token expiry via debug_token
+        try {
+            const me = await metaGet("me", { fields: "id,name" });
+            let expiry = null;
+            try {
+                const dbg = await metaGet("debug_token", { input_token: META_ACCESS_TOKEN });
+                const exp  = dbg.data?.expires_at;
+                const dexp = dbg.data?.data_access_expires_at;
+                const days = ts => ts ? Math.floor((ts * 1000 - Date.now()) / 86400000) : null;
+                expiry = {
+                    token_expires:        exp === 0 ? "never" : exp ? `${days(exp)} days (${new Date(exp * 1000).toISOString().split("T")[0]})` : "unknown",
+                    data_access_expires:  dexp ? `${days(dexp)} days (${new Date(dexp * 1000).toISOString().split("T")[0]})` : "unknown",
+                };
+                const soonest = Math.min(...[exp, dexp].filter(t => t > 0).map(t => days(t)));
+                if (isFinite(soonest) && soonest <= 14) expiry.warning = `⚠️ Meta token expires in ${soonest} days — regenerate it soon.`;
+            } catch (_) { /* debug_token can fail on some token types; identity check already passed */ }
+            checks.meta = { status: "✅ OK", authenticated_as: me.name, ...(expiry ? { expiry } : {}) };
+        } catch (e) {
+            checks.meta = { status: "❌ FAILING", error: e.message };
+        }
+
+        checks.accounts_tracked = {
+            google: Object.keys(GOOGLE_ACCOUNTS).length,
+            meta: Object.keys(META_ACCOUNTS).length,
+            stackadapt: Object.keys(STACKADAPT_ADVERTISERS).length,
+        };
+        result = checks;
+
+    } else if (name === "manage_accounts") {
+        const action   = args.action || "list";
+        const platform = args.platform;
+        const confirm  = !!args.confirm;
+        const stores   = { google: GOOGLE_ACCOUNTS, meta: META_ACCOUNTS, stackadapt: STACKADAPT_ADVERTISERS };
+
+        if (action === "list") {
+            result = {
+                accounts_file: ACCOUNTS_FILE,
+                google:     Object.entries(GOOGLE_ACCOUNTS).map(([id, a]) => ({ id, ...a })),
+                meta:       Object.entries(META_ACCOUNTS).map(([id, a]) => ({ id, ...a })),
+                stackadapt: Object.entries(STACKADAPT_ADVERTISERS).map(([id, a]) => ({ id, ...a })),
+            };
+        } else if (!platform || !stores[platform]) {
+            result = { error: "platform (google | meta | stackadapt) is required for add/update/remove." };
+        } else if (!args.id) {
+            result = { error: "id is required for add/update/remove." };
+        } else {
+            const store = stores[platform];
+            const id    = platform === "meta" && !args.id.startsWith("act_") ? `act_${args.id}` : args.id;
+
+            if (action === "add") {
+                if (store[id]) {
+                    result = { error: `${id} already exists (${store[id].name}). Use action=update to modify it.` };
+                } else if (!args.name || args.budget == null) {
+                    result = { error: "name and budget are required for add." };
+                } else {
+                    const entry = { name: args.name, budget: args.budget };
+                    if (platform === "google") entry.mcc = args.mcc || id;
+                    for (const f of ["ga4", "nc_budget", "flight_start", "flight_end", "budget_schedule"]) {
+                        if (args[f] != null) entry[f] = args[f];
+                    }
+                    if (!confirm) {
+                        result = { dry_run: true, message: "DRY RUN — set confirm=true to save", platform, id, entry };
+                    } else {
+                        store[id] = entry;
+                        saveAccounts();
+                        result = { success: true, platform, id, entry, note: "Saved to accounts.json. Commit + push to git so Railway picks it up." };
+                    }
+                }
+            } else if (action === "update") {
+                if (!store[id]) {
+                    result = { error: `${id} not found in ${platform} accounts.`, available: Object.entries(store).map(([k, a]) => `${k} (${a.name})`) };
+                } else {
+                    const changes = {};
+                    for (const f of ["name", "budget", "mcc", "ga4", "nc_budget", "flight_start", "flight_end", "budget_schedule"]) {
+                        if (args[f] != null) changes[f] = args[f];
+                    }
+                    if (!Object.keys(changes).length) {
+                        result = { error: "No fields to update. Provide name, budget, mcc, ga4, nc_budget, flight_start, flight_end, or budget_schedule." };
+                    } else if (!confirm) {
+                        result = { dry_run: true, message: "DRY RUN — set confirm=true to save", platform, id, current: store[id], changes };
+                    } else {
+                        Object.assign(store[id], changes);
+                        saveAccounts();
+                        result = { success: true, platform, id, account: store[id], note: "Saved to accounts.json. Commit + push to git so Railway picks it up." };
+                    }
+                }
+            } else if (action === "remove") {
+                if (!store[id]) {
+                    result = { error: `${id} not found in ${platform} accounts.` };
+                } else if (!confirm) {
+                    result = { dry_run: true, message: "DRY RUN — set confirm=true to remove", platform, id, account: store[id] };
+                } else {
+                    const removed = store[id];
+                    delete store[id];
+                    saveAccounts();
+                    result = { success: true, removed: { id, ...removed }, note: "Saved to accounts.json. Commit + push to git so Railway picks it up." };
+                }
+            }
+        }
+
     } else if (name === "sync_accounts") {
         const platform           = args.platform || "both";
         const excludeBizIds      = args.exclude_business_ids || [];
@@ -3863,6 +4390,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         result = { error: `Unknown tool: ${name}` };
     }
 
+    return result;
+}
+
+server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    const { name, arguments: args } = request.params;
+    const result = await handleToolCall(name, args || {});
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
 });
 
@@ -3931,4 +4464,6 @@ async function main() {
     }
 }
 
-main().catch(console.error);
+module.exports = { handleToolCall };
+
+if (!process.env.MCP_TEST) main().catch(console.error);

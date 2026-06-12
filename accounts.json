@@ -1,0 +1,28 @@
+{
+  "google": {
+    "9547060400": { "name": "Eye Associates of NF",   "budget": 2500, "mcc": "9547060400" },
+    "5976116321": { "name": "Nationwide Southwest",    "budget": 1000, "mcc": "7631184147" },
+    "9694376492": { "name": "Enzoic",                  "budget": 1800, "mcc": "9694376492" },
+    "9040402786": { "name": "Alderwood Psychological", "budget": 650,  "mcc": "7631184147" },
+    "2908157845": { "name": "Boulevard Carroll",       "budget": 3500, "mcc": "7631184147", "nc_budget": 1000 },
+    "8459391760": { "name": "Outside The Breadbox",    "budget": 375,  "mcc": "7631184147" },
+    "1481569045": { "name": "Woca Woodcare",           "budget": 2500, "mcc": "7631184147" },
+    "2696762909": { "name": "Warrior Advocates",       "budget": 300,  "mcc": "8621281595", "ga4": "14591178781" },
+    "8184463966": { "name": "Spartan Exteriors",       "budget": 500,  "mcc": "8184463966", "budget_schedule": [{ "from": "2026-06-01", "budget": 2000 }] },
+    "6631800329": { "name": "Summit Express",          "budget": 0,    "mcc": "7631184147" },
+    "2275371078": { "name": "Childrens Therapy Services of Colorado", "budget": 1000, "mcc": "7631184147" }
+  },
+  "meta": {
+    "act_287139600343581":  { "name": "Nationwide Southwest", "budget": 1000 },
+    "act_6128243883951018": { "name": "Warrior Advocates",    "budget": 300 },
+    "act_866700669704203":  { "name": "Spartan Exteriors",    "budget": 1000 },
+    "act_482088457883195":  { "name": "Summit Express",       "budget": 0 },
+    "act_1527255801416040": { "name": "Florida DOH Monroe County", "budget": 1445, "flight_start": "2026-05-25", "flight_end": "2026-06-05" }
+  },
+  "stackadapt": {
+    "51727":  { "name": "TOC (StackAdapt)",                       "budget": 0 },
+    "69461":  { "name": "Florida State Guard (StackAdapt)",       "budget": 0 },
+    "97806":  { "name": "Southern Quality Propane (StackAdapt)",  "budget": 0 },
+    "108228": { "name": "Metro Electrical Services (StackAdapt)", "budget": 0 }
+  }
+}
