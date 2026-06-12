@@ -1625,6 +1625,125 @@ async function addCampaignExtensions(token, customerId, mccId, campaignResourceN
     return { assets_created: assetResults.length, links_created: linkResults.length, asset_resources: assetResults };
 }
 
+// ── Helpers for new tools ─────────────────────────────────────────────────────
+
+// list_ad_groups — all non-removed ad groups, optionally filtered by campaign name
+async function listAdGroupsFull(token, customerId, mccId, campaignSearch) {
+    const rows = await googleSearch(token, customerId, mccId, `
+        SELECT ad_group.resource_name, ad_group.id, ad_group.name, ad_group.status,
+               ad_group.type, campaign.name, campaign.resource_name, campaign.status
+        FROM ad_group
+        WHERE ad_group.status != 'REMOVED'
+        ORDER BY campaign.name, ad_group.name`);
+    let filtered = rows;
+    if (campaignSearch) {
+        filtered = rows.filter(r => r.campaign.name.toLowerCase().includes(campaignSearch.toLowerCase()));
+    }
+    return filtered.map(r => ({
+        ad_group_resource: r.adGroup.resourceName,
+        ad_group_id:       r.adGroup.id,
+        name:              r.adGroup.name,
+        status:            r.adGroup.status,
+        type:              r.adGroup.type,
+        campaign:          r.campaign.name,
+        campaign_status:   r.campaign.status,
+    }));
+}
+
+// get_bidding_strategy — reads current strategy + CPC caps from the campaign resource
+async function fetchBiddingStrategies(token, customerId, mccId, campaignSearch) {
+    const rows = await googleSearch(token, customerId, mccId, `
+        SELECT campaign.name, campaign.status, campaign.bidding_strategy_type,
+               campaign.maximize_clicks.cpc_bid_ceiling_micros,
+               campaign.maximize_conversions.target_spend_micros,
+               campaign.target_cpa.target_cpa_micros,
+               campaign.target_roas.target_roas,
+               campaign.manual_cpc.enhanced_cpc_enabled
+        FROM campaign
+        WHERE campaign.status != 'REMOVED'
+        ORDER BY campaign.name`);
+    let filtered = rows;
+    if (campaignSearch) {
+        filtered = rows.filter(r => r.campaign.name.toLowerCase().includes(campaignSearch.toLowerCase()));
+    }
+    return filtered.map(r => {
+        const c = r.campaign;
+        const out = {
+            campaign:         c.name,
+            status:           c.status,
+            bidding_strategy: c.biddingStrategyType,
+        };
+        if (c.maximizeClicks?.cpcBidCeilingMicros) {
+            out.cpc_bid_ceiling = "$" + (parseInt(c.maximizeClicks.cpcBidCeilingMicros) / 1_000_000).toFixed(2);
+        } else if (c.biddingStrategyType === "MAXIMIZE_CLICKS") {
+            out.cpc_bid_ceiling = null; // strategy active but no cap set
+        }
+        if (c.targetCpa?.targetCpaMicros) {
+            out.target_cpa = "$" + (parseInt(c.targetCpa.targetCpaMicros) / 1_000_000).toFixed(2);
+        }
+        if (c.targetRoas?.targetRoas) {
+            out.target_roas = c.targetRoas.targetRoas;
+        }
+        if (c.manualCpc != null) {
+            out.enhanced_cpc = !!c.manualCpc.enhancedCpcEnabled;
+        }
+        if (c.maximizeConversions?.targetSpendMicros) {
+            out.target_spend_cap = "$" + (parseInt(c.maximizeConversions.targetSpendMicros) / 1_000_000).toFixed(2);
+        }
+        return out;
+    });
+}
+
+// get_change_history — queries the change_event resource for audit trail
+async function fetchChangeHistory(token, customerId, mccId, days, resourceType) {
+    const periodMap = { 7: "LAST_7_DAYS", 14: "LAST_14_DAYS", 30: "LAST_30_DAYS" };
+    const period = periodMap[days] || "LAST_14_DAYS";
+    let where = `change_event.change_date_time DURING ${period}`;
+    if (resourceType) where += ` AND change_event.change_resource_type = '${resourceType}'`;
+    const rows = await googleSearch(token, customerId, mccId, `
+        SELECT change_event.change_date_time,
+               change_event.change_resource_type,
+               change_event.resource_change_operation,
+               change_event.changed_fields,
+               change_event.campaign,
+               change_event.ad_group
+        FROM change_event
+        WHERE ${where}
+        ORDER BY change_event.change_date_time DESC
+        LIMIT 200`);
+    return rows.map(r => {
+        const e = r.changeEvent;
+        return {
+            timestamp:      e.changeDateTime,
+            resource_type:  e.changeResourceType,
+            operation:      e.resourceChangeOperation,
+            changed_fields: e.changedFields || null,
+            campaign:       e.campaign  || null,
+            ad_group:       e.adGroup   || null,
+        };
+    });
+}
+
+// set_google_budget — campaign lookup without the THIS_MONTH date filter so it
+// finds campaigns regardless of whether they've spent anything this month.
+async function listGoogleCampaignsAll(token, customerId, mccId) {
+    const rows = await googleSearch(token, customerId, mccId, `
+        SELECT campaign.name, campaign.status, campaign.advertising_channel_type,
+               campaign_budget.amount_micros, campaign.resource_name
+        FROM campaign
+        WHERE campaign.status != 'REMOVED'
+        ORDER BY campaign.name`);
+    return rows.map(r => ({
+        name:          r.campaign.name,
+        status:        r.campaign.status,
+        type:          r.campaign.advertisingChannelType,
+        daily_budget:  r.campaignBudget?.amountMicros
+                           ? "$" + (parseInt(r.campaignBudget.amountMicros) / 1_000_000).toFixed(2)
+                           : null,
+        resource_name: r.campaign.resourceName,
+    }));
+}
+
 // ── MCP Server ────────────────────────────────────────────────────────────────
 const server = new Server(
     { name: "kaycomm-pacing", version: "2.0.0" },
@@ -2214,6 +2333,85 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
                     },
                 },
                 required: ["account_name", "keywords"],
+            },
+        },
+        {
+            name: "duplicate_meta_campaign",
+            description: "Duplicate a Meta campaign (deep copy including ad sets and ads). " +
+                "Designed for monthly campaign cloning — e.g. copying NSW's campaign at the start of each month. " +
+                "Dry run by default — set confirm=true to apply.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    account_name:     { type: "string", description: "Meta account name (partial match ok)" },
+                    source_campaign:  { type: "string", description: "Name of the campaign to duplicate (partial match ok)" },
+                    new_name:         { type: "string", description: "Name for the new campaign. Defaults to 'Copy of [original name]'." },
+                    status:           { type: "string", enum: ["PAUSED", "ACTIVE", "INHERITED_FROM_SOURCE"], description: "Status for the copy (default: PAUSED)" },
+                    confirm:          { type: "boolean", description: "Set true to create the copy. Omit for dry-run preview." },
+                },
+                required: ["account_name", "source_campaign"],
+            },
+        },
+        {
+            name: "get_change_history",
+            description: "Pull the Google Ads change event log for an account — who changed what and when. " +
+                "Useful for investigating removed keywords, budget changes, or status changes. " +
+                "Covers the last 7, 14, or 30 days. Optionally filter to a specific resource type.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    account_name:  { type: "string", description: "Client name (partial match ok)" },
+                    days:          { type: "number", enum: [7, 14, 30], description: "How far back to look (default: 14)" },
+                    resource_type: {
+                        type: "string",
+                        description: "Filter to a specific resource type. AD_GROUP_CRITERION = keywords, CAMPAIGN_CRITERION = campaign negatives.",
+                        enum: ["CAMPAIGN", "AD_GROUP", "AD", "AD_GROUP_CRITERION", "CAMPAIGN_CRITERION", "CAMPAIGN_BUDGET"],
+                    },
+                },
+                required: ["account_name"],
+            },
+        },
+        {
+            name: "get_bidding_strategy",
+            description: "Read the current bidding strategy and any CPC caps or target values for all campaigns in a Google Ads account. " +
+                "Use to check whether a MAXIMIZE_CLICKS campaign has a CPC cap set, or to see current Target CPA/ROAS targets. " +
+                "Optionally filter to a specific campaign.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    account_name:  { type: "string", description: "Client name (partial match ok)" },
+                    campaign_name: { type: "string", description: "Campaign name filter (partial match ok). Omit to see all campaigns." },
+                },
+                required: ["account_name"],
+            },
+        },
+        {
+            name: "list_ad_groups",
+            description: "List all ad groups (with resource names) in a Google Ads account or campaign. " +
+                "Returns the ad_group_resource needed for populate_ad_group and add_negative_keywords. " +
+                "Optionally filter to a specific campaign.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    account_name:  { type: "string", description: "Client name (partial match ok)" },
+                    campaign_name: { type: "string", description: "Filter to a specific campaign (partial match ok). Omit for all campaigns." },
+                },
+                required: ["account_name"],
+            },
+        },
+        {
+            name: "set_google_budget",
+            description: "Set the daily budget for a Google Ads campaign. Unlike update_budget, this works even for campaigns with no spend this month. " +
+                "Dry run by default — set confirm=true to apply.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    account_name:  { type: "string", description: "Client name (partial match ok)" },
+                    campaign_name: { type: "string", description: "Campaign name (partial match ok)" },
+                    daily_budget:  { type: "number", description: "New daily budget in dollars" },
+                    confirm:       { type: "boolean", description: "Set true to apply. Omit for dry run." },
+                },
+                required: ["account_name", "campaign_name", "daily_budget"],
             },
         },
     ],
@@ -3489,6 +3687,172 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                                 extension_type: extType,
                                 ...res,
                             };
+                        }
+                    } catch (e) { result = { error: e.message }; }
+                }
+            }
+        }
+
+    } else if (name === "duplicate_meta_campaign") {
+        const search       = (args.account_name || "").toLowerCase();
+        const campSearch   = (args.source_campaign || "").toLowerCase();
+        const confirm      = !!args.confirm;
+        const dupStatus    = (args.status || "PAUSED").toUpperCase();
+
+        const acctMatch = Object.entries(META_ACCOUNTS).find(([, info]) => info.name.toLowerCase().includes(search));
+        if (!acctMatch) {
+            result = { error: `No Meta account found matching '${args.account_name}'. Available: ${Object.values(META_ACCOUNTS).map(a => a.name).join(", ")}` };
+        } else {
+            const [accountId, acctInfo] = acctMatch;
+            try {
+                const campaigns = await getMetaCampaigns(accountId);
+                const camp = campaigns.find(c => c.name.toLowerCase().includes(campSearch));
+                if (!camp) {
+                    result = { error: `No campaign matching '${args.source_campaign}'`, available: campaigns.map(c => c.name) };
+                } else {
+                    const copyName = args.new_name || `Copy of ${camp.name}`;
+                    if (!confirm) {
+                        result = {
+                            dry_run:    true,
+                            message:    "DRY RUN — set confirm=true to create the copy",
+                            account:    acctInfo.name,
+                            source:     { id: camp.id, name: camp.name, status: camp.status },
+                            new_name:   copyName,
+                            new_status: dupStatus,
+                            note:       "deep_copy=true — ad sets and ads will be duplicated",
+                        };
+                    } else {
+                        const res = await metaDuplicate(camp.id, "campaign", copyName, dupStatus);
+                        result = {
+                            success:    true,
+                            account:    acctInfo.name,
+                            source:     { id: camp.id, name: camp.name },
+                            new_id:     res.new_id,
+                            new_name:   copyName,
+                            new_status: dupStatus,
+                        };
+                    }
+                }
+            } catch (e) {
+                result = { error: e.message };
+            }
+        }
+
+    } else if (name === "get_change_history") {
+        const search       = (args.account_name || "").toLowerCase();
+        const days         = args.days || 14;
+        const resourceType = args.resource_type || null;
+
+        const match = Object.entries(GOOGLE_ACCOUNTS).find(([, i]) => i.name.toLowerCase().includes(search));
+        if (!match) {
+            result = { error: `No Google account found matching '${args.account_name}'` };
+        } else {
+            const [cid, info] = match;
+            const { token, error: authErr } = await getGoogleAccessToken();
+            if (authErr) { result = { error: `Auth: ${authErr}` }; }
+            else {
+                try {
+                    const events = await fetchChangeHistory(token, cid, info.mcc, days, resourceType);
+                    const summary = {};
+                    for (const e of events) {
+                        const key = `${e.resource_type}:${e.operation}`;
+                        summary[key] = (summary[key] || 0) + 1;
+                    }
+                    result = {
+                        account:       info.name,
+                        days_back:     days,
+                        resource_type: resourceType || "all",
+                        total_changes: events.length,
+                        summary,
+                        changes:       events,
+                    };
+                } catch (e) { result = { error: e.message }; }
+            }
+        }
+
+    } else if (name === "get_bidding_strategy") {
+        const search     = (args.account_name || "").toLowerCase();
+        const campSearch = args.campaign_name ? args.campaign_name.toLowerCase() : null;
+
+        const match = Object.entries(GOOGLE_ACCOUNTS).find(([, i]) => i.name.toLowerCase().includes(search));
+        if (!match) {
+            result = { error: `No Google account found matching '${args.account_name}'` };
+        } else {
+            const [cid, info] = match;
+            const { token, error: authErr } = await getGoogleAccessToken();
+            if (authErr) { result = { error: `Auth: ${authErr}` }; }
+            else {
+                try {
+                    const campaigns = await fetchBiddingStrategies(token, cid, info.mcc, campSearch);
+                    result = {
+                        account:        info.name,
+                        campaign_count: campaigns.length,
+                        campaigns,
+                    };
+                } catch (e) { result = { error: e.message }; }
+            }
+        }
+
+    } else if (name === "list_ad_groups") {
+        const search     = (args.account_name || "").toLowerCase();
+        const campSearch = args.campaign_name ? args.campaign_name.toLowerCase() : null;
+
+        const match = Object.entries(GOOGLE_ACCOUNTS).find(([, i]) => i.name.toLowerCase().includes(search));
+        if (!match) {
+            result = { error: `No Google account found matching '${args.account_name}'` };
+        } else {
+            const [cid, info] = match;
+            const { token, error: authErr } = await getGoogleAccessToken();
+            if (authErr) { result = { error: `Auth: ${authErr}` }; }
+            else {
+                try {
+                    const adGroups = await listAdGroupsFull(token, cid, info.mcc, campSearch);
+                    result = {
+                        account:       info.name,
+                        campaign_filter: campSearch || "all",
+                        ad_group_count: adGroups.length,
+                        ad_groups:     adGroups,
+                    };
+                } catch (e) { result = { error: e.message }; }
+            }
+        }
+
+    } else if (name === "set_google_budget") {
+        const search     = (args.account_name || "").toLowerCase();
+        const campSearch = (args.campaign_name || "").toLowerCase();
+        const daily      = args.daily_budget;
+        const confirm    = !!args.confirm;
+
+        if (!daily || daily <= 0) {
+            result = { error: "daily_budget must be a positive number." };
+        } else {
+            const match = Object.entries(GOOGLE_ACCOUNTS).find(([, i]) => i.name.toLowerCase().includes(search));
+            if (!match) {
+                result = { error: `No Google account matching '${args.account_name}'` };
+            } else {
+                const [cid, info] = match;
+                const { token, error: authErr } = await getGoogleAccessToken();
+                if (authErr) { result = { error: `Auth: ${authErr}` }; }
+                else {
+                    try {
+                        // Use the no-date-filter listing so paused/new campaigns appear
+                        const campaigns = await listGoogleCampaignsAll(token, cid, info.mcc);
+                        const camp = campaigns.find(c => c.name.toLowerCase().includes(campSearch));
+                        if (!camp) {
+                            result = { error: `No campaign matching '${args.campaign_name}'`, available: campaigns.map(c => c.name) };
+                        } else if (!confirm) {
+                            result = {
+                                dry_run:          true,
+                                message:          "DRY RUN — set confirm=true to apply",
+                                account:          info.name,
+                                campaign:         camp.name,
+                                status:           camp.status,
+                                current_daily_budget: camp.daily_budget,
+                                new_daily_budget: "$" + daily.toFixed(2),
+                            };
+                        } else {
+                            const r = await updateGoogleCampaignBudget(token, cid, info.mcc, camp.resource_name, daily);
+                            result = { success: true, account: info.name, campaign: camp.name, ...r };
                         }
                     } catch (e) { result = { error: e.message }; }
                 }
