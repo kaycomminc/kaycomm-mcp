@@ -3871,12 +3871,35 @@ async function main() {
 
     if (PORT) {
         // ── HTTP/SSE mode (Railway) ──────────────────────────────────────────
+        // Auth: every /sse connection must present MCP_AUTH_TOKEN, either as
+        // "Authorization: Bearer <token>" or "?token=<token>" (EventSource
+        // clients can't set headers). /messages is protected by the session ID,
+        // which only exists after an authenticated /sse handshake.
+        // Fails closed: if MCP_AUTH_TOKEN is unset, all connections are refused.
+        const AUTH_TOKEN = process.env.MCP_AUTH_TOKEN || null;
+        if (!AUTH_TOKEN) {
+            console.error("WARNING: MCP_AUTH_TOKEN is not set — refusing all SSE connections until it is configured in Railway Variables.");
+        }
+
+        const isAuthorized = (req, url) => {
+            if (!AUTH_TOKEN) return false;
+            const header = req.headers["authorization"] || "";
+            if (header === `Bearer ${AUTH_TOKEN}`) return true;
+            if (url.searchParams.get("token") === AUTH_TOKEN) return true;
+            return false;
+        };
+
         const transports = {};
 
         const httpServer = http.createServer(async (req, res) => {
             const url = new URL(req.url, `http://localhost`);
 
             if (url.pathname === "/sse") {
+                if (!isAuthorized(req, url)) {
+                    res.writeHead(401, { "Content-Type": "text/plain" });
+                    res.end(AUTH_TOKEN ? "Unauthorized" : "Server auth not configured (MCP_AUTH_TOKEN missing)");
+                    return;
+                }
                 const transport = new SSEServerTransport("/messages", res);
                 transports[transport.sessionId] = transport;
                 res.on("close", () => delete transports[transport.sessionId]);
@@ -3893,12 +3916,12 @@ async function main() {
 
             } else {
                 res.writeHead(200, { "Content-Type": "text/plain" });
-                res.end("KayComm MCP Server v2 — running");
+                res.end("KayComm MCP Server v2 — running" + (AUTH_TOKEN ? "" : " (auth not configured)"));
             }
         });
 
         httpServer.listen(parseInt(PORT), () => {
-            console.error(`KayComm MCP running on port ${PORT} (SSE mode)`);
+            console.error(`KayComm MCP running on port ${PORT} (SSE mode, auth ${AUTH_TOKEN ? "enabled" : "NOT CONFIGURED"})`);
         });
 
     } else {
