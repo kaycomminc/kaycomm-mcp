@@ -441,7 +441,8 @@ function getGA4DateRange(range) {
         case "LAST_MONTH":   return { startDate: fmt(new Date(today.getFullYear(), today.getMonth()-1, 1)), endDate: fmt(new Date(today.getFullYear(), today.getMonth(), 0)) };
         case "LAST_7_DAYS":  return { startDate: "7daysAgo",  endDate: "yesterday" };
         case "LAST_30_DAYS": return { startDate: "30daysAgo", endDate: "yesterday" };
-        case "LAST_90_DAYS": return { startDate: "90daysAgo", endDate: "yesterday" };
+        case "LAST_90_DAYS":  return { startDate: "90daysAgo", endDate: "yesterday" };
+        case "YEAR_TO_DATE": return { startDate: fmt(new Date(today.getFullYear(), 0, 1)), endDate: "yesterday" };
         default:             return { startDate: "30daysAgo", endDate: "yesterday" };
     }
 }
@@ -455,8 +456,10 @@ const GA4_DIMENSION_MAP = {
     campaign:      "sessionGoogleAdsCampaignName",
 };
 
-async function fetchGA4Report(token, propertyId, dateRange, breakdownBy = "channel") {
-    const { startDate, endDate } = getGA4DateRange(dateRange);
+async function fetchGA4Report(token, propertyId, dateRange, breakdownBy = "channel", customStart, customEnd) {
+    const { startDate, endDate } = (dateRange === "CUSTOM" && customStart && customEnd)
+        ? { startDate: customStart, endDate: customEnd }
+        : getGA4DateRange(dateRange);
     const dimensionName = GA4_DIMENSION_MAP[breakdownBy] || GA4_DIMENSION_MAP.channel;
 
     const body = {
@@ -539,14 +542,15 @@ async function fetchGA4Report(token, propertyId, dateRange, breakdownBy = "chann
 }
 
 // ── Campaign performance ──────────────────────────────────────────────────────
-async function fetchGoogleCampaignPerf(token, customerId, mccId, dateRange) {
+async function fetchGoogleCampaignPerf(token, customerId, mccId, dateRange, startDate, endDate) {
+    const dateClause = resolveGaqlDateClause(dateRange, startDate, endDate);
     const rows = await googleSearch(token, customerId, mccId, `
         SELECT campaign.name, campaign.status, campaign.advertising_channel_type,
                metrics.cost_micros, metrics.clicks, metrics.impressions,
                metrics.conversions, metrics.conversions_value,
                metrics.ctr, metrics.average_cpc, metrics.search_impression_share
         FROM campaign
-        WHERE segments.date DURING ${dateRange}
+        WHERE segments.date ${dateClause}
           AND metrics.impressions > 0
         ORDER BY metrics.cost_micros DESC`);
 
@@ -574,14 +578,18 @@ async function fetchGoogleCampaignPerf(token, customerId, mccId, dateRange) {
     });
 }
 
-async function fetchMetaCampaignPerf(accountId, datePreset) {
+async function fetchMetaCampaignPerf(accountId, datePreset, timeRange) {
     const params = new URLSearchParams({
         access_token: META_ACCESS_TOKEN,
         fields: "campaign_name,spend,clicks,impressions,ctr,cpc,actions,cost_per_action_type,purchase_roas",
-        date_preset: datePreset,
         level: "campaign",
         limit: 100,
     });
+    if (timeRange) {
+        params.set("time_range", JSON.stringify(timeRange));
+    } else {
+        params.set("date_preset", datePreset);
+    }
     const resp = await fetchFn(`https://graph.facebook.com/${META_API_VERSION}/${accountId}/insights?${params}`);
     const data = await resp.json();
     if (data.error) throw new Error(data.error.message);
@@ -609,6 +617,95 @@ async function fetchMetaCampaignPerf(accountId, datePreset) {
             roas,
         };
     });
+}
+
+// ── Monthly trend ─────────────────────────────────────────────────────────────
+async function fetchGoogleMonthlyTrend(token, customerId, mccId, year) {
+    const { today } = getDateInfo();
+    const yearStart = `${year}-01-01`;
+    const yearEnd = year < parseInt(today.slice(0, 4)) ? `${year}-12-31` : today;
+    const rows = await googleSearch(token, customerId, mccId, `
+        SELECT segments.month,
+               metrics.cost_micros, metrics.clicks, metrics.impressions,
+               metrics.conversions, metrics.conversions_value
+        FROM campaign
+        WHERE segments.date BETWEEN '${yearStart}' AND '${yearEnd}'
+        ORDER BY segments.month`);
+
+    const byMonth = {};
+    for (const row of rows) {
+        const m = row.segments.month;
+        if (!byMonth[m]) byMonth[m] = { month: m, spend: 0, clicks: 0, impressions: 0, conversions: 0, conv_value: 0 };
+        byMonth[m].spend       += parseInt(row.metrics.costMicros || 0) / 1_000_000;
+        byMonth[m].clicks      += parseInt(row.metrics.clicks || 0);
+        byMonth[m].impressions += parseInt(row.metrics.impressions || 0);
+        byMonth[m].conversions += parseFloat(row.metrics.conversions || 0);
+        byMonth[m].conv_value  += parseFloat(row.metrics.conversionsValue || 0);
+    }
+    const months = Object.values(byMonth).sort((a, b) => a.month.localeCompare(b.month));
+    let ytdSpend = 0, ytdConv = 0, ytdValue = 0;
+    for (const m of months) {
+        m.spend      = Math.round(m.spend * 100) / 100;
+        m.conv_value = Math.round(m.conv_value * 100) / 100;
+        m.conversions = Math.round(m.conversions * 10) / 10;
+        m.cpa  = m.conversions > 0 ? Math.round((m.spend / m.conversions) * 100) / 100 : null;
+        m.roas = m.spend > 0 && m.conv_value > 0 ? Math.round((m.conv_value / m.spend) * 100) / 100 : null;
+        ytdSpend += m.spend; ytdConv += m.conversions; ytdValue += m.conv_value;
+    }
+    return {
+        months,
+        ytd_totals: {
+            spend: Math.round(ytdSpend * 100) / 100,
+            conversions: Math.round(ytdConv * 10) / 10,
+            conv_value: Math.round(ytdValue * 100) / 100,
+            cpa: ytdConv > 0 ? Math.round((ytdSpend / ytdConv) * 100) / 100 : null,
+            roas: ytdSpend > 0 && ytdValue > 0 ? Math.round((ytdValue / ytdSpend) * 100) / 100 : null,
+        },
+    };
+}
+
+async function fetchMetaMonthlyTrend(accountId, year) {
+    const { today } = getDateInfo();
+    const since = `${year}-01-01`;
+    const until = year < parseInt(today.slice(0, 4)) ? `${year}-12-31` : today;
+    const params = new URLSearchParams({
+        access_token: META_ACCESS_TOKEN,
+        fields: "spend,clicks,impressions,actions,purchase_roas",
+        time_range: JSON.stringify({ since, until }),
+        time_increment: "monthly",
+        level: "account",
+        limit: 100,
+    });
+    const resp = await fetchFn(`https://graph.facebook.com/${META_API_VERSION}/${accountId}/insights?${params}`);
+    const data = await resp.json();
+    if (data.error) throw new Error(data.error.message);
+
+    let ytdSpend = 0, ytdConv = 0;
+    const months = (data.data || []).map(row => {
+        const actions = row.actions || [];
+        const leads = parseFloat(actions.find(a => a.action_type === "lead")?.value || 0);
+        const purchases = parseFloat(actions.find(a => a.action_type === "purchase")?.value || 0);
+        const convs = leads + purchases;
+        const spend = parseFloat(row.spend || 0);
+        const cpa = convs > 0 ? Math.round((spend / convs) * 100) / 100 : null;
+        ytdSpend += spend; ytdConv += convs;
+        return {
+            month: row.date_start,
+            spend: Math.round(spend * 100) / 100,
+            clicks: parseInt(row.clicks || 0),
+            impressions: parseInt(row.impressions || 0),
+            conversions: convs,
+            cpa,
+        };
+    });
+    return {
+        months,
+        ytd_totals: {
+            spend: Math.round(ytdSpend * 100) / 100,
+            conversions: ytdConv,
+            cpa: ytdConv > 0 ? Math.round((ytdSpend / ytdConv) * 100) / 100 : null,
+        },
+    };
 }
 
 // ── Recommendations ────────────────────────────────────────────────────────────
@@ -668,7 +765,8 @@ async function fetchGoogleRecommendations(token, customerId, mccId) {
 }
 
 // ── Keyword performance ───────────────────────────────────────────────────────
-async function fetchGoogleKeywordPerf(token, customerId, mccId, dateRange) {
+async function fetchGoogleKeywordPerf(token, customerId, mccId, dateRange, startDate, endDate) {
+    const dateClause = resolveGaqlDateClause(dateRange, startDate, endDate);
     const rows = await googleSearch(token, customerId, mccId, `
         SELECT campaign.name, ad_group.name,
                ad_group_criterion.keyword.text,
@@ -680,7 +778,7 @@ async function fetchGoogleKeywordPerf(token, customerId, mccId, dateRange) {
                metrics.conversions, metrics.ctr, metrics.average_cpc,
                metrics.search_impression_share, metrics.search_top_impression_share
         FROM keyword_view
-        WHERE segments.date DURING ${dateRange}
+        WHERE segments.date ${dateClause}
           AND metrics.impressions > 0
         ORDER BY metrics.cost_micros DESC
         LIMIT 200`);
@@ -702,6 +800,29 @@ async function fetchGoogleKeywordPerf(token, customerId, mccId, dateRange) {
         impression_share: row.metrics.searchImpressionShare ?? null,
         top_is:           row.metrics.searchTopImpressionShare ?? null,
     }));
+}
+
+// ── Meta date resolver ───────────────────────────────────────────────────────
+function resolveMetaDateOpts(dateRange, startDate, endDate, presetMap) {
+    if (dateRange === "CUSTOM" && startDate && endDate) {
+        return { preset: null, timeRange: { since: startDate, until: endDate } };
+    }
+    return { preset: presetMap[dateRange] || "this_month", timeRange: null };
+}
+
+// ── GAQL date clause resolver ────────────────────────────────────────────────
+function resolveGaqlDateClause(dateRange, startDate, endDate) {
+    if (dateRange === "YEAR_TO_DATE") {
+        const { today } = getDateInfo();
+        const yd = new Date(today); yd.setDate(yd.getDate() - 1);
+        const yearStart = `${today.slice(0, 4)}-01-01`;
+        const yFmt = `${yd.getFullYear()}-${String(yd.getMonth()+1).padStart(2,"0")}-${String(yd.getDate()).padStart(2,"0")}`;
+        return `BETWEEN '${yearStart}' AND '${yFmt}'`;
+    }
+    if (dateRange === "CUSTOM" && startDate && endDate) {
+        return `BETWEEN '${startDate}' AND '${endDate}'`;
+    }
+    return `DURING ${dateRange}`;
 }
 
 // ── Period comparison helpers ─────────────────────────────────────────────────
@@ -734,6 +855,16 @@ function getCompareDateRanges(comparison) {
         return {
             p1: { start: fmt(shift(today, -30)), end: fmt(shift(today, -1)), label: "Last 30 Days" },
             p2: { start: fmt(shift(today, -60)), end: fmt(shift(today, -31)), label: "Prior 30 Days" },
+        };
+    }
+    if (comparison === "year_over_year") {
+        const yearStart = new Date(today.getFullYear(), 0, 1);
+        const lastYearStart = new Date(today.getFullYear() - 1, 0, 1);
+        const lastYearEnd = new Date(today.getFullYear() - 1, today.getMonth(), today.getDate());
+        lastYearEnd.setDate(lastYearEnd.getDate() - 1);
+        return {
+            p1: { start: fmt(yearStart),     end: fmt(shift(today, -1)), label: `${today.getFullYear()} YTD` },
+            p2: { start: fmt(lastYearStart), end: fmt(lastYearEnd),      label: `${today.getFullYear() - 1} Same Period` },
         };
     }
     throw new Error(`Unknown comparison: ${comparison}`);
@@ -810,13 +941,14 @@ function pctChange(current, prior) {
 }
 
 // ── Search terms ──────────────────────────────────────────────────────────────
-async function fetchSearchTerms(token, customerId, mccId, dateRange) {
+async function fetchSearchTerms(token, customerId, mccId, dateRange, startDate, endDate) {
+    const dateClause = resolveGaqlDateClause(dateRange, startDate, endDate);
     const campRows = await googleSearch(token, customerId, mccId, `
         SELECT campaign.name, ad_group.name,
                metrics.cost_micros, metrics.clicks, metrics.impressions,
                metrics.conversions, metrics.average_cpc, metrics.ctr
         FROM ad_group
-        WHERE segments.date DURING ${dateRange} AND metrics.impressions > 0
+        WHERE segments.date ${dateClause} AND metrics.impressions > 0
         ORDER BY metrics.cost_micros DESC`);
 
     const termRows = await googleSearch(token, customerId, mccId, `
@@ -824,7 +956,7 @@ async function fetchSearchTerms(token, customerId, mccId, dateRange) {
                campaign.name, metrics.cost_micros, metrics.clicks,
                metrics.impressions, metrics.conversions, metrics.ctr, metrics.average_cpc
         FROM search_term_view
-        WHERE segments.date DURING ${dateRange} AND metrics.impressions > 0
+        WHERE segments.date ${dateClause} AND metrics.impressions > 0
         ORDER BY metrics.cost_micros DESC LIMIT 500`);
 
     const terms = termRows.map(row => ({
@@ -855,6 +987,62 @@ async function fetchSearchTerms(token, customerId, mccId, dateRange) {
         wasted:    terms.filter(t => t.cost > 3 && t.convs === 0).slice(0, 25),
         converting: terms.filter(t => t.convs > 0),
         all_terms:  terms,
+    };
+}
+
+// ── PMax search term insights ────────────────────────────────────────────────
+async function fetchPmaxSearchTermInsights(token, customerId, mccId, dateRange, startDate, endDate) {
+    const dateClause = resolveGaqlDateClause(dateRange, startDate, endDate);
+
+    // Find PMax campaigns
+    const pmaxRows = await googleSearch(token, customerId, mccId, `
+        SELECT campaign.id, campaign.name
+        FROM campaign
+        WHERE campaign.advertising_channel_type = 'PERFORMANCE_MAX'
+          AND campaign.status != 'REMOVED'`);
+
+    if (pmaxRows.length === 0) {
+        return { campaigns: [], total_categories: 0, insights: [], note: "No Performance Max campaigns found in this account." };
+    }
+
+    const allInsights = [];
+    for (const pRow of pmaxRows) {
+        const campaignId   = pRow.campaign.id;
+        const campaignName = pRow.campaign.name;
+        try {
+            const rows = await googleSearch(token, customerId, mccId, `
+                SELECT campaign_search_term_insight.category_label,
+                       metrics.clicks, metrics.impressions,
+                       metrics.conversions, metrics.conversions_value
+                FROM campaign_search_term_insight
+                WHERE campaign_search_term_insight.campaign_id = ${campaignId}
+                  AND segments.date ${dateClause}
+                ORDER BY metrics.impressions DESC`);
+
+            for (const row of rows) {
+                allInsights.push({
+                    campaign:    campaignName,
+                    category:    row.campaignSearchTermInsight?.categoryLabel || "(unlabeled)",
+                    clicks:      parseInt(row.metrics?.clicks || 0),
+                    impressions: parseInt(row.metrics?.impressions || 0),
+                    convs:       parseFloat(row.metrics?.conversions || 0),
+                    conv_value:  parseFloat(row.metrics?.conversionsValue || 0),
+                });
+            }
+        } catch (e) {
+            allInsights.push({ campaign: campaignName, error: e.message });
+        }
+    }
+
+    allInsights.sort((a, b) => (b.impressions || 0) - (a.impressions || 0));
+
+    return {
+        campaigns:        pmaxRows.map(r => r.campaign.name),
+        total_categories: allInsights.filter(i => !i.error).length,
+        top_categories:   allInsights.filter(i => !i.error).slice(0, 50),
+        converting:       allInsights.filter(i => !i.error && i.convs > 0),
+        all_insights:     allInsights,
+        note: "PMax search term insights are categorized groupings (not individual raw search queries). They reflect the categories shown in the Google Ads UI.",
     };
 }
 
@@ -2026,9 +2214,29 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
                     account_name: { type: "string", description: "Client name (partial match ok)" },
                     date_range: {
                         type: "string",
-                        description: "THIS_MONTH (default), LAST_30_DAYS, LAST_90_DAYS, LAST_MONTH",
-                        enum: ["THIS_MONTH", "LAST_30_DAYS", "LAST_90_DAYS", "LAST_MONTH"],
+                        description: "THIS_MONTH (default), LAST_7_DAYS, LAST_30_DAYS, LAST_90_DAYS, LAST_MONTH, YEAR_TO_DATE, or CUSTOM (requires start_date + end_date)",
+                        enum: ["THIS_MONTH", "LAST_7_DAYS", "LAST_30_DAYS", "LAST_90_DAYS", "LAST_MONTH", "YEAR_TO_DATE", "CUSTOM"],
                     },
+                    start_date: { type: "string", description: "Start date YYYY-MM-DD (only with CUSTOM)" },
+                    end_date:   { type: "string", description: "End date YYYY-MM-DD (only with CUSTOM)" },
+                },
+                required: ["account_name"],
+            },
+        },
+        {
+            name: "get_pmax_search_terms",
+            description: "Pull Performance Max search term insights for an account. Returns categorized search term groupings (as shown in the Google Ads UI) with clicks, impressions, conversions, and conversion value per category. Useful for understanding what queries are triggering PMax campaigns.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    account_name: { type: "string", description: "Client name (partial match ok)" },
+                    date_range: {
+                        type: "string",
+                        description: "THIS_MONTH (default), LAST_7_DAYS, LAST_30_DAYS, LAST_90_DAYS, LAST_MONTH, YEAR_TO_DATE, or CUSTOM (requires start_date + end_date)",
+                        enum: ["THIS_MONTH", "LAST_7_DAYS", "LAST_30_DAYS", "LAST_90_DAYS", "LAST_MONTH", "YEAR_TO_DATE", "CUSTOM"],
+                    },
+                    start_date: { type: "string", description: "Start date YYYY-MM-DD (only with CUSTOM)" },
+                    end_date:   { type: "string", description: "End date YYYY-MM-DD (only with CUSTOM)" },
                 },
                 required: ["account_name"],
             },
@@ -2044,9 +2252,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
                     account_name: { type: "string", description: "Client name (partial match ok). Only clients with GA4 configured will work." },
                     date_range: {
                         type: "string",
-                        description: "THIS_MONTH (default), LAST_7_DAYS, LAST_30_DAYS, LAST_90_DAYS, LAST_MONTH",
-                        enum: ["THIS_MONTH", "LAST_7_DAYS", "LAST_30_DAYS", "LAST_90_DAYS", "LAST_MONTH"],
+                        description: "THIS_MONTH (default), LAST_7_DAYS, LAST_30_DAYS, LAST_90_DAYS, LAST_MONTH, YEAR_TO_DATE, or CUSTOM (requires start_date + end_date)",
+                        enum: ["THIS_MONTH", "LAST_7_DAYS", "LAST_30_DAYS", "LAST_90_DAYS", "LAST_MONTH", "YEAR_TO_DATE", "CUSTOM"],
                     },
+                    start_date: { type: "string", description: "Start date YYYY-MM-DD (only with CUSTOM)" },
+                    end_date:   { type: "string", description: "End date YYYY-MM-DD (only with CUSTOM)" },
                     breakdown: {
                         type: "string",
                         description: "channel (default) | source_medium | landing_page | device | date | campaign",
@@ -2058,7 +2268,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         },
         {
             name: "get_campaign_performance",
-            description: "Pull full campaign-level performance metrics — spend, clicks, impressions, CTR, CPC, conversions, CPA, ROAS — for Google Ads and/or Meta accounts. Better than get_google_pacing for optimization analysis.",
+            description: "Pull full campaign-level performance metrics — spend, clicks, impressions, CTR, CPC, conversions, CPA, ROAS — for Google Ads and/or Meta accounts. Supports YTD and custom date ranges.",
             inputSchema: {
                 type: "object",
                 properties: {
@@ -2070,9 +2280,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
                     },
                     date_range: {
                         type: "string",
-                        description: "THIS_MONTH (default), LAST_30_DAYS, LAST_90_DAYS, LAST_MONTH, LAST_7_DAYS",
-                        enum: ["THIS_MONTH", "LAST_30_DAYS", "LAST_90_DAYS", "LAST_MONTH", "LAST_7_DAYS"],
+                        description: "THIS_MONTH (default), LAST_7_DAYS, LAST_30_DAYS, LAST_90_DAYS, LAST_MONTH, YEAR_TO_DATE, or CUSTOM (requires start_date + end_date)",
+                        enum: ["THIS_MONTH", "LAST_7_DAYS", "LAST_30_DAYS", "LAST_90_DAYS", "LAST_MONTH", "YEAR_TO_DATE", "CUSTOM"],
                     },
+                    start_date: { type: "string", description: "Start date YYYY-MM-DD (only with CUSTOM)" },
+                    end_date:   { type: "string", description: "End date YYYY-MM-DD (only with CUSTOM)" },
                 },
                 required: ["account_name"],
             },
@@ -2090,16 +2302,18 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         },
         {
             name: "get_keyword_performance",
-            description: "Pull keyword-level metrics including Quality Score, impression share, CPC, CTR, and conversions for a Google Ads account. Use to find low QS keywords, impression share loss, and bidding issues.",
+            description: "Pull keyword-level metrics including Quality Score, impression share, CPC, CTR, and conversions for a Google Ads account. Supports YTD and custom date ranges.",
             inputSchema: {
                 type: "object",
                 properties: {
                     account_name: { type: "string", description: "Client name (partial match ok)" },
                     date_range: {
                         type: "string",
-                        description: "THIS_MONTH (default), LAST_30_DAYS, LAST_90_DAYS, LAST_MONTH",
-                        enum: ["THIS_MONTH", "LAST_30_DAYS", "LAST_90_DAYS", "LAST_MONTH"],
+                        description: "THIS_MONTH (default), LAST_7_DAYS, LAST_30_DAYS, LAST_90_DAYS, LAST_MONTH, YEAR_TO_DATE, or CUSTOM (requires start_date + end_date)",
+                        enum: ["THIS_MONTH", "LAST_7_DAYS", "LAST_30_DAYS", "LAST_90_DAYS", "LAST_MONTH", "YEAR_TO_DATE", "CUSTOM"],
                     },
+                    start_date: { type: "string", description: "Start date YYYY-MM-DD (only with CUSTOM)" },
+                    end_date:   { type: "string", description: "End date YYYY-MM-DD (only with CUSTOM)" },
                     filter: {
                         type: "string",
                         description: "Optional filter: low_quality_score (QS ≤ 4), low_impression_share (IS < 50%), converting (has conversions), non_converting (0 conversions, >$5 spend)",
@@ -2111,15 +2325,15 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         },
         {
             name: "compare_periods",
-            description: "Compare performance metrics across two time periods for an account — this month vs last, last 7 days vs prior 7, or last 30 days vs prior 30. Shows % change for spend, clicks, CPC, conversions, CPA, ROAS.",
+            description: "Compare performance metrics across two time periods for an account — this month vs last, last 7 vs prior 7, last 30 vs prior 30, or year-over-year (YTD this year vs same days last year). Shows % change for spend, clicks, CPC, conversions, CPA, ROAS.",
             inputSchema: {
                 type: "object",
                 properties: {
                     account_name: { type: "string", description: "Client name (partial match ok)" },
                     comparison: {
                         type: "string",
-                        description: "this_month_vs_last_month | last_7_days_vs_prior_7_days | last_30_days_vs_prior_30_days",
-                        enum: ["this_month_vs_last_month", "last_7_days_vs_prior_7_days", "last_30_days_vs_prior_30_days"],
+                        description: "this_month_vs_last_month | last_7_days_vs_prior_7_days | last_30_days_vs_prior_30_days | year_over_year",
+                        enum: ["this_month_vs_last_month", "last_7_days_vs_prior_7_days", "last_30_days_vs_prior_30_days", "year_over_year"],
                     },
                     platform: {
                         type: "string",
@@ -2128,6 +2342,23 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
                     },
                 },
                 required: ["account_name", "comparison"],
+            },
+        },
+        {
+            name: "get_monthly_trend",
+            description: "Month-by-month performance breakdown for the current year (or custom range). Returns spend, clicks, impressions, conversions, CPA, and ROAS per month. Great for spotting trends and seasonality.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    account_name: { type: "string", description: "Client name (partial match ok)" },
+                    platform: {
+                        type: "string",
+                        description: "google (default), meta, or both",
+                        enum: ["google", "meta", "both"],
+                    },
+                    year: { type: "number", description: "Year to analyze (default: current year)" },
+                },
+                required: ["account_name"],
             },
         },
         {
@@ -2780,6 +3011,8 @@ async function handleToolCall(name, args = {}) {
     } else if (name === "get_search_terms") {
         const search    = (args.account_name || "").toLowerCase();
         const dateRange = args.date_range || "THIS_MONTH";
+        const startDate = args.start_date;
+        const endDate   = args.end_date;
         const match     = Object.entries(GOOGLE_ACCOUNTS).find(([, info]) => info.name.toLowerCase().includes(search));
         if (!match) {
             result = { error: `No Google account found matching '${args.account_name}'` };
@@ -2789,7 +3022,28 @@ async function handleToolCall(name, args = {}) {
             if (error) { result = { error: `Auth failed: ${error}` }; }
             else {
                 try {
-                    result = { account: info.name, date_range: dateRange, ...(await fetchSearchTerms(token, cid, info.mcc, dateRange)) };
+                    result = { account: info.name, date_range: dateRange, ...(await fetchSearchTerms(token, cid, info.mcc, dateRange, startDate, endDate)) };
+                } catch (e) {
+                    result = { error: e.message };
+                }
+            }
+        }
+
+    } else if (name === "get_pmax_search_terms") {
+        const search    = (args.account_name || "").toLowerCase();
+        const dateRange = args.date_range || "THIS_MONTH";
+        const startDate = args.start_date;
+        const endDate   = args.end_date;
+        const match     = Object.entries(GOOGLE_ACCOUNTS).find(([, info]) => info.name.toLowerCase().includes(search));
+        if (!match) {
+            result = { error: `No Google account found matching '${args.account_name}'` };
+        } else {
+            const [cid, info] = match;
+            const { token, error } = await getGoogleAccessToken();
+            if (error) { result = { error: `Auth failed: ${error}` }; }
+            else {
+                try {
+                    result = { account: info.name, date_range: dateRange, ...(await fetchPmaxSearchTermInsights(token, cid, info.mcc, dateRange, startDate, endDate)) };
                 } catch (e) {
                     result = { error: e.message };
                 }
@@ -3130,7 +3384,8 @@ async function handleToolCall(name, args = {}) {
                 if (authErr) { result = { error: `Auth: ${authErr}` }; }
                 else {
                     try {
-                        const report = await fetchGA4Report(token, info.ga4, dateRange, breakdown);
+                        const effectiveRange = (dateRange === "CUSTOM" && args.start_date && args.end_date) ? "CUSTOM" : dateRange;
+                        const report = await fetchGA4Report(token, info.ga4, effectiveRange, breakdown, args.start_date, args.end_date);
                         result = { account: info.name, ga4_property: info.ga4, date_range: dateRange, breakdown, ...report };
                     } catch (e) { result = { error: e.message }; }
                 }
@@ -3141,12 +3396,17 @@ async function handleToolCall(name, args = {}) {
         const search    = (args.account_name || "").toLowerCase();
         const platform  = args.platform || "google";
         const dateRange = args.date_range || "THIS_MONTH";
+        const startDate = args.start_date;
+        const endDate   = args.end_date;
         const metaPresetMap = {
             THIS_MONTH: "this_month", LAST_MONTH: "last_month",
             LAST_30_DAYS: "last_30_days", LAST_90_DAYS: "last_90_days", LAST_7_DAYS: "last_7_days",
+            YEAR_TO_DATE: "this_year",
         };
 
         result = { account: args.account_name, date_range: dateRange };
+        if (startDate) result.start_date = startDate;
+        if (endDate)   result.end_date = endDate;
 
         if (platform === "google" || platform === "both") {
             const match = Object.entries(GOOGLE_ACCOUNTS).find(([, i]) => i.name.toLowerCase().includes(search));
@@ -3158,7 +3418,7 @@ async function handleToolCall(name, args = {}) {
                 if (authErr) { result.google_error = `Auth: ${authErr}`; }
                 else {
                     try {
-                        result.google = { account: info.name, campaigns: await fetchGoogleCampaignPerf(token, cid, info.mcc, dateRange) };
+                        result.google = { account: info.name, campaigns: await fetchGoogleCampaignPerf(token, cid, info.mcc, dateRange, startDate, endDate) };
                     } catch (e) { result.google_error = e.message; }
                 }
             }
@@ -3171,7 +3431,8 @@ async function handleToolCall(name, args = {}) {
             } else {
                 const [accountId, info] = match;
                 try {
-                    result.meta = { account: info.name, campaigns: await fetchMetaCampaignPerf(accountId, metaPresetMap[dateRange] || "this_month") };
+                    const metaDateOpts = resolveMetaDateOpts(dateRange, startDate, endDate, metaPresetMap);
+                    result.meta = { account: info.name, campaigns: await fetchMetaCampaignPerf(accountId, metaDateOpts.preset, metaDateOpts.timeRange) };
                 } catch (e) { result.meta_error = e.message; }
             }
         }
@@ -3200,6 +3461,8 @@ async function handleToolCall(name, args = {}) {
     } else if (name === "get_keyword_performance") {
         const search    = (args.account_name || "").toLowerCase();
         const dateRange = args.date_range || "THIS_MONTH";
+        const startDate = args.start_date;
+        const endDate   = args.end_date;
         const filter    = args.filter || null;
         const match     = Object.entries(GOOGLE_ACCOUNTS).find(([, i]) => i.name.toLowerCase().includes(search));
 
@@ -3211,7 +3474,7 @@ async function handleToolCall(name, args = {}) {
             if (authErr) { result = { error: `Auth: ${authErr}` }; }
             else {
                 try {
-                    let keywords = await fetchGoogleKeywordPerf(token, cid, info.mcc, dateRange);
+                    let keywords = await fetchGoogleKeywordPerf(token, cid, info.mcc, dateRange, startDate, endDate);
                     if (filter === "low_quality_score")   keywords = keywords.filter(k => k.quality_score != null && k.quality_score <= 4);
                     if (filter === "low_impression_share") keywords = keywords.filter(k => k.impression_share != null && parseFloat(k.impression_share) < 0.5);
                     if (filter === "converting")          keywords = keywords.filter(k => k.conversions > 0);
@@ -3290,6 +3553,35 @@ async function handleToolCall(name, args = {}) {
                         cpa:         cur.cpa != null ? diff(cur.cpa, pri.cpa, true) : null,
                         roas:        cur.roas != null ? diff(cur.roas, pri.roas) : null,
                     };
+                }
+            }
+        } catch (e) { result = { error: e.message }; }
+
+    } else if (name === "get_monthly_trend") {
+        const search   = (args.account_name || "").toLowerCase();
+        const platform = args.platform || "google";
+        const year     = args.year || new Date().getFullYear();
+        result = { account: args.account_name, year, platform };
+
+        try {
+            if (platform === "google" || platform === "both") {
+                const match = Object.entries(GOOGLE_ACCOUNTS).find(([, i]) => i.name.toLowerCase().includes(search));
+                if (!match) { result.google_error = `No Google account matching '${args.account_name}'`; }
+                else {
+                    const [cid, info] = match;
+                    const { token, error: authErr } = await getGoogleAccessToken();
+                    if (authErr) { result.google_error = authErr; }
+                    else {
+                        result.google = { account: info.name, ...(await fetchGoogleMonthlyTrend(token, cid, info.mcc, year)) };
+                    }
+                }
+            }
+            if (platform === "meta" || platform === "both") {
+                const match = Object.entries(META_ACCOUNTS).find(([, i]) => i.name.toLowerCase().includes(search));
+                if (!match) { result.meta_error = `No Meta account matching '${args.account_name}'`; }
+                else {
+                    const [accountId, info] = match;
+                    result.meta = { account: info.name, ...(await fetchMetaMonthlyTrend(accountId, year)) };
                 }
             }
         } catch (e) { result = { error: e.message }; }
