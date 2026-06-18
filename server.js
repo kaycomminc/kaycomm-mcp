@@ -990,59 +990,42 @@ async function fetchSearchTerms(token, customerId, mccId, dateRange, startDate, 
     };
 }
 
-// ── PMax search term insights ────────────────────────────────────────────────
+// ── PMax-adjacent search terms (DSA / catch-all campaigns) ───────────────────
 async function fetchPmaxSearchTermInsights(token, customerId, mccId, dateRange, startDate, endDate) {
     const dateClause = resolveGaqlDateClause(dateRange, startDate, endDate);
 
-    // Find PMax campaigns
-    const pmaxRows = await googleSearch(token, customerId, mccId, `
-        SELECT campaign.id, campaign.name
-        FROM campaign
-        WHERE campaign.advertising_channel_type = 'PERFORMANCE_MAX'
-          AND campaign.status != 'REMOVED'`);
+    const termRows = await googleSearch(token, customerId, mccId, `
+        SELECT search_term_view.search_term, search_term_view.status,
+               campaign.name, campaign.advertising_channel_type,
+               metrics.cost_micros, metrics.clicks, metrics.impressions,
+               metrics.conversions, metrics.conversions_value,
+               metrics.ctr, metrics.average_cpc
+        FROM search_term_view
+        WHERE segments.date ${dateClause}
+          AND metrics.impressions > 0
+          AND campaign.advertising_channel_type IN ('MULTI_CHANNEL', 'SEARCH')
+        ORDER BY metrics.cost_micros DESC LIMIT 500`);
 
-    if (pmaxRows.length === 0) {
-        return { campaigns: [], total_categories: 0, insights: [], note: "No Performance Max campaigns found in this account." };
-    }
-
-    const allInsights = [];
-    for (const pRow of pmaxRows) {
-        const campaignId   = pRow.campaign.id;
-        const campaignName = pRow.campaign.name;
-        try {
-            const rows = await googleSearch(token, customerId, mccId, `
-                SELECT campaign_search_term_insight.category_label,
-                       metrics.clicks, metrics.impressions,
-                       metrics.conversions, metrics.conversions_value
-                FROM campaign_search_term_insight
-                WHERE campaign_search_term_insight.campaign_id = ${campaignId}
-                  AND segments.date ${dateClause}
-                ORDER BY metrics.impressions DESC`);
-
-            for (const row of rows) {
-                allInsights.push({
-                    campaign:    campaignName,
-                    category:    row.campaignSearchTermInsight?.categoryLabel || "(unlabeled)",
-                    clicks:      parseInt(row.metrics?.clicks || 0),
-                    impressions: parseInt(row.metrics?.impressions || 0),
-                    convs:       parseFloat(row.metrics?.conversions || 0),
-                    conv_value:  parseFloat(row.metrics?.conversionsValue || 0),
-                });
-            }
-        } catch (e) {
-            allInsights.push({ campaign: campaignName, error: e.message });
-        }
-    }
-
-    allInsights.sort((a, b) => (b.impressions || 0) - (a.impressions || 0));
+    const terms = termRows.map(row => ({
+        term:         row.searchTermView.searchTerm,
+        status:       row.searchTermView.status || "",
+        campaign:     row.campaign.name,
+        channel_type: row.campaign.advertisingChannelType,
+        cost:         parseInt(row.metrics.costMicros || 0) / 1_000_000,
+        clicks:       parseInt(row.metrics.clicks || 0),
+        impressions:  parseInt(row.metrics.impressions || 0),
+        convs:        parseFloat(row.metrics.conversions || 0),
+        conv_value:   parseFloat(row.metrics.conversionsValue || 0),
+        ctr:          (parseFloat(row.metrics.ctr || 0) * 100).toFixed(1) + "%",
+        avg_cpc:      (parseInt(row.metrics.averageCpc || 0) / 1_000_000).toFixed(2),
+    }));
 
     return {
-        campaigns:        pmaxRows.map(r => r.campaign.name),
-        total_categories: allInsights.filter(i => !i.error).length,
-        top_categories:   allInsights.filter(i => !i.error).slice(0, 50),
-        converting:       allInsights.filter(i => !i.error && i.convs > 0),
-        all_insights:     allInsights,
-        note: "PMax search term insights are categorized groupings (not individual raw search queries). They reflect the categories shown in the Google Ads UI.",
+        total_terms: terms.length,
+        wasted:      terms.filter(t => t.cost > 3 && t.convs === 0).slice(0, 25),
+        converting:  terms.filter(t => t.convs > 0),
+        all_terms:   terms,
+        note: "These are search terms from DSA and catch-all Search campaigns (the API-visible traffic running alongside PMax). True PMax search themes are only available in the Google Ads UI under the PMax campaign Insights tab → Search categories.",
     };
 }
 
@@ -2225,7 +2208,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         },
         {
             name: "get_pmax_search_terms",
-            description: "Pull Performance Max search term insights for an account. Returns categorized search term groupings (as shown in the Google Ads UI) with clicks, impressions, conversions, and conversion value per category. Useful for understanding what queries are triggering PMax campaigns.",
+            description: "Pull search terms from DSA (Dynamic Search Ads) and catch-all campaigns that run alongside PMax. True PMax search themes are only visible in the Google Ads UI (Insights tab → Search categories) and cannot be pulled via the API. This tool surfaces the API-visible equivalent: DSA and branded campaign queries with spend, clicks, conversions. Useful for finding keyword migration opportunities.",
             inputSchema: {
                 type: "object",
                 properties: {
