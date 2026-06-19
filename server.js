@@ -990,27 +990,13 @@ async function fetchSearchTerms(token, customerId, mccId, dateRange, startDate, 
     };
 }
 
-// ── PMax-adjacent search terms (DSA / catch-all campaigns) ───────────────────
+// ── PMax search terms + DSA/catch-all fallback ───────────────────────────────
 async function fetchPmaxSearchTermInsights(token, customerId, mccId, dateRange, startDate, endDate) {
     const dateClause = resolveGaqlDateClause(dateRange, startDate, endDate);
-
-    const termRows = await googleSearch(token, customerId, mccId, `
-        SELECT search_term_view.search_term, search_term_view.status,
-               campaign.name, campaign.advertising_channel_type,
-               metrics.cost_micros, metrics.clicks, metrics.impressions,
-               metrics.conversions, metrics.conversions_value,
-               metrics.ctr, metrics.average_cpc
-        FROM search_term_view
-        WHERE segments.date ${dateClause}
-          AND metrics.impressions > 0
-          AND campaign.advertising_channel_type IN ('MULTI_CHANNEL', 'SEARCH')
-        ORDER BY metrics.cost_micros DESC LIMIT 500`);
-
-    const terms = termRows.map(row => ({
-        term:         row.searchTermView.searchTerm,
-        status:       row.searchTermView.status || "",
+    const mapTerm = (row, source) => ({
+        term:         row.campaignSearchTermView?.searchTerm || row.searchTermView?.searchTerm,
         campaign:     row.campaign.name,
-        channel_type: row.campaign.advertisingChannelType,
+        source,
         cost:         parseInt(row.metrics.costMicros || 0) / 1_000_000,
         clicks:       parseInt(row.metrics.clicks || 0),
         impressions:  parseInt(row.metrics.impressions || 0),
@@ -1018,15 +1004,71 @@ async function fetchPmaxSearchTermInsights(token, customerId, mccId, dateRange, 
         conv_value:   parseFloat(row.metrics.conversionsValue || 0),
         ctr:          (parseFloat(row.metrics.ctr || 0) * 100).toFixed(1) + "%",
         avg_cpc:      (parseInt(row.metrics.averageCpc || 0) / 1_000_000).toFixed(2),
-    }));
+    });
 
-    return {
-        total_terms: terms.length,
-        wasted:      terms.filter(t => t.cost > 3 && t.convs === 0).slice(0, 25),
-        converting:  terms.filter(t => t.convs > 0),
-        all_terms:   terms,
-        note: "These are search terms from DSA and catch-all Search campaigns (the API-visible traffic running alongside PMax). True PMax search themes are only available in the Google Ads UI under the PMax campaign Insights tab → Search categories.",
-    };
+    // Primary: PMax search terms via campaign_search_term_view
+    let pmaxTerms = [];
+    let pmaxError = null;
+    try {
+        const pmaxRows = await googleSearch(token, customerId, mccId, `
+            SELECT campaign_search_term_view.search_term,
+                   campaign.name,
+                   metrics.cost_micros, metrics.clicks, metrics.impressions,
+                   metrics.conversions, metrics.conversions_value,
+                   metrics.ctr, metrics.average_cpc
+            FROM campaign_search_term_view
+            WHERE segments.date ${dateClause}
+              AND metrics.impressions > 0
+            ORDER BY metrics.impressions DESC`);
+        pmaxTerms = pmaxRows.map(r => mapTerm(r, "pmax"));
+    } catch (e) {
+        pmaxError = e.message;
+    }
+
+    // Secondary: DSA / catch-all search terms running alongside PMax
+    let dsaTerms = [];
+    try {
+        const dsaRows = await googleSearch(token, customerId, mccId, `
+            SELECT search_term_view.search_term, search_term_view.status,
+                   campaign.name,
+                   metrics.cost_micros, metrics.clicks, metrics.impressions,
+                   metrics.conversions, metrics.conversions_value,
+                   metrics.ctr, metrics.average_cpc
+            FROM search_term_view
+            WHERE segments.date ${dateClause}
+              AND metrics.impressions > 0
+              AND campaign.advertising_channel_type IN ('MULTI_CHANNEL', 'SEARCH')
+            ORDER BY metrics.cost_micros DESC LIMIT 500`);
+        dsaTerms = dsaRows.map(r => {
+            const t = mapTerm(r, "dsa");
+            t.status = r.searchTermView.status || "";
+            return t;
+        });
+    } catch (_) {}
+
+    const result = {};
+
+    if (pmaxTerms.length > 0) {
+        result.pmax_terms = {
+            total: pmaxTerms.length,
+            top_terms:   pmaxTerms.slice(0, 50),
+            converting:  pmaxTerms.filter(t => t.convs > 0),
+            wasted:      pmaxTerms.filter(t => t.cost > 3 && t.convs === 0).slice(0, 25),
+        };
+    } else {
+        result.pmax_terms = { total: 0, note: pmaxError || "No PMax search term data returned. Check the Google Ads UI (PMax campaign → Insights → Search categories) for theme-level data." };
+    }
+
+    if (dsaTerms.length > 0) {
+        result.dsa_catch_all = {
+            total: dsaTerms.length,
+            wasted:     dsaTerms.filter(t => t.cost > 3 && t.convs === 0).slice(0, 25),
+            converting: dsaTerms.filter(t => t.convs > 0),
+            all_terms:  dsaTerms,
+        };
+    }
+
+    return result;
 }
 
 // ── Keyword planning ──────────────────────────────────────────────────────────
@@ -2208,7 +2250,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         },
         {
             name: "get_pmax_search_terms",
-            description: "Pull search terms from DSA (Dynamic Search Ads) and catch-all campaigns that run alongside PMax. True PMax search themes are only visible in the Google Ads UI (Insights tab → Search categories) and cannot be pulled via the API. This tool surfaces the API-visible equivalent: DSA and branded campaign queries with spend, clicks, conversions. Useful for finding keyword migration opportunities.",
+            description: "Pull Performance Max search terms via campaign_search_term_view, plus DSA/catch-all terms running alongside PMax. PMax section shows queries triggering PMax campaigns with impressions, clicks, spend, conversions. DSA section shows dynamic and branded catch-all queries. Useful for understanding PMax query coverage and finding keyword migration opportunities.",
             inputSchema: {
                 type: "object",
                 properties: {
