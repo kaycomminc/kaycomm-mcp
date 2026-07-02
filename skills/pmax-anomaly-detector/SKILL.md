@@ -61,7 +61,7 @@ PMax will bid on branded searches unless explicitly excluded. If you see branded
 **Recommendations**: Ordered by impact. For each:
 - The specific action
 - Expected outcome
-- Whether it can be done with an available tool (negative keywords → `add_negative_keywords`, budget change → `set_google_budget`)
+- Whether it can be done with an available tool (negative keywords → `add_negative_keywords`, budget change → `update_budget`, asset group visibility → `get_pmax_asset_groups`)
 
 ## Important context
 

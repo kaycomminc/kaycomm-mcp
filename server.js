@@ -222,25 +222,31 @@ async function getGoogleAccessToken() {
 
 // ── Google Ads API ────────────────────────────────────────────────────────────
 async function googleSearch(token, customerId, mccId, query) {
-    const resp = await fetchFn(
-        `https://googleads.googleapis.com/${GOOGLE_API_VERSION}/customers/${customerId}/googleAds:search`,
-        {
-            method: "POST",
-            headers: {
-                "Authorization":       `Bearer ${token}`,
-                "developer-token":     GOOGLE_DEVELOPER_TOKEN,
-                "login-customer-id":   mccId,
-                "Content-Type":        "application/json",
-            },
-            body: JSON.stringify({ query }),
+    const results = [];
+    let pageToken = null;
+    do {
+        const resp = await fetchFn(
+            `https://googleads.googleapis.com/${GOOGLE_API_VERSION}/customers/${customerId}/googleAds:search`,
+            {
+                method: "POST",
+                headers: {
+                    "Authorization":       `Bearer ${token}`,
+                    "developer-token":     GOOGLE_DEVELOPER_TOKEN,
+                    "login-customer-id":   mccId,
+                    "Content-Type":        "application/json",
+                },
+                body: JSON.stringify(pageToken ? { query, pageToken } : { query }),
+            }
+        );
+        const data = await resp.json();
+        if (!resp.ok) {
+            const msg = data?.error?.details?.[0]?.errors?.[0]?.message || data?.error?.message || JSON.stringify(data);
+            throw new Error(msg);
         }
-    );
-    const data = await resp.json();
-    if (!resp.ok) {
-        const msg = data?.error?.details?.[0]?.errors?.[0]?.message || data?.error?.message || JSON.stringify(data);
-        throw new Error(msg);
-    }
-    return data.results || [];
+        results.push(...(data.results || []));
+        pageToken = data.nextPageToken || null;
+    } while (pageToken);
+    return results;
 }
 
 async function fetchGoogleMTD(token, customerId, mccId, monthStart, yesterday) {
@@ -544,12 +550,39 @@ async function metaPost(path, body = {}) {
     return data;
 }
 
+// Single definition of "conversions" for every Meta tool: lead + purchase +
+// offsite_conversion.fb_pixel_lead (some accounts report pixel leads only
+// under the latter, so dropping it undercounts).
+function metaConversions(actions = []) {
+    const val = type => parseFloat(actions.find(a => a.action_type === type)?.value || 0);
+    const leads      = val("lead");
+    const purchases  = val("purchase");
+    const pixelLeads = val("offsite_conversion.fb_pixel_lead");
+    return { leads, purchases, pixelLeads, conversions: leads + purchases + pixelLeads };
+}
+
+// Follows Graph API cursor pagination (paging.next) and returns all rows.
+async function metaGetAll(path, extraParams = {}) {
+    const rows = [];
+    let data = await metaGet(path, extraParams);
+    rows.push(...(data.data || []));
+    let next = data.paging?.next;
+    while (next) {
+        const resp = await fetchFn(next); // paging.next carries the access token
+        data = await resp.json();
+        if (data.error) throw new Error(data.error.message);
+        rows.push(...(data.data || []));
+        next = data.paging?.next;
+    }
+    return rows;
+}
+
 async function getMetaCampaigns(accountId) {
-    const data = await metaGet(`${accountId}/campaigns`, {
+    const rows = await metaGetAll(`${accountId}/campaigns`, {
         fields: "id,name,status,daily_budget,lifetime_budget,objective",
         limit: 100,
     });
-    return (data.data || []).map(c => ({
+    return rows.map(c => ({
         id: c.id, name: c.name, status: c.status,
         daily_budget:    c.daily_budget    ? parseFloat(c.daily_budget) / 100    : null,
         lifetime_budget: c.lifetime_budget ? parseFloat(c.lifetime_budget) / 100 : null,
@@ -559,11 +592,11 @@ async function getMetaCampaigns(accountId) {
 }
 
 async function getMetaAdsets(accountId) {
-    const data = await metaGet(`${accountId}/adsets`, {
+    const rows = await metaGetAll(`${accountId}/adsets`, {
         fields: "id,name,status,daily_budget,lifetime_budget,campaign_id,campaign{name}",
         limit: 200,
     });
-    return (data.data || []).map(s => ({
+    return rows.map(s => ({
         id: s.id, name: s.name, status: s.status,
         campaign: s.campaign?.name || s.campaign_id,
         daily_budget:    s.daily_budget    ? parseFloat(s.daily_budget) / 100    : null,
@@ -574,15 +607,16 @@ async function getMetaAdsets(accountId) {
 
 // ── Google Analytics 4 ───────────────────────────────────────────────────────
 function getGA4DateRange(range) {
-    const today = new Date();
-    const fmt = d => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
+    const { today, month_start } = getDateInfo();
+    const [y, m] = today.split("-").map(Number);
+    const fmt = dt => dt.toISOString().split("T")[0];
     switch (range) {
-        case "THIS_MONTH":   return { startDate: fmt(new Date(today.getFullYear(), today.getMonth(), 1)), endDate: "today" };
-        case "LAST_MONTH":   return { startDate: fmt(new Date(today.getFullYear(), today.getMonth()-1, 1)), endDate: fmt(new Date(today.getFullYear(), today.getMonth(), 0)) };
+        case "THIS_MONTH":   return { startDate: month_start, endDate: "today" };
+        case "LAST_MONTH":   return { startDate: fmt(new Date(Date.UTC(y, m - 2, 1))), endDate: fmt(new Date(Date.UTC(y, m - 1, 0))) };
         case "LAST_7_DAYS":  return { startDate: "7daysAgo",  endDate: "yesterday" };
         case "LAST_30_DAYS": return { startDate: "30daysAgo", endDate: "yesterday" };
         case "LAST_90_DAYS":  return { startDate: "90daysAgo", endDate: "yesterday" };
-        case "YEAR_TO_DATE": return { startDate: fmt(new Date(today.getFullYear(), 0, 1)), endDate: "yesterday" };
+        case "YEAR_TO_DATE": return { startDate: `${y}-01-01`, endDate: "yesterday" };
         default:             return { startDate: "30daysAgo", endDate: "yesterday" };
     }
 }
@@ -735,11 +769,7 @@ async function fetchMetaCampaignPerf(accountId, datePreset, timeRange) {
     if (data.error) throw new Error(data.error.message);
 
     return (data.data || []).map(row => {
-        const actions   = row.actions || [];
-        const leads     = parseFloat(actions.find(a => a.action_type === "lead")?.value || 0);
-        const purchases = parseFloat(actions.find(a => a.action_type === "purchase")?.value || 0);
-        const pixelLeads = parseFloat(actions.find(a => a.action_type === "offsite_conversion.fb_pixel_lead")?.value || 0);
-        const convs     = leads + purchases + pixelLeads;
+        const { leads, purchases, conversions: convs } = metaConversions(row.actions);
         const spend     = parseFloat(row.spend || 0);
         const roas      = row.purchase_roas?.[0]?.value ? parseFloat(row.purchase_roas[0].value) : null;
         const cpa       = convs > 0 ? Math.round((spend / convs) * 100) / 100 : null;
@@ -822,10 +852,7 @@ async function fetchMetaMonthlyTrend(accountId, year) {
 
     let ytdSpend = 0, ytdConv = 0;
     const months = (data.data || []).map(row => {
-        const actions = row.actions || [];
-        const leads = parseFloat(actions.find(a => a.action_type === "lead")?.value || 0);
-        const purchases = parseFloat(actions.find(a => a.action_type === "purchase")?.value || 0);
-        const convs = leads + purchases;
+        const { conversions: convs } = metaConversions(row.actions);
         const spend = parseFloat(row.spend || 0);
         const cpa = convs > 0 ? Math.round((spend / convs) * 100) / 100 : null;
         ytdSpend += spend; ytdConv += convs;
@@ -953,11 +980,11 @@ function resolveMetaDateOpts(dateRange, startDate, endDate, presetMap) {
 // ── GAQL date clause resolver ────────────────────────────────────────────────
 function resolveGaqlDateClause(dateRange, startDate, endDate) {
     if (dateRange === "YEAR_TO_DATE") {
-        const { today } = getDateInfo();
-        const yd = new Date(today); yd.setDate(yd.getDate() - 1);
+        const { today, yesterday } = getDateInfo();
         const yearStart = `${today.slice(0, 4)}-01-01`;
-        const yFmt = `${yd.getFullYear()}-${String(yd.getMonth()+1).padStart(2,"0")}-${String(yd.getDate()).padStart(2,"0")}`;
-        return `BETWEEN '${yearStart}' AND '${yFmt}'`;
+        // On Jan 1, yesterday is in the prior year — fall back to today so the range stays valid
+        const end = yesterday >= yearStart ? yesterday : today;
+        return `BETWEEN '${yearStart}' AND '${end}'`;
     }
     if (dateRange === "CUSTOM" && startDate && endDate) {
         return `BETWEEN '${startDate}' AND '${endDate}'`;
@@ -967,44 +994,33 @@ function resolveGaqlDateClause(dateRange, startDate, endDate) {
 
 // ── Period comparison helpers ─────────────────────────────────────────────────
 function getCompareDateRanges(comparison) {
-    const today = new Date();
-    const fmt = d => {
-        const y   = d.getFullYear();
-        const m   = String(d.getMonth() + 1).padStart(2, "0");
-        const day = String(d.getDate()).padStart(2, "0");
-        return `${y}-${m}-${day}`;
-    };
-    const shift = (d, n) => { const r = new Date(d); r.setDate(r.getDate() + n); return r; };
+    const { today, month_start } = getDateInfo();
+    const [y, m, d] = today.split("-").map(Number);
+    const fmt = dt => dt.toISOString().split("T")[0];
+    const shift = n => fmt(new Date(Date.UTC(y, m - 1, d + n)));
 
     if (comparison === "this_month_vs_last_month") {
-        const thisStart = new Date(today.getFullYear(), today.getMonth(), 1);
-        const lastStart = new Date(today.getFullYear(), today.getMonth() - 1, 1);
-        const lastEnd   = new Date(today.getFullYear(), today.getMonth(), 0);
         return {
-            p1: { start: fmt(thisStart), end: fmt(shift(today, -1)), label: "This Month MTD" },
-            p2: { start: fmt(lastStart), end: fmt(lastEnd),          label: "Last Month (Full)" },
+            p1: { start: month_start,                     end: shift(-1),                        label: "This Month MTD" },
+            p2: { start: fmt(new Date(Date.UTC(y, m - 2, 1))), end: fmt(new Date(Date.UTC(y, m - 1, 0))), label: "Last Month (Full)" },
         };
     }
     if (comparison === "last_7_days_vs_prior_7_days") {
         return {
-            p1: { start: fmt(shift(today, -7)), end: fmt(shift(today, -1)), label: "Last 7 Days" },
-            p2: { start: fmt(shift(today, -14)), end: fmt(shift(today, -8)), label: "Prior 7 Days" },
+            p1: { start: shift(-7), end: shift(-1), label: "Last 7 Days" },
+            p2: { start: shift(-14), end: shift(-8), label: "Prior 7 Days" },
         };
     }
     if (comparison === "last_30_days_vs_prior_30_days") {
         return {
-            p1: { start: fmt(shift(today, -30)), end: fmt(shift(today, -1)), label: "Last 30 Days" },
-            p2: { start: fmt(shift(today, -60)), end: fmt(shift(today, -31)), label: "Prior 30 Days" },
+            p1: { start: shift(-30), end: shift(-1), label: "Last 30 Days" },
+            p2: { start: shift(-60), end: shift(-31), label: "Prior 30 Days" },
         };
     }
     if (comparison === "year_over_year") {
-        const yearStart = new Date(today.getFullYear(), 0, 1);
-        const lastYearStart = new Date(today.getFullYear() - 1, 0, 1);
-        const lastYearEnd = new Date(today.getFullYear() - 1, today.getMonth(), today.getDate());
-        lastYearEnd.setDate(lastYearEnd.getDate() - 1);
         return {
-            p1: { start: fmt(yearStart),     end: fmt(shift(today, -1)), label: `${today.getFullYear()} YTD` },
-            p2: { start: fmt(lastYearStart), end: fmt(lastYearEnd),      label: `${today.getFullYear() - 1} Same Period` },
+            p1: { start: `${y}-01-01`,     end: shift(-1),                                label: `${y} YTD` },
+            p2: { start: `${y - 1}-01-01`, end: fmt(new Date(Date.UTC(y - 1, m - 1, d - 1))), label: `${y - 1} Same Period` },
         };
     }
     throw new Error(`Unknown comparison: ${comparison}`);
@@ -1054,10 +1070,7 @@ async function fetchMetaMetricsForRange(accountId, startDate, endDate) {
     if (data.error) throw new Error(data.error.message);
 
     const row     = data.data?.[0] || {};
-    const actions = row.actions || [];
-    const leads   = parseFloat(actions.find(a => a.action_type === "lead")?.value || 0);
-    const purch   = parseFloat(actions.find(a => a.action_type === "purchase")?.value || 0);
-    const convs   = leads + purch;
+    const { conversions: convs } = metaConversions(row.actions);
     const spend   = parseFloat(row.spend || 0);
     const roas    = row.purchase_roas?.[0]?.value ? parseFloat(row.purchase_roas[0].value) : null;
     const cpa     = convs > 0 ? Math.round((spend / convs) * 100) / 100 : null;
@@ -1925,7 +1938,13 @@ function detectSpendAnomaly(byDate, yesterday) {
     for (let i = 1; i <= 7; i++) prior.push(byDate[daysAgo(i, yesterday)] ?? 0);
     const avg = prior.reduce((s, v) => s + v, 0) / prior.length;
     if (avg < 5 && ydaySpend < 5) return null; // too small to be meaningful
-    const pct = avg > 0 ? Math.round(((ydaySpend - avg) / avg) * 100) : (ydaySpend > 0 ? Infinity : 0);
+    if (avg === 0) {
+        // No trailing spend at all — a percentage is meaningless
+        return ydaySpend > 0
+            ? { type: "SPEND_SPIKE", yesterday: ydaySpend, trailing_7d_avg: 0, change: "new spend" }
+            : null;
+    }
+    const pct = Math.round(((ydaySpend - avg) / avg) * 100);
     if (pct >= 75)  return { type: "SPEND_SPIKE", yesterday: ydaySpend, trailing_7d_avg: Math.round(avg * 100) / 100, change: `+${pct}%` };
     if (pct <= -60) return { type: "SPEND_DROP",  yesterday: ydaySpend, trailing_7d_avg: Math.round(avg * 100) / 100, change: `${pct}%` };
     return null;
@@ -5421,7 +5440,14 @@ async function main() {
                 if (!transport) { res.writeHead(404); res.end("Session not found"); return; }
                 const chunks = [];
                 for await (const chunk of req) chunks.push(chunk);
-                const body = JSON.parse(Buffer.concat(chunks).toString());
+                let body;
+                try {
+                    body = JSON.parse(Buffer.concat(chunks).toString());
+                } catch {
+                    res.writeHead(400, { "Content-Type": "text/plain" });
+                    res.end("Invalid JSON body");
+                    return;
+                }
                 await transport.handlePostMessage(req, res, body);
 
             } else {
