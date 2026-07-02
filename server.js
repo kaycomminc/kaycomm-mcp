@@ -82,6 +82,43 @@ function getHealthConfig(info) {
 
 loadAccounts();
 
+// ── Write-action audit log ────────────────────────────────────────────────────
+// Every confirmed mutation (any tool called with confirm=true) is appended as a
+// JSONL entry — a cross-platform record of what the MCP changed and when.
+// NOTE: Railway's filesystem resets on deploy, so the local Mac holds the
+// authoritative history.
+const WRITE_LOG_FILE = path.join(__dirname, "write-log.jsonl");
+
+function logWriteAction(tool, args, result) {
+    try {
+        const entry = {
+            ts:   new Date().toISOString(),
+            tool,
+            args: Object.fromEntries(Object.entries(args || {}).filter(([k]) => k !== "confirm")),
+            ok:   !(result && result.error),
+        };
+        if (result?.error) entry.error = result.error;
+        fs.appendFileSync(WRITE_LOG_FILE, JSON.stringify(entry) + "\n");
+    } catch (_) { /* logging must never break a write */ }
+}
+
+function readWriteLog({ days = 30, account_name, tool, limit = 50 } = {}) {
+    if (!fs.existsSync(WRITE_LOG_FILE)) return [];
+    const cutoff = new Date(Date.now() - days * 86400000).toISOString();
+    const search = account_name ? account_name.toLowerCase() : null;
+    const entries = [];
+    for (const line of fs.readFileSync(WRITE_LOG_FILE, "utf8").split("\n")) {
+        if (!line.trim()) continue;
+        let e;
+        try { e = JSON.parse(line); } catch (_) { continue; }
+        if (e.ts < cutoff) continue;
+        if (tool && e.tool !== tool) continue;
+        if (search && !(e.args?.account_name || e.args?.name || "").toLowerCase().includes(search)) continue;
+        entries.push(e);
+    }
+    return entries.slice(-limit).reverse(); // newest first
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 // Resolve an account's budget (and nc_budget) for a given date, honoring an
@@ -1266,12 +1303,6 @@ async function callKeywordPlannerIdeas(token, customerId, mccId, seedKeywords, u
     return (data.results || []).map(r => parseKwMetric(r));
 }
 
-// Keep old name for existing get_keyword_ideas tool
-async function fetchKeywordIdeas(token, customerId, mccId, seedKeywords) {
-    const results = await callKeywordPlannerIdeas(token, customerId, mccId, seedKeywords, null);
-    return results.sort((a, b) => b.avg_monthly_searches - a.avg_monthly_searches);
-}
-
 async function fetchKeywordHistoricalMetrics(token, customerId, mccId, keywords, showTrend) {
     const resp = await fetchFn(
         `https://googleads.googleapis.com/${GOOGLE_API_VERSION}/customers/${customerId}:generateKeywordHistoricalMetrics`,
@@ -1398,23 +1429,23 @@ function inferNegatives(kwMetrics) {
 
 // ── Campaign status + budget writes ──────────────────────────────────────────
 async function listGoogleCampaignsFull(token, customerId, mccId) {
-    const rows = await googleSearch(token, customerId, mccId, `
-        SELECT campaign.id, campaign.name, campaign.status, campaign.advertising_channel_type,
-               campaign_budget.amount_micros, campaign.resource_name,
-               metrics.cost_micros
-        FROM campaign
-        WHERE campaign.status != 'REMOVED'
-          AND segments.date DURING THIS_MONTH
-        ORDER BY metrics.cost_micros DESC`);
-    return rows.map(r => ({
-        id:           r.campaign.id,
-        name:         r.campaign.name,
-        status:       r.campaign.status,
-        type:         r.campaign.advertisingChannelType,
-        daily_budget: r.campaignBudget?.amountMicros ? "$" + (parseInt(r.campaignBudget.amountMicros) / 1_000_000).toFixed(2) : null,
-        mtd_spend:    "$" + (parseInt(r.metrics.costMicros || 0) / 1_000_000).toFixed(2),
-        resource_name: r.campaign.resourceName,
-    }));
+    // Two queries merged: a date-filtered metrics query alone would hide
+    // campaigns with zero spend this month (they have no data rows).
+    const [all, spendRows] = await Promise.all([
+        listGoogleCampaignsAll(token, customerId, mccId),
+        googleSearch(token, customerId, mccId, `
+            SELECT campaign.resource_name, metrics.cost_micros
+            FROM campaign
+            WHERE campaign.status != 'REMOVED'
+              AND segments.date DURING THIS_MONTH`).catch(() => []),
+    ]);
+    const spend = {};
+    for (const r of spendRows) {
+        spend[r.campaign.resourceName] = (spend[r.campaign.resourceName] || 0) + parseInt(r.metrics?.costMicros || 0);
+    }
+    return all
+        .map(c => ({ ...c, mtd_spend: "$" + ((spend[c.resource_name] || 0) / 1_000_000).toFixed(2) }))
+        .sort((a, b) => (spend[b.resource_name] || 0) - (spend[a.resource_name] || 0));
 }
 
 async function updateGoogleCampaignStatus(token, customerId, mccId, resourceName, status) {
@@ -1811,6 +1842,81 @@ async function fetchStackAdaptSpend(advertiserId, from, to) {
     const nodes = data?.campaignDelivery?.records?.nodes || [];
     const spend = nodes.reduce((s, n) => s + parseFloat(n.metrics?.cost || 0), 0);
     return { spend, campaigns: nodes.map(n => ({ name: n.campaign?.name, cost: parseFloat(n.metrics?.cost || 0) })) };
+}
+
+async function fetchStackAdaptDailySpend(advertiserId, from, to) {
+    const data = await stackAdaptGQL(`{
+        campaignDelivery(
+            dataType: TABLE
+            granularity: DAILY
+            date: { from: "${from}", to: "${to}" }
+            filterBy: { advertiserIds: [${parseInt(advertiserId)}] }
+        ) {
+            ... on CampaignDeliveryOutcome {
+                records { nodes { granularity { time } metrics { cost } } }
+            }
+        }
+    }`);
+    const byDate = {};
+    for (const n of (data?.campaignDelivery?.records?.nodes || [])) {
+        const dt = String(n.granularity?.time || "").slice(0, 10);
+        if (dt) byDate[dt] = (byDate[dt] || 0) + parseFloat(n.metrics?.cost || 0);
+    }
+    return byDate;
+}
+
+async function fetchStackAdaptCampaignPerf(advertiserId, from, to) {
+    const data = await stackAdaptGQL(`{
+        campaignDelivery(
+            dataType: TABLE
+            granularity: TOTAL
+            date: { from: "${from}", to: "${to}" }
+            filterBy: { advertiserIds: [${parseInt(advertiserId)}] }
+        ) {
+            ... on CampaignDeliveryOutcome {
+                records { nodes { campaign { id name } metrics { cost impressionsBigint clicksBigint conversions } } }
+            }
+        }
+    }`);
+    return (data?.campaignDelivery?.records?.nodes || []).map(n => {
+        const m     = n.metrics || {};
+        const spend = parseFloat(m.cost || 0);
+        const imps  = parseInt(m.impressionsBigint || 0);
+        const clicks = parseInt(m.clicksBigint || 0);
+        const convs = parseFloat(m.conversions || 0);
+        return {
+            campaign:    n.campaign?.name,
+            spend:       Math.round(spend * 100) / 100,
+            impressions: imps,
+            clicks,
+            ctr:         imps > 0 ? (clicks / imps * 100).toFixed(2) + "%" : "0%",
+            avg_cpm:     imps > 0 ? "$" + (spend / imps * 1000).toFixed(2) : null,
+            conversions: convs,
+            cpa:         convs > 0 ? "$" + (Math.round((spend / convs) * 100) / 100) : null,
+        };
+    });
+}
+
+// Resolve a report date_range to concrete from/to dates (StackAdapt has no presets)
+function rangeToDates(dateRange, startDate, endDate) {
+    const { today, yesterday, month_start } = getDateInfo();
+    if (dateRange === "CUSTOM" && startDate && endDate) return { from: startDate, to: endDate };
+    const [y, m] = today.split("-").map(Number);
+    const fmt = dt => dt.toISOString().split("T")[0];
+    switch (dateRange) {
+        case "LAST_7_DAYS":  return { from: daysAgo(7, today),  to: yesterday };
+        case "LAST_30_DAYS": return { from: daysAgo(30, today), to: yesterday };
+        case "LAST_90_DAYS": return { from: daysAgo(90, today), to: yesterday };
+        case "LAST_MONTH":   return { from: fmt(new Date(Date.UTC(y, m - 2, 1))), to: fmt(new Date(Date.UTC(y, m - 1, 0))) };
+        case "YEAR_TO_DATE": {
+            const yearStart = `${y}-01-01`;
+            return { from: yearStart, to: yesterday >= yearStart ? yesterday : today };
+        }
+        case "THIS_MONTH":
+        default:
+            // On the 1st there are no complete days yet — clamp to a valid single-day window
+            return { from: month_start, to: yesterday >= month_start ? yesterday : month_start };
+    }
 }
 
 async function buildStackAdaptRows(pace_dom, dim, today, monthStart, yesterday) {
@@ -2334,16 +2440,17 @@ async function fetchChangeHistory(token, customerId, mccId, days, resourceType) 
     });
 }
 
-// set_google_budget — campaign lookup without the THIS_MONTH date filter so it
+// Campaign lookup without the THIS_MONTH date filter so it
 // finds campaigns regardless of whether they've spent anything this month.
 async function listGoogleCampaignsAll(token, customerId, mccId) {
     const rows = await googleSearch(token, customerId, mccId, `
-        SELECT campaign.name, campaign.status, campaign.advertising_channel_type,
+        SELECT campaign.id, campaign.name, campaign.status, campaign.advertising_channel_type,
                campaign_budget.amount_micros, campaign.resource_name
         FROM campaign
         WHERE campaign.status != 'REMOVED'
         ORDER BY campaign.name`);
     return rows.map(r => ({
+        id:            r.campaign.id,
         name:          r.campaign.name,
         status:        r.campaign.status,
         type:          r.campaign.advertisingChannelType,
@@ -2352,6 +2459,202 @@ async function listGoogleCampaignsAll(token, customerId, mccId) {
                            : null,
         resource_name: r.campaign.resourceName,
     }));
+}
+
+// Generic googleAds:mutate wrapper for typed mutate operations
+async function googleMutateOps(token, customerId, mccId, mutateOperations) {
+    const resp = await fetchFn(
+        `https://googleads.googleapis.com/${GOOGLE_API_VERSION}/customers/${customerId}/googleAds:mutate`,
+        {
+            method: "POST",
+            headers: {
+                "Authorization":     `Bearer ${token}`,
+                "developer-token":   GOOGLE_DEVELOPER_TOKEN,
+                "login-customer-id": mccId,
+                "Content-Type":      "application/json",
+            },
+            body: JSON.stringify({ mutateOperations }),
+        }
+    );
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(googleAdsError(data));
+    return data.mutateOperationResponses || [];
+}
+
+// ── PMax asset groups ─────────────────────────────────────────────────────────
+async function fetchPmaxAssetGroups(token, customerId, mccId, dateClause) {
+    const rows = await googleSearch(token, customerId, mccId, `
+        SELECT campaign.name, asset_group.name, asset_group.status,
+               asset_group.primary_status,
+               metrics.cost_micros, metrics.impressions, metrics.clicks,
+               metrics.conversions, metrics.conversions_value
+        FROM asset_group
+        WHERE segments.date ${dateClause}
+        ORDER BY metrics.cost_micros DESC`);
+    return rows.map(r => {
+        const spend   = parseInt(r.metrics?.costMicros || 0) / 1_000_000;
+        const convs   = parseFloat(r.metrics?.conversions || 0);
+        const convVal = parseFloat(r.metrics?.conversionsValue || 0);
+        return {
+            campaign:       r.campaign.name,
+            asset_group:    r.assetGroup.name,
+            status:         r.assetGroup.status,
+            primary_status: r.assetGroup.primaryStatus || null,
+            spend:          Math.round(spend * 100) / 100,
+            impressions:    parseInt(r.metrics?.impressions || 0),
+            clicks:         parseInt(r.metrics?.clicks || 0),
+            conversions:    convs,
+            conv_value:     Math.round(convVal * 100) / 100,
+            cpa:            convs > 0 ? "$" + (Math.round((spend / convs) * 100) / 100) : null,
+            roas:           spend > 0 && convVal > 0 ? Math.round((convVal / spend) * 100) / 100 : null,
+        };
+    });
+}
+
+async function fetchPmaxAssetPerformance(token, customerId, mccId) {
+    const rows = await googleSearch(token, customerId, mccId, `
+        SELECT campaign.name, asset_group.name,
+               asset_group_asset.field_type, asset_group_asset.performance_label,
+               asset.type, asset.text_asset.text, asset.name
+        FROM asset_group_asset
+        WHERE asset_group_asset.status = 'ENABLED'
+          AND campaign.status = 'ENABLED'`);
+    return rows.map(r => ({
+        campaign:    r.campaign.name,
+        asset_group: r.assetGroup.name,
+        field_type:  r.assetGroupAsset.fieldType,
+        performance: r.assetGroupAsset.performanceLabel || null,
+        asset:       r.asset?.textAsset?.text || r.asset?.name || r.asset?.type || null,
+    }));
+}
+
+// ── Performance breakdowns (geo / device / hour / day_of_week / date) ────────
+const BREAKDOWN_SEGMENTS = {
+    device:      "segments.device",
+    hour:        "segments.hour",
+    day_of_week: "segments.day_of_week",
+    date:        "segments.date",
+};
+
+async function fetchPerformanceBreakdown(token, customerId, mccId, segment, dateClause, campaignSearch) {
+    const isGeo    = segment === "geo" || segment === "geo_city";
+    const segField = segment === "geo"      ? "segments.geo_target_state"
+                   : segment === "geo_city" ? "segments.geo_target_city"
+                   : BREAKDOWN_SEGMENTS[segment];
+    // LOCATION_OF_PRESENCE = where the user physically was; mixing in
+    // AREA_OF_INTEREST rows would double-count spend.
+    const rows = await googleSearch(token, customerId, mccId, `
+        SELECT ${segField}, campaign.name,
+               metrics.cost_micros, metrics.impressions, metrics.clicks,
+               metrics.conversions, metrics.conversions_value
+        FROM ${isGeo ? "geographic_view" : "campaign"}
+        WHERE segments.date ${dateClause}
+          AND metrics.impressions > 0
+          ${isGeo ? "AND geographic_view.location_type = 'LOCATION_OF_PRESENCE'" : ""}`);
+
+    const byKey = {};
+    for (const r of rows) {
+        if (campaignSearch && !r.campaign.name.toLowerCase().includes(campaignSearch.toLowerCase())) continue;
+        let key;
+        if (isGeo)                          key = r.segments?.geoTargetState || r.segments?.geoTargetCity || "unknown";
+        else if (segment === "device")      key = r.segments?.device;
+        else if (segment === "hour")        key = String(r.segments?.hour);
+        else if (segment === "day_of_week") key = r.segments?.dayOfWeek;
+        else                                key = r.segments?.date;
+        if (!byKey[key]) byKey[key] = { spend: 0, impressions: 0, clicks: 0, conversions: 0, conv_value: 0 };
+        const b = byKey[key];
+        b.spend       += parseInt(r.metrics?.costMicros || 0) / 1_000_000;
+        b.impressions += parseInt(r.metrics?.impressions || 0);
+        b.clicks      += parseInt(r.metrics?.clicks || 0);
+        b.conversions += parseFloat(r.metrics?.conversions || 0);
+        b.conv_value  += parseFloat(r.metrics?.conversionsValue || 0);
+    }
+
+    // Resolve geoTargetConstants/NNN resource names to readable state names
+    const names = {};
+    if (isGeo) {
+        const ids = Object.keys(byKey).filter(k => k.startsWith("geoTargetConstants/"));
+        if (ids.length) {
+            try {
+                const geoRows = await googleSearch(token, customerId, mccId, `
+                    SELECT geo_target_constant.resource_name, geo_target_constant.name
+                    FROM geo_target_constant
+                    WHERE geo_target_constant.resource_name IN (${ids.map(i => `'${i}'`).join(", ")})`);
+                for (const g of geoRows) names[g.geoTargetConstant.resourceName] = g.geoTargetConstant.name;
+            } catch (_) { /* fall back to raw resource names */ }
+        }
+    }
+
+    const out = Object.entries(byKey).map(([key, b]) => ({
+        [segment]:   isGeo ? (names[key] || key) : key,
+        spend:       Math.round(b.spend * 100) / 100,
+        impressions: b.impressions,
+        clicks:      b.clicks,
+        ctr:         b.impressions > 0 ? (b.clicks / b.impressions * 100).toFixed(2) + "%" : "0%",
+        avg_cpc:     b.clicks > 0 ? "$" + (b.spend / b.clicks).toFixed(2) : null,
+        conversions: Math.round(b.conversions * 10) / 10,
+        conv_value:  Math.round(b.conv_value * 100) / 100,
+        cpa:         b.conversions > 0 ? "$" + (Math.round((b.spend / b.conversions) * 100) / 100) : null,
+    }));
+
+    // Sensible ordering: hours/dates/weekdays in natural order, otherwise by spend
+    if (segment === "hour")             out.sort((a, b) => parseInt(a.hour) - parseInt(b.hour));
+    else if (segment === "date")        out.sort((a, b) => a.date.localeCompare(b.date));
+    else if (segment === "day_of_week") {
+        const order = ["MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY", "SUNDAY"];
+        out.sort((a, b) => order.indexOf(a.day_of_week) - order.indexOf(b.day_of_week));
+    }
+    else out.sort((a, b) => b.spend - a.spend);
+    return out;
+}
+
+// ── Ad-group negatives + shared negative keyword lists ───────────────────────
+async function mutateAdGroupNegatives(token, customerId, mccId, adGroupResourceName, keywords, matchType) {
+    return googleMutateOps(token, customerId, mccId, keywords.map(kw => ({
+        adGroupCriterionOperation: {
+            create: {
+                adGroup:  adGroupResourceName,
+                negative: true,
+                keyword:  { text: kw.replace(/^["']|["']$/g, ""), matchType },
+            },
+        },
+    })));
+}
+
+async function listSharedNegativeLists(token, customerId, mccId) {
+    const [sets, links] = await Promise.all([
+        googleSearch(token, customerId, mccId, `
+            SELECT shared_set.resource_name, shared_set.id, shared_set.name,
+                   shared_set.member_count, shared_set.status
+            FROM shared_set
+            WHERE shared_set.type = 'NEGATIVE_KEYWORDS' AND shared_set.status != 'REMOVED'`),
+        googleSearch(token, customerId, mccId, `
+            SELECT campaign.name, campaign_shared_set.shared_set
+            FROM campaign_shared_set
+            WHERE campaign_shared_set.status != 'REMOVED'`).catch(() => []),
+    ]);
+    const attached = {};
+    for (const l of links) {
+        const key = l.campaignSharedSet.sharedSet;
+        (attached[key] = attached[key] || []).push(l.campaign.name);
+    }
+    return sets.map(r => ({
+        resource_name:      r.sharedSet.resourceName,
+        id:                 r.sharedSet.id,
+        name:               r.sharedSet.name,
+        keyword_count:      parseInt(r.sharedSet.memberCount || 0),
+        status:             r.sharedSet.status,
+        attached_campaigns: attached[r.sharedSet.resourceName] || [],
+    }));
+}
+
+async function viewSharedNegativeList(token, customerId, mccId, sharedSetResource) {
+    const rows = await googleSearch(token, customerId, mccId, `
+        SELECT shared_criterion.keyword.text, shared_criterion.keyword.match_type
+        FROM shared_criterion
+        WHERE shared_criterion.shared_set = '${sharedSetResource}'
+          AND shared_criterion.type = 'KEYWORD'`);
+    return rows.map(r => ({ text: r.sharedCriterion.keyword.text, match_type: r.sharedCriterion.keyword.matchType }));
 }
 
 // ── MCP Server ────────────────────────────────────────────────────────────────
@@ -2382,7 +2685,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         },
         {
             name: "get_account_detail",
-            description: "Get MTD spend detail across Google and Meta for a specific client by name.",
+            description: "Get MTD spend detail across Google, Meta, and StackAdapt for a specific client by name.",
             inputSchema: {
                 type: "object",
                 properties: {
@@ -2393,7 +2696,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         },
         {
             name: "get_search_terms",
-            description: "Analyze Google Ads search term performance for an account — wasted spend, converting terms, campaign breakdown. Use to find negative keyword opportunities.",
+            description: "Analyze Google Ads search term performance for an account — wasted spend, converting terms, campaign breakdown. Use to find negative keyword opportunities. " +
+                "Set summary_only=true (or a low limit) to keep the response small when you just need wasted/converting terms.",
             inputSchema: {
                 type: "object",
                 properties: {
@@ -2403,8 +2707,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
                         description: "THIS_MONTH (default), LAST_7_DAYS, LAST_30_DAYS, LAST_90_DAYS, LAST_MONTH, YEAR_TO_DATE, or CUSTOM (requires start_date + end_date)",
                         enum: ["THIS_MONTH", "LAST_7_DAYS", "LAST_30_DAYS", "LAST_90_DAYS", "LAST_MONTH", "YEAR_TO_DATE", "CUSTOM"],
                     },
-                    start_date: { type: "string", description: "Start date YYYY-MM-DD (only with CUSTOM)" },
-                    end_date:   { type: "string", description: "End date YYYY-MM-DD (only with CUSTOM)" },
+                    start_date:   { type: "string", description: "Start date YYYY-MM-DD (only with CUSTOM)" },
+                    end_date:     { type: "string", description: "End date YYYY-MM-DD (only with CUSTOM)" },
+                    limit:        { type: "number", description: "Max terms in all_terms, by spend (default: 100)" },
+                    summary_only: { type: "boolean", description: "Omit all_terms entirely — return only wasted, converting, and campaign totals (default: false)" },
                 },
                 required: ["account_name"],
             },
@@ -2454,15 +2760,15 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         },
         {
             name: "get_campaign_performance",
-            description: "Pull full campaign-level performance metrics — spend, clicks, impressions, CTR, CPC, conversions, CPA, ROAS — for Google Ads and/or Meta accounts. Supports YTD and custom date ranges.",
+            description: "Pull full campaign-level performance metrics — spend, clicks, impressions, CTR, CPC, conversions, CPA, ROAS — for Google Ads, Meta, and/or StackAdapt accounts. Supports YTD and custom date ranges.",
             inputSchema: {
                 type: "object",
                 properties: {
                     account_name: { type: "string", description: "Client name (partial match ok)" },
                     platform: {
                         type: "string",
-                        description: "google (default), meta, or both",
-                        enum: ["google", "meta", "both"],
+                        description: "google (default), meta, stackadapt, or both (both = google + meta + stackadapt where tracked)",
+                        enum: ["google", "meta", "stackadapt", "both"],
                     },
                     date_range: {
                         type: "string",
@@ -2638,22 +2944,6 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             },
         },
         {
-            name: "get_keyword_ideas",
-            description: "Generate keyword ideas with search volume, competition level, and CPC range estimates from Google Ads Keyword Planner. Use for research before building new campaigns or expanding existing ones.",
-            inputSchema: {
-                type: "object",
-                properties: {
-                    account_name: { type: "string", description: "Client account to run the query under (partial match ok)" },
-                    keywords: {
-                        type: "array",
-                        items: { type: "string" },
-                        description: "Seed keywords to generate ideas from (1-10 keywords)",
-                    },
-                },
-                required: ["account_name", "keywords"],
-            },
-        },
-        {
             name: "pause_campaign",
             description: "Pause a Google Ads or Meta campaign. Dry run by default — set confirm=true to apply. Use list_campaigns first to confirm the exact campaign name.",
             inputSchema: {
@@ -2720,11 +3010,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         },
         {
             name: "check_anomalies",
-            description: "Scan all accounts for spend anomalies — yesterday's spend vs trailing 7-day average (spikes ≥ +75%, drops ≤ -60%) on Google and Meta, plus enabled Google campaigns that served zero impressions yesterday.",
+            description: "Scan all accounts for spend anomalies — yesterday's spend vs trailing 7-day average (spikes ≥ +75%, drops ≤ -60%) on Google, Meta, and StackAdapt, plus enabled Google campaigns that served zero impressions yesterday.",
             inputSchema: {
                 type: "object",
                 properties: {
-                    platform: { type: "string", enum: ["google", "meta", "both"], description: "Platform to scan (default: both)" },
+                    platform: { type: "string", enum: ["google", "meta", "stackadapt", "both"], description: "Platform to scan (default: both)" },
                 },
                 required: [],
             },
@@ -3036,7 +3326,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         },
         {
             name: "add_negative_keywords",
-            description: "Add campaign-level negative keywords to a Google Ads account. " +
+            description: "Add negative keywords to a Google Ads campaign (default) or a specific ad group (level=ad_group). " +
+                "For negatives shared across campaigns, use manage_negative_lists instead. " +
                 "By default runs as a DRY RUN (preview only). Set confirm=true to actually write to the account. " +
                 "If campaign_name is omitted, returns a list of available campaigns to choose from.",
             inputSchema: {
@@ -3044,6 +3335,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
                 properties: {
                     account_name: { type: "string", description: "Client name (partial match ok)" },
                     campaign_name: { type: "string", description: "Campaign name (partial match ok). Omit to list campaigns." },
+                    level: { type: "string", enum: ["campaign", "ad_group"], description: "Where to add the negatives (default: campaign)" },
+                    ad_group_name: { type: "string", description: "Ad group name (partial match ok). Required when level=ad_group." },
                     keywords: {
                         type: "array",
                         items: { type: "string" },
@@ -3127,18 +3420,85 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             },
         },
         {
-            name: "set_google_budget",
-            description: "Set the daily budget for a Google Ads campaign. Unlike update_budget, this works even for campaigns with no spend this month. " +
-                "Dry run by default — set confirm=true to apply.",
+            name: "get_pmax_asset_groups",
+            description: "Performance Max asset group report — spend, clicks, conversions, CPA, ROAS per asset group, plus status/primary_status to spot limited or disapproved groups. " +
+                "Set include_assets=true to also pull asset-level performance labels (BEST/GOOD/LOW/LEARNING) for enabled assets. " +
+                "Use with get_pmax_search_terms for a full picture of what PMax is doing.",
             inputSchema: {
                 type: "object",
                 properties: {
-                    account_name:  { type: "string", description: "Client name (partial match ok)" },
-                    campaign_name: { type: "string", description: "Campaign name (partial match ok)" },
-                    daily_budget:  { type: "number", description: "New daily budget in dollars" },
-                    confirm:       { type: "boolean", description: "Set true to apply. Omit for dry run." },
+                    account_name: { type: "string", description: "Client name (partial match ok)" },
+                    date_range: {
+                        type: "string",
+                        description: "THIS_MONTH (default), LAST_7_DAYS, LAST_30_DAYS, LAST_90_DAYS, LAST_MONTH, YEAR_TO_DATE, or CUSTOM (requires start_date + end_date)",
+                        enum: ["THIS_MONTH", "LAST_7_DAYS", "LAST_30_DAYS", "LAST_90_DAYS", "LAST_MONTH", "YEAR_TO_DATE", "CUSTOM"],
+                    },
+                    start_date:     { type: "string", description: "Start date YYYY-MM-DD (only with CUSTOM)" },
+                    end_date:       { type: "string", description: "End date YYYY-MM-DD (only with CUSTOM)" },
+                    include_assets: { type: "boolean", description: "Also return asset-level performance labels (default false)" },
                 },
-                required: ["account_name", "campaign_name", "daily_budget"],
+                required: ["account_name"],
+            },
+        },
+        {
+            name: "get_performance_breakdown",
+            description: "Break down Google Ads performance by geo (state), device, hour of day, day of week, or date. " +
+                "Returns spend, clicks, impressions, CTR, CPC, conversions, CPA per segment. " +
+                "Use for questions like 'where are the leads coming from', 'which device converts best', or 'what hours should we dayparts'.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    account_name: { type: "string", description: "Client name (partial match ok)" },
+                    segment: {
+                        type: "string",
+                        description: "geo (state-level) | geo_city (city-level) | device | hour | day_of_week | date. Geo segments use the user's physical location; note PMax campaigns don't report geo data.",
+                        enum: ["geo", "geo_city", "device", "hour", "day_of_week", "date"],
+                    },
+                    date_range: {
+                        type: "string",
+                        description: "THIS_MONTH (default), LAST_7_DAYS, LAST_30_DAYS, LAST_90_DAYS, LAST_MONTH, YEAR_TO_DATE, or CUSTOM (requires start_date + end_date)",
+                        enum: ["THIS_MONTH", "LAST_7_DAYS", "LAST_30_DAYS", "LAST_90_DAYS", "LAST_MONTH", "YEAR_TO_DATE", "CUSTOM"],
+                    },
+                    start_date:    { type: "string", description: "Start date YYYY-MM-DD (only with CUSTOM)" },
+                    end_date:      { type: "string", description: "End date YYYY-MM-DD (only with CUSTOM)" },
+                    campaign_name: { type: "string", description: "Filter to campaigns whose name contains this (optional)" },
+                },
+                required: ["account_name", "segment"],
+            },
+        },
+        {
+            name: "manage_negative_lists",
+            description: "Manage shared negative keyword lists in a Google Ads account. " +
+                "Actions: list (all lists + attached campaigns), view (keywords in a list), create (new empty list), " +
+                "add_keywords (add negatives to a list), attach (link a list to campaigns). " +
+                "Write actions are dry run by default — set confirm=true to apply.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    account_name: { type: "string", description: "Client name (partial match ok)" },
+                    action:       { type: "string", enum: ["list", "view", "create", "add_keywords", "attach"], description: "What to do (default: list)" },
+                    list_name:    { type: "string", description: "Shared list name (partial match ok for view/add_keywords/attach; exact name for create)" },
+                    keywords:     { type: "array", items: { type: "string" }, description: "Keywords to add (for add_keywords)" },
+                    match_type:   { type: "string", enum: ["EXACT", "PHRASE", "BROAD"], description: "Match type for added keywords (default: PHRASE)" },
+                    campaign_names: { type: "array", items: { type: "string" }, description: "Campaign names to attach the list to (partial match ok, for attach)" },
+                    confirm:      { type: "boolean", description: "Set true to apply create/add_keywords/attach. Omit for dry run." },
+                },
+                required: ["account_name"],
+            },
+        },
+        {
+            name: "get_write_log",
+            description: "Read the audit log of confirmed changes made through this MCP (budget updates, pauses, keyword adds, etc.) across all platforms. " +
+                "Every tool call with confirm=true is recorded. Filter by account, tool, or lookback window.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    days:         { type: "number", description: "Lookback window in days (default: 30)" },
+                    account_name: { type: "string", description: "Filter to changes for one client (partial match ok)" },
+                    tool:         { type: "string", description: "Filter to one tool name (e.g. update_budget)" },
+                    limit:        { type: "number", description: "Max entries to return (default: 50, newest first)" },
+                },
+                required: [],
             },
         },
         {
@@ -3215,6 +3575,28 @@ async function handleToolCall(name, args = {}) {
             }
         }
 
+        // StackAdapt
+        for (const [advId, info] of Object.entries(STACKADAPT_ADVERTISERS)) {
+            if (!info.name.toLowerCase().includes(search)) continue;
+            const { budget } = getEffectiveBudget(info, today);
+            try {
+                if (info.flight_start && info.flight_end) {
+                    const until = yesterday < info.flight_end ? yesterday : info.flight_end;
+                    const { spend } = emptyWindow(info.flight_start, until) ? { spend: 0 }
+                        : await fetchStackAdaptSpend(advId, info.flight_start, until);
+                    results.push({ platform: "StackAdapt", account: info.name,
+                        flight_spend: Math.round(spend * 100) / 100,
+                        ...getFlightPacing(spend, budget, info.flight_start, info.flight_end, yesterday) });
+                } else {
+                    const { spend } = emptyWindow(month_start, yesterday) ? { spend: 0 }
+                        : await fetchStackAdaptSpend(advId, month_start, yesterday);
+                    results.push({ platform: "StackAdapt", account: info.name,
+                        mtd_spend: Math.round(spend * 100) / 100, budget,
+                        ...getPacingLabel(spend, budget, pace_dom, dim) });
+                }
+            } catch (e) { results.push({ platform: "StackAdapt", account: info.name, error: e.message }); }
+        }
+
         result = results.length
             ? { date: today, spend_through: yesterday, day: dom, days_in_month: dim, results }
             : { error: `No account found matching '${args.account_name}'` };
@@ -3233,7 +3615,18 @@ async function handleToolCall(name, args = {}) {
             if (error) { result = { error: `Auth failed: ${error}` }; }
             else {
                 try {
-                    result = { account: info.name, date_range: dateRange, ...(await fetchSearchTerms(token, cid, info.mcc, dateRange, startDate, endDate)) };
+                    const st = await fetchSearchTerms(token, cid, info.mcc, dateRange, startDate, endDate);
+                    if (args.summary_only) {
+                        delete st.all_terms;
+                        st.note = "summary_only — all_terms omitted; total_terms reflects the full count.";
+                    } else {
+                        const limit = args.limit || 100;
+                        if (st.all_terms.length > limit) {
+                            st.all_terms = st.all_terms.slice(0, limit);
+                            st.note = `all_terms truncated to top ${limit} by spend (of ${st.total_terms}); pass a higher limit for more.`;
+                        }
+                    }
+                    result = { account: info.name, date_range: dateRange, ...st };
                 } catch (e) {
                     result = { error: e.message };
                 }
@@ -3453,24 +3846,6 @@ async function handleToolCall(name, args = {}) {
             }
         }
 
-    } else if (name === "get_keyword_ideas") {
-        const search  = (args.account_name || "").toLowerCase();
-        const keywords = args.keywords || [];
-        const match = Object.entries(GOOGLE_ACCOUNTS).find(([, i]) => i.name.toLowerCase().includes(search));
-        if (!match) {
-            result = { error: `No Google account found matching '${args.account_name}'` };
-        } else {
-            const [cid, info] = match;
-            const { token, error: authErr } = await getGoogleAccessToken();
-            if (authErr) { result = { error: `Auth: ${authErr}` }; }
-            else {
-                try {
-                    const ideas = await fetchKeywordIdeas(token, cid, info.mcc, keywords);
-                    result = { account: info.name, seed_keywords: keywords, total: ideas.length, ideas };
-                } catch (e) { result = { error: e.message }; }
-            }
-        }
-
     } else if (name === "pause_campaign" || name === "enable_campaign") {
         const search    = (args.account_name || "").toLowerCase();
         const campSearch = (args.campaign_name || "").toLowerCase();
@@ -3645,6 +4020,19 @@ async function handleToolCall(name, args = {}) {
                     const metaDateOpts = resolveMetaDateOpts(dateRange, startDate, endDate, metaPresetMap);
                     result.meta = { account: info.name, campaigns: await fetchMetaCampaignPerf(accountId, metaDateOpts.preset, metaDateOpts.timeRange) };
                 } catch (e) { result.meta_error = e.message; }
+            }
+        }
+
+        if (platform === "stackadapt" || platform === "both") {
+            const match = Object.entries(STACKADAPT_ADVERTISERS).find(([, i]) => i.name.toLowerCase().includes(search));
+            if (!match) {
+                if (platform === "stackadapt") result.stackadapt_error = `No StackAdapt advertiser matching '${args.account_name}'`;
+            } else {
+                const [advId, info] = match;
+                try {
+                    const { from, to } = rangeToDates(dateRange, startDate, endDate);
+                    result.stackadapt = { account: info.name, campaigns: await fetchStackAdaptCampaignPerf(advId, from, to) };
+                } catch (e) { result.stackadapt_error = e.message; }
             }
         }
 
@@ -3946,25 +4334,46 @@ async function handleToolCall(name, args = {}) {
                             result = { error: "No keywords provided." };
                         } else {
                             const cleanKws = keywords.map(k => k.replace(/^["']|["']$/g, "").trim()).filter(Boolean);
+                            const level    = args.level || "campaign";
 
-                            if (!confirm) {
+                            // level=ad_group targets one ad group inside the campaign
+                            let adGroup = null;
+                            if (level === "ad_group") {
+                                const agSearch = (args.ad_group_name || "").toLowerCase();
+                                if (!agSearch) throw new Error("ad_group_name is required when level=ad_group.");
+                                const adGroups = await listAdGroupsFull(token, cid, info.mcc, campMatch.name);
+                                adGroup = adGroups.find(g => g.name.toLowerCase().includes(agSearch));
+                                if (!adGroup) {
+                                    result = { error: `No ad group matching '${args.ad_group_name}' in ${campMatch.name}`, available: adGroups.map(g => g.name) };
+                                }
+                            }
+
+                            if (result) {
+                                // ad group lookup already failed above
+                            } else if (!confirm) {
                                 // Dry run
                                 result = {
                                     dry_run: true,
                                     message: "DRY RUN — no changes made. Set confirm=true to apply.",
                                     account: info.name,
                                     campaign: campMatch.name,
+                                    ...(adGroup ? { ad_group: adGroup.name } : {}),
+                                    level,
                                     match_type: matchType,
                                     keywords_to_add: cleanKws,
                                     count: cleanKws.length,
                                 };
                             } else {
                                 // Live write
-                                const responses = await mutateNegativeKeywords(token, cid, info.mcc, campMatch.resourceName, cleanKws, matchType);
+                                const responses = adGroup
+                                    ? await mutateAdGroupNegatives(token, cid, info.mcc, adGroup.ad_group_resource, cleanKws, matchType)
+                                    : await mutateNegativeKeywords(token, cid, info.mcc, campMatch.resourceName, cleanKws, matchType);
                                 result = {
                                     success: true,
                                     account: info.name,
                                     campaign: campMatch.name,
+                                    ...(adGroup ? { ad_group: adGroup.name } : {}),
+                                    level,
                                     match_type: matchType,
                                     keywords_added: cleanKws,
                                     count: cleanKws.length,
@@ -4074,6 +4483,17 @@ async function handleToolCall(name, args = {}) {
             }
         }
 
+        if (platform === "stackadapt" || platform === "both") {
+            for (const [advId, info] of Object.entries(STACKADAPT_ADVERTISERS)) {
+                if (info.flight_end && info.flight_end < yesterday) continue; // flight over — spend stopping is expected
+                try {
+                    const byDate  = await fetchStackAdaptDailySpend(advId, start8, yesterday);
+                    const anomaly = detectSpendAnomaly(byDate, yesterday);
+                    if (anomaly) flags.push({ platform: "StackAdapt", account: info.name, ...anomaly });
+                } catch (e) { errors.push(`${info.name} (StackAdapt): ${e.message}`); }
+            }
+        }
+
         result = {
             date_checked: yesterday,
             anomalies_found: flags.length,
@@ -4118,6 +4538,18 @@ async function handleToolCall(name, args = {}) {
             checks.meta = { status: "✅ OK", authenticated_as: me.name, ...(expiry ? { expiry } : {}) };
         } catch (e) {
             checks.meta = { status: "❌ FAILING", error: e.message };
+        }
+
+        // StackAdapt: cheap authenticated GraphQL round-trip
+        if (STACKADAPT_API_KEY) {
+            try {
+                await stackAdaptGQL("{ __typename }");
+                checks.stackadapt = { status: "✅ OK", note: "API key accepted." };
+            } catch (e) {
+                checks.stackadapt = { status: "❌ FAILING", error: e.message };
+            }
+        } else {
+            checks.stackadapt = { status: "⚠️ NOT CONFIGURED", note: "STACKADAPT_API_KEY env var not set." };
         }
 
         checks.accounts_tracked = {
@@ -4847,48 +5279,6 @@ async function handleToolCall(name, args = {}) {
             }
         }
 
-    } else if (name === "set_google_budget") {
-        const search     = (args.account_name || "").toLowerCase();
-        const campSearch = (args.campaign_name || "").toLowerCase();
-        const daily      = args.daily_budget;
-        const confirm    = !!args.confirm;
-
-        if (!daily || daily <= 0) {
-            result = { error: "daily_budget must be a positive number." };
-        } else {
-            const match = Object.entries(GOOGLE_ACCOUNTS).find(([, i]) => i.name.toLowerCase().includes(search));
-            if (!match) {
-                result = { error: `No Google account matching '${args.account_name}'` };
-            } else {
-                const [cid, info] = match;
-                const { token, error: authErr } = await getGoogleAccessToken();
-                if (authErr) { result = { error: `Auth: ${authErr}` }; }
-                else {
-                    try {
-                        // Use the no-date-filter listing so paused/new campaigns appear
-                        const campaigns = await listGoogleCampaignsAll(token, cid, info.mcc);
-                        const camp = campaigns.find(c => c.name.toLowerCase().includes(campSearch));
-                        if (!camp) {
-                            result = { error: `No campaign matching '${args.campaign_name}'`, available: campaigns.map(c => c.name) };
-                        } else if (!confirm) {
-                            result = {
-                                dry_run:          true,
-                                message:          "DRY RUN — set confirm=true to apply",
-                                account:          info.name,
-                                campaign:         camp.name,
-                                status:           camp.status,
-                                current_daily_budget: camp.daily_budget,
-                                new_daily_budget: "$" + daily.toFixed(2),
-                            };
-                        } else {
-                            const r = await updateGoogleCampaignBudget(token, cid, info.mcc, camp.resource_name, daily);
-                            result = { success: true, account: info.name, campaign: camp.name, ...r };
-                        }
-                    } catch (e) { result = { error: e.message }; }
-                }
-            }
-        }
-
     } else if (name === "run_health_check") {
         const weekly = !!args.weekly;
         const structural = !!args.structural;
@@ -5382,9 +5772,163 @@ async function handleToolCall(name, args = {}) {
             ...(errors.length ? { errors } : {}),
         };
 
+    } else if (name === "get_write_log") {
+        result = {
+            entries: readWriteLog({
+                days:         args.days || 30,
+                account_name: args.account_name,
+                tool:         args.tool,
+                limit:        args.limit || 50,
+            }),
+            note: "Newest first. Railway's log resets on deploy — the local Mac holds the full history.",
+        };
+
+    } else if (name === "get_pmax_asset_groups") {
+        const search    = (args.account_name || "").toLowerCase();
+        const dateRange = args.date_range || "THIS_MONTH";
+        const match     = Object.entries(GOOGLE_ACCOUNTS).find(([, i]) => i.name.toLowerCase().includes(search));
+        if (!match) {
+            result = { error: `No Google account found matching '${args.account_name}'` };
+        } else {
+            const [cid, info] = match;
+            const { token, error: authErr } = await getGoogleAccessToken();
+            if (authErr) { result = { error: `Auth: ${authErr}` }; }
+            else {
+                try {
+                    const dateClause = resolveGaqlDateClause(dateRange, args.start_date, args.end_date);
+                    const groups = await fetchPmaxAssetGroups(token, cid, info.mcc, dateClause);
+                    result = { account: info.name, date_range: dateRange, total: groups.length, asset_groups: groups };
+                    if (!groups.length) result.note = "No PMax asset groups with data in this range — the account may not run Performance Max.";
+                    if (args.include_assets && groups.length) {
+                        const assets = await fetchPmaxAssetPerformance(token, cid, info.mcc);
+                        result.assets = {
+                            total: assets.length,
+                            low_performing: assets.filter(a => a.performance === "LOW"),
+                            all: assets,
+                        };
+                    }
+                } catch (e) { result = { error: e.message }; }
+            }
+        }
+
+    } else if (name === "get_performance_breakdown") {
+        const search    = (args.account_name || "").toLowerCase();
+        const segment   = args.segment;
+        const dateRange = args.date_range || "THIS_MONTH";
+        const match     = Object.entries(GOOGLE_ACCOUNTS).find(([, i]) => i.name.toLowerCase().includes(search));
+        if (!match) {
+            result = { error: `No Google account found matching '${args.account_name}'` };
+        } else if (segment !== "geo" && segment !== "geo_city" && !BREAKDOWN_SEGMENTS[segment]) {
+            result = { error: `Unknown segment '${segment}'. Valid: geo, geo_city, device, hour, day_of_week, date.` };
+        } else {
+            const [cid, info] = match;
+            const { token, error: authErr } = await getGoogleAccessToken();
+            if (authErr) { result = { error: `Auth: ${authErr}` }; }
+            else {
+                try {
+                    const dateClause = resolveGaqlDateClause(dateRange, args.start_date, args.end_date);
+                    const rows = await fetchPerformanceBreakdown(token, cid, info.mcc, segment, dateClause, args.campaign_name);
+                    result = { account: info.name, segment, date_range: dateRange, rows };
+                    if (!rows.length && (segment === "geo" || segment === "geo_city")) {
+                        result.note = "No geographic rows — PMax and some Display campaigns don't report into geographic_view. Try device/hour/day_of_week instead.";
+                    }
+                } catch (e) { result = { error: e.message }; }
+            }
+        }
+
+    } else if (name === "manage_negative_lists") {
+        const search  = (args.account_name || "").toLowerCase();
+        const action  = args.action || "list";
+        const confirm = !!args.confirm;
+        const match   = Object.entries(GOOGLE_ACCOUNTS).find(([, i]) => i.name.toLowerCase().includes(search));
+        if (!match) {
+            result = { error: `No Google account found matching '${args.account_name}'` };
+        } else {
+            const [cid, info] = match;
+            const { token, error: authErr } = await getGoogleAccessToken();
+            if (authErr) { result = { error: `Auth: ${authErr}` }; }
+            else {
+                try {
+                    if (action === "list") {
+                        const lists = await listSharedNegativeLists(token, cid, info.mcc);
+                        result = { account: info.name, total: lists.length, lists };
+
+                    } else if (action === "create") {
+                        if (!args.list_name) { result = { error: "list_name is required for create." }; }
+                        else if (!confirm) {
+                            result = { dry_run: true, message: "DRY RUN — set confirm=true to create", account: info.name, list_name: args.list_name };
+                        } else {
+                            const res = await googleMutateOps(token, cid, info.mcc, [{
+                                sharedSetOperation: { create: { name: args.list_name, type: "NEGATIVE_KEYWORDS" } },
+                            }]);
+                            result = { success: true, account: info.name, list_name: args.list_name, resource_name: res[0]?.sharedSetResult?.resourceName };
+                        }
+
+                    } else {
+                        // view / add_keywords / attach need an existing list
+                        const lists = await listSharedNegativeLists(token, cid, info.mcc);
+                        const listSearch = (args.list_name || "").toLowerCase();
+                        const list = lists.find(l => l.name.toLowerCase().includes(listSearch));
+                        if (!list) {
+                            result = { error: `No shared negative list matching '${args.list_name}'`, available: lists.map(l => l.name) };
+                        } else if (action === "view") {
+                            const keywords = await viewSharedNegativeList(token, cid, info.mcc, list.resource_name);
+                            result = { account: info.name, list: list.name, attached_campaigns: list.attached_campaigns, total: keywords.length, keywords };
+
+                        } else if (action === "add_keywords") {
+                            const keywords  = args.keywords || [];
+                            const matchType = (args.match_type || "PHRASE").toUpperCase();
+                            if (!keywords.length) { result = { error: "keywords is required for add_keywords." }; }
+                            else if (!confirm) {
+                                result = { dry_run: true, message: "DRY RUN — set confirm=true to apply", account: info.name, list: list.name, match_type: matchType, keywords };
+                            } else {
+                                const res = await googleMutateOps(token, cid, info.mcc, keywords.map(kw => ({
+                                    sharedCriterionOperation: {
+                                        create: {
+                                            sharedSet: list.resource_name,
+                                            keyword:   { text: kw.replace(/^["']|["']$/g, ""), matchType },
+                                        },
+                                    },
+                                })));
+                                result = { success: true, account: info.name, list: list.name, keywords_added: res.length, match_type: matchType };
+                            }
+
+                        } else if (action === "attach") {
+                            const wanted = (args.campaign_names || []).map(c => c.toLowerCase());
+                            if (!wanted.length) { result = { error: "campaign_names is required for attach." }; }
+                            else {
+                                const campaigns = await listGoogleCampaignsAll(token, cid, info.mcc);
+                                const targets = campaigns.filter(c => wanted.some(w => c.name.toLowerCase().includes(w)));
+                                const already = new Set(list.attached_campaigns);
+                                const toAttach = targets.filter(c => !already.has(c.name));
+                                if (!targets.length) {
+                                    result = { error: "No campaigns matched campaign_names.", available: campaigns.map(c => c.name) };
+                                } else if (!confirm) {
+                                    result = { dry_run: true, message: "DRY RUN — set confirm=true to apply", account: info.name, list: list.name,
+                                        attaching: toAttach.map(c => c.name), already_attached: targets.filter(c => already.has(c.name)).map(c => c.name) };
+                                } else if (!toAttach.length) {
+                                    result = { success: true, account: info.name, list: list.name, note: "All matched campaigns were already attached." };
+                                } else {
+                                    const res = await googleMutateOps(token, cid, info.mcc, toAttach.map(c => ({
+                                        campaignSharedSetOperation: { create: { campaign: c.resource_name, sharedSet: list.resource_name } },
+                                    })));
+                                    result = { success: true, account: info.name, list: list.name, campaigns_attached: res.length, campaigns: toAttach.map(c => c.name) };
+                                }
+                            }
+                        } else {
+                            result = { error: `Unknown action '${action}'. Valid: list, view, create, add_keywords, attach.` };
+                        }
+                    }
+                } catch (e) { result = { error: e.message }; }
+            }
+        }
+
     } else {
         result = { error: `Unknown tool: ${name}` };
     }
+
+    // Every mutation gates on confirm=true, so this catches all confirmed writes
+    if (args && args.confirm === true) logWriteAction(name, args, result);
 
     return result;
 }
