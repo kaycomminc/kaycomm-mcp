@@ -31,6 +31,14 @@ const META_API_VERSION  = "v21.0";
 const STACKADAPT_API_KEY = process.env.STACKADAPT_API_KEY;
 const STACKADAPT_URL     = "https://api.stackadapt.com/graphql";
 
+// When bumping GOOGLE_API_VERSION or META_API_VERSION above, update `released`
+// here by hand to the new version's release date — health_check uses these to
+// warn before the provider sunsets the pinned version out from under us.
+const API_VERSION_INFO = {
+    google: { version: GOOGLE_API_VERSION, released: "2025-08-01", warnAfterMonths: 9 },   // Google sunsets ~12mo after release
+    meta:   { version: META_API_VERSION,  released: "2024-10-02", warnAfterMonths: 21 },   // Meta sunsets ~24mo after release
+};
+
 // ── Accounts — loaded from accounts.json ─────────────────────────────────────
 // Google fields: name, budget, mcc (login-customer-id), nc_budget?, ga4?,
 //                budget_schedule? [{from, budget, nc_budget?}], flight_start?, flight_end?,
@@ -4643,6 +4651,20 @@ async function handleToolCall(name, args = {}) {
             meta: Object.keys(META_ACCOUNTS).length,
             stackadapt: Object.keys(STACKADAPT_ADVERTISERS).length,
         };
+
+        // Pinned API version age — providers sunset old versions on a clock,
+        // and today that only surfaces as a surprise 4xx. Warn ahead of time.
+        checks.api_versions = {};
+        for (const [platform, info] of Object.entries(API_VERSION_INFO)) {
+            const ageMonths = (Date.now() - new Date(info.released).getTime()) / (1000 * 60 * 60 * 24 * 30.44);
+            const entry = { version: info.version, released: info.released, age_months: Math.round(ageMonths * 10) / 10 };
+            if (ageMonths >= info.warnAfterMonths) {
+                const label = platform === "google" ? "Google Ads" : "Meta";
+                entry.warning = `⚠️ pinned ${label} API ${info.version} is ${Math.round(ageMonths)} months old — check deprecation schedule and bump ${platform === "google" ? "GOOGLE_API_VERSION" : "META_API_VERSION"}`;
+            }
+            checks.api_versions[platform] = entry;
+        }
+
         result = checks;
 
     } else if (name === "manage_accounts") {
