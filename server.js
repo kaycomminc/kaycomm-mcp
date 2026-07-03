@@ -61,8 +61,58 @@ const BUILTIN_HEALTH_DEFAULTS = {
     budget_exhaustion_is_lost_pct: 20,
 };
 
+// Top-level keys the code actually reads off a google/meta account entry
+// (grepped from info.* accesses across the file, incl. manage_accounts'
+// add/update field lists and getEffectiveBudget's budget_schedule).
+const KNOWN_ACCOUNT_KEYS = new Set([
+    "name", "budget", "mcc", "nc_budget", "ga4", "health",
+    "flight_start", "flight_end", "budget_schedule",
+]);
+
+// Per-account health overrides beyond BUILTIN_HEALTH_DEFAULTS that
+// run_health_check/getHealthConfig actually read (grepped for `hc.<key>`).
+const KNOWN_HEALTH_EXTRA_KEYS = new Set([
+    "conversion_type", "cpa_target", "roas_target", "impression_share_floor", "frequency_cap",
+]);
+
+// Validate accounts.json shape without ever throwing — the server must still
+// boot even if an entry is malformed. Warnings are prefixed "accounts.json:"
+// and the entry id so they're greppable in Railway logs.
+function validateAccounts(data) {
+    const warn = (id, msg) => console.error(`accounts.json: ${id}: ${msg}`);
+
+    for (const platform of ["google", "meta"]) {
+        for (const [id, info] of Object.entries(data[platform] || {})) {
+            if (typeof info.name !== "string" || !info.name) {
+                warn(id, `missing or non-string "name"`);
+            }
+            if (typeof info.budget !== "number") {
+                warn(id, `"budget" is not a number (got ${JSON.stringify(info.budget)})`);
+            }
+            if (platform === "google" && !info.mcc) {
+                warn(id, `google entry missing "mcc"`);
+            }
+            if (info.health !== undefined && info.health !== false && typeof info.health !== "object") {
+                warn(id, `"health" must be false or an object (got ${JSON.stringify(info.health)})`);
+            } else if (info.health && typeof info.health === "object") {
+                for (const key of Object.keys(info.health)) {
+                    if (!(key in BUILTIN_HEALTH_DEFAULTS) && !KNOWN_HEALTH_EXTRA_KEYS.has(key)) {
+                        warn(id, `unknown health key "${key}"`);
+                    }
+                }
+            }
+            for (const key of Object.keys(info)) {
+                if (!KNOWN_ACCOUNT_KEYS.has(key)) {
+                    warn(id, `unknown top-level key "${key}"`);
+                }
+            }
+        }
+    }
+}
+
 function loadAccounts() {
     const data = JSON.parse(fs.readFileSync(ACCOUNTS_FILE, "utf8"));
+    validateAccounts(data);
     GOOGLE_ACCOUNTS        = data.google     || {};
     META_ACCOUNTS          = data.meta       || {};
     STACKADAPT_ADVERTISERS = data.stackadapt || {};
