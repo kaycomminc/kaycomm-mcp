@@ -6072,6 +6072,9 @@ async function main() {
     }
 }
 
-module.exports = { handleToolCall };
+module.exports = {
+    handleToolCall,
+    getPacingLabel, getFlightPacing, buildDailyBudgetRec, getDateInfo, getEffectiveBudget, pctChange,
+};
 
 if (!process.env.MCP_TEST) main().catch(console.error);
