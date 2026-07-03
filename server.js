@@ -4627,7 +4627,7 @@ async function handleToolCall(name, args = {}) {
                     data_access_expires:  dexp ? `${days(dexp)} days (${new Date(dexp * 1000).toISOString().split("T")[0]})` : "unknown",
                 };
                 const soonest = Math.min(...[exp, dexp].filter(t => t > 0).map(t => days(t)));
-                if (isFinite(soonest) && soonest <= 14) expiry.warning = `⚠️ Meta token expires in ${soonest} days — regenerate it soon.`;
+                if (isFinite(soonest) && soonest <= 14) expiry.warning = `⚠️ Meta token expires in ${soonest} days — run \`node refresh-meta-token.js\` in ~/kaycomm-mcp to renew it, then update Railway.`;
             } catch (_) { /* debug_token can fail on some token types; identity check already passed */ }
             checks.meta = { status: "✅ OK", authenticated_as: me.name, ...(expiry ? { expiry } : {}) };
         } catch (e) {
