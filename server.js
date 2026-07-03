@@ -237,13 +237,33 @@ function getDateInfo() {
     };
 }
 
+// Retry helper for read-only fetches: transient 429/5xx and network-level
+// failures get retried with exponential backoff + jitter. Never use this for
+// mutation calls (googleAds:mutate, metaPost, /copies) — a double-fire on a
+// write is worse than a failure, and those callers surface errors directly.
+async function fetchWithRetry(url, opts, tries = 3) {
+    for (let i = 0; ; i++) {
+        try {
+            const resp = await fetchFn(url, opts);
+            if ((resp.status === 429 || resp.status >= 500) && i < tries - 1) {
+                await new Promise(r => setTimeout(r, (2 ** i) * 1000 + Math.random() * 250));
+                continue;
+            }
+            return resp;
+        } catch (e) {           // network-level failure
+            if (i >= tries - 1) throw e;
+            await new Promise(r => setTimeout(r, (2 ** i) * 1000 + Math.random() * 250));
+        }
+    }
+}
+
 // ── Google Auth ───────────────────────────────────────────────────────────────
 let _googleToken = null;
 let _googleTokenExpiry = 0;
 
 async function getGoogleAccessToken() {
     if (_googleToken && Date.now() < _googleTokenExpiry) return { token: _googleToken, error: null };
-    const resp = await fetchFn("https://oauth2.googleapis.com/token", {
+    const resp = await fetchWithRetry("https://oauth2.googleapis.com/token", {
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
         body: new URLSearchParams({
@@ -263,7 +283,7 @@ async function googleSearch(token, customerId, mccId, query) {
     const results = [];
     let pageToken = null;
     do {
-        const resp = await fetchFn(
+        const resp = await fetchWithRetry(
             `https://googleads.googleapis.com/${GOOGLE_API_VERSION}/customers/${customerId}/googleAds:search`,
             {
                 method: "POST",
@@ -350,7 +370,7 @@ async function fetchMetaMTD(accountId, monthStart, yesterday) {
         time_range: JSON.stringify({ since: monthStart, until: yesterday }),
         level: "account",
     });
-    const resp = await fetchFn(`https://graph.facebook.com/${META_API_VERSION}/${accountId}/insights?${params}`);
+    const resp = await fetchWithRetry(`https://graph.facebook.com/${META_API_VERSION}/${accountId}/insights?${params}`);
     const data = await resp.json();
     if (data.error) return { spend: null, error: data.error.message };
     const spend = data.data?.length ? parseFloat(data.data[0].spend || 0) : 0;
@@ -571,7 +591,7 @@ async function metaDuplicate(id, level, newName, status = "PAUSED") {
 }
 async function metaGet(path, extraParams = {}) {
     const params = new URLSearchParams({ access_token: META_ACCESS_TOKEN, ...extraParams });
-    const resp = await fetchFn(`https://graph.facebook.com/${META_API_VERSION}/${path}?${params}`);
+    const resp = await fetchWithRetry(`https://graph.facebook.com/${META_API_VERSION}/${path}?${params}`);
     const data = await resp.json();
     if (data.error) throw new Error(data.error.message);
     return data;
@@ -606,7 +626,7 @@ async function metaGetAll(path, extraParams = {}) {
     rows.push(...(data.data || []));
     let next = data.paging?.next;
     while (next) {
-        const resp = await fetchFn(next); // paging.next carries the access token
+        const resp = await fetchWithRetry(next); // paging.next carries the access token
         data = await resp.json();
         if (data.error) throw new Error(data.error.message);
         rows.push(...(data.data || []));
@@ -692,7 +712,7 @@ async function fetchGA4Report(token, propertyId, dateRange, breakdownBy = "chann
         limit: 50,
     };
 
-    const resp = await fetchFn(
+    const resp = await fetchWithRetry(
         `https://analyticsdata.googleapis.com/v1beta/properties/${propertyId}:runReport`,
         {
             method: "POST",
@@ -802,7 +822,7 @@ async function fetchMetaCampaignPerf(accountId, datePreset, timeRange) {
     } else {
         params.set("date_preset", datePreset);
     }
-    const resp = await fetchFn(`https://graph.facebook.com/${META_API_VERSION}/${accountId}/insights?${params}`);
+    const resp = await fetchWithRetry(`https://graph.facebook.com/${META_API_VERSION}/${accountId}/insights?${params}`);
     const data = await resp.json();
     if (data.error) throw new Error(data.error.message);
 
@@ -884,7 +904,7 @@ async function fetchMetaMonthlyTrend(accountId, year) {
         level: "account",
         limit: 100,
     });
-    const resp = await fetchFn(`https://graph.facebook.com/${META_API_VERSION}/${accountId}/insights?${params}`);
+    const resp = await fetchWithRetry(`https://graph.facebook.com/${META_API_VERSION}/${accountId}/insights?${params}`);
     const data = await resp.json();
     if (data.error) throw new Error(data.error.message);
 
@@ -1103,7 +1123,7 @@ async function fetchMetaMetricsForRange(accountId, startDate, endDate) {
         time_range: JSON.stringify({ since: startDate, until: endDate }),
         level: "account",
     });
-    const resp = await fetchFn(`https://graph.facebook.com/${META_API_VERSION}/${accountId}/insights?${params}`);
+    const resp = await fetchWithRetry(`https://graph.facebook.com/${META_API_VERSION}/${accountId}/insights?${params}`);
     const data = await resp.json();
     if (data.error) throw new Error(data.error.message);
 
