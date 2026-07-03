@@ -11,6 +11,7 @@ const path    = require("path");
 const { Server } = require("@modelcontextprotocol/sdk/server/index.js");
 const { StdioServerTransport } = require("@modelcontextprotocol/sdk/server/stdio.js");
 const { SSEServerTransport }   = require("@modelcontextprotocol/sdk/server/sse.js");
+const { StreamableHTTPServerTransport } = require("@modelcontextprotocol/sdk/server/streamableHttp.js");
 const { CallToolRequestSchema, ListToolsRequestSchema } = require("@modelcontextprotocol/sdk/types.js");
 
 let fetchFn = globalThis.fetch;
@@ -2658,12 +2659,16 @@ async function viewSharedNegativeList(token, customerId, mccId, sharedSetResourc
 }
 
 // ── MCP Server ────────────────────────────────────────────────────────────────
-const server = new Server(
-    { name: "kaycomm-pacing", version: "2.0.0" },
-    { capabilities: { tools: {} } }
-);
+// makeServer() builds a fresh Server instance with both handlers registered.
+// stdio mode and SSE mode share one module-level instance; the stateless
+// Streamable HTTP transport (see main()) gets a fresh instance per request.
+function makeServer() {
+    const srv = new Server(
+        { name: "kaycomm-pacing", version: "2.0.0" },
+        { capabilities: { tools: {} } }
+    );
 
-server.setRequestHandler(ListToolsRequestSchema, async () => ({
+    srv.setRequestHandler(ListToolsRequestSchema, async () => ({
     tools: [
         {
             name: "get_google_pacing",
@@ -3520,7 +3525,18 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             },
         },
     ],
-}));
+    }));
+
+    srv.setRequestHandler(CallToolRequestSchema, async (request) => {
+        const { name, arguments: args } = request.params;
+        const result = await handleToolCall(name, args || {});
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    });
+
+    return srv;
+}
+
+const server = makeServer();
 
 async function handleToolCall(name, args = {}) {
     const { today, yesterday, month_start, dom, pace_dom, dim } = getDateInfo();
@@ -5933,12 +5949,6 @@ async function handleToolCall(name, args = {}) {
     return result;
 }
 
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-    const { name, arguments: args } = request.params;
-    const result = await handleToolCall(name, args || {});
-    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
-});
-
 async function main() {
     const PORT = process.env.PORT;
 
@@ -5994,6 +6004,37 @@ async function main() {
                 }
                 await transport.handlePostMessage(req, res, body);
 
+            } else if (url.pathname === "/mcp") {
+                // Streamable HTTP transport (stateless) — this is what claude.ai
+                // custom connectors speak, so it's how Claude mobile reaches this
+                // server. Each request gets its own transport + Server instance;
+                // there is no session to resume or delete, hence 405 on GET/DELETE.
+                if (!isAuthorized(req, url)) {
+                    res.writeHead(401, { "Content-Type": "text/plain" });
+                    res.end(AUTH_TOKEN ? "Unauthorized" : "Server auth not configured (MCP_AUTH_TOKEN missing)");
+                    return;
+                }
+                if (req.method !== "POST") {
+                    res.writeHead(405, { "Content-Type": "text/plain" });
+                    res.end("Method not allowed — stateless /mcp only supports POST.");
+                    return;
+                }
+                const chunks = [];
+                for await (const chunk of req) chunks.push(chunk);
+                let body;
+                try {
+                    body = JSON.parse(Buffer.concat(chunks).toString());
+                } catch {
+                    res.writeHead(400, { "Content-Type": "text/plain" });
+                    res.end("Invalid JSON body");
+                    return;
+                }
+                const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+                res.on("close", () => transport.close());
+                const mcpServer = makeServer();
+                await mcpServer.connect(transport);
+                await transport.handleRequest(req, res, body);
+
             } else {
                 res.writeHead(200, { "Content-Type": "text/plain" });
                 res.end("KayComm MCP Server v2 — running" + (AUTH_TOKEN ? "" : " (auth not configured)"));
@@ -6001,7 +6042,7 @@ async function main() {
         });
 
         httpServer.listen(parseInt(PORT), () => {
-            console.error(`KayComm MCP running on port ${PORT} (SSE mode, auth ${AUTH_TOKEN ? "enabled" : "NOT CONFIGURED"})`);
+            console.error(`KayComm MCP running on port ${PORT} (SSE mode: /sse + /messages; Streamable HTTP: /mcp; auth ${AUTH_TOKEN ? "enabled" : "NOT CONFIGURED"})`);
         });
 
     } else {
