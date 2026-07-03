@@ -4633,6 +4633,7 @@ async function handleToolCall(name, args = {}) {
                         store[id] = entry;
                         saveAccounts();
                         result = { success: true, platform, id, entry, note: "Saved to accounts.json. Commit + push to git so Railway picks it up." };
+                        if (process.env.PORT) result.ephemeral_warning = "⚠️ This server runs on Railway with an ephemeral filesystem — this change will be LOST on the next deploy. Make account changes from the Mac (local server) and commit accounts.json to git.";
                     }
                 }
             } else if (action === "update") {
@@ -4651,6 +4652,7 @@ async function handleToolCall(name, args = {}) {
                         Object.assign(store[id], changes);
                         saveAccounts();
                         result = { success: true, platform, id, account: store[id], note: "Saved to accounts.json. Commit + push to git so Railway picks it up." };
+                        if (process.env.PORT) result.ephemeral_warning = "⚠️ This server runs on Railway with an ephemeral filesystem — this change will be LOST on the next deploy. Make account changes from the Mac (local server) and commit accounts.json to git.";
                     }
                 }
             } else if (action === "remove") {
@@ -4663,6 +4665,7 @@ async function handleToolCall(name, args = {}) {
                     delete store[id];
                     saveAccounts();
                     result = { success: true, removed: { id, ...removed }, note: "Saved to accounts.json. Commit + push to git so Railway picks it up." };
+                    if (process.env.PORT) result.ephemeral_warning = "⚠️ This server runs on Railway with an ephemeral filesystem — this change will be LOST on the next deploy. Make account changes from the Mac (local server) and commit accounts.json to git.";
                 }
             }
         }
