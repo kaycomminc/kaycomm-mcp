@@ -6099,12 +6099,15 @@ async function main() {
                 }
                 await transport.handlePostMessage(req, res, body);
 
-            } else if (url.pathname === "/mcp") {
+            } else if (url.pathname === "/mcp" || url.pathname.startsWith("/mcp/")) {
                 // Streamable HTTP transport (stateless) — this is what claude.ai
                 // custom connectors speak, so it's how Claude mobile reaches this
                 // server. Each request gets its own transport + Server instance;
                 // there is no session to resume or delete, hence 405 on GET/DELETE.
-                if (!isAuthorized(req, url)) {
+                // The connector UI can't set headers, so the token may ride the
+                // query (?token=) or the path (/mcp/<token>).
+                const pathToken = url.pathname.startsWith("/mcp/") ? decodeURIComponent(url.pathname.slice(5)) : null;
+                if (!isAuthorized(req, url) && !(AUTH_TOKEN && pathToken === AUTH_TOKEN)) {
                     res.writeHead(401, { "Content-Type": "text/plain" });
                     res.end(AUTH_TOKEN ? "Unauthorized" : "Server auth not configured (MCP_AUTH_TOKEN missing)");
                     return;
@@ -6130,9 +6133,16 @@ async function main() {
                 await mcpServer.connect(transport);
                 await transport.handleRequest(req, res, body);
 
-            } else {
+            } else if (url.pathname === "/") {
                 res.writeHead(200, { "Content-Type": "text/plain" });
                 res.end("KayComm MCP Server v2 — running" + (AUTH_TOKEN ? "" : " (auth not configured)"));
+
+            } else {
+                // 404 everything else. A 200 here made claude.ai's OAuth discovery
+                // probes (/.well-known/*, /register) think this server had a
+                // sign-in service, breaking custom-connector setup.
+                res.writeHead(404, { "Content-Type": "text/plain" });
+                res.end("Not found");
             }
         });
 
