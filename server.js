@@ -23,10 +23,10 @@ const GOOGLE_DEVELOPER_TOKEN = process.env.GOOGLE_DEVELOPER_TOKEN;
 const GOOGLE_CLIENT_ID       = process.env.GOOGLE_CLIENT_ID;
 const GOOGLE_CLIENT_SECRET   = process.env.GOOGLE_CLIENT_SECRET;
 const GOOGLE_REFRESH_TOKEN   = process.env.GOOGLE_REFRESH_TOKEN;
-const GOOGLE_API_VERSION     = "v21";
+const GOOGLE_API_VERSION     = "v24";
 
 const META_ACCESS_TOKEN = process.env.META_ACCESS_TOKEN;
-const META_API_VERSION  = "v21.0";
+const META_API_VERSION  = "v25.0";
 
 const STACKADAPT_API_KEY = process.env.STACKADAPT_API_KEY;
 const STACKADAPT_URL     = "https://api.stackadapt.com/graphql";
@@ -35,8 +35,8 @@ const STACKADAPT_URL     = "https://api.stackadapt.com/graphql";
 // here by hand to the new version's release date — health_check uses these to
 // warn before the provider sunsets the pinned version out from under us.
 const API_VERSION_INFO = {
-    google: { version: GOOGLE_API_VERSION, released: "2025-08-01", warnAfterMonths: 9 },   // Google sunsets ~12mo after release
-    meta:   { version: META_API_VERSION,  released: "2024-10-02", warnAfterMonths: 21 },   // Meta sunsets ~24mo after release
+    google: { version: GOOGLE_API_VERSION, released: "2026-04-22", warnAfterMonths: 9 },   // Google sunsets ~12mo after release
+    meta:   { version: META_API_VERSION,  released: "2026-02-18", warnAfterMonths: 21 },   // Meta sunsets ~24mo after release
 };
 
 // ── Accounts — loaded from accounts.json ─────────────────────────────────────
@@ -146,7 +146,9 @@ loadAccounts();
 // JSONL entry — a cross-platform record of what the MCP changed and when.
 // NOTE: Railway's filesystem resets on deploy, so the local Mac holds the
 // authoritative history.
-const WRITE_LOG_FILE = path.join(__dirname, "write-log.jsonl");
+// On Railway, mount a volume and set WRITE_LOG_FILE=/data/write-log.jsonl so
+// the audit log survives deploys; unset, it lives next to server.js.
+const WRITE_LOG_FILE = process.env.WRITE_LOG_FILE || path.join(__dirname, "write-log.jsonl");
 
 function logWriteAction(tool, args, result) {
     try {
@@ -2148,33 +2150,37 @@ async function fetchZeroImpressionCampaigns(token, customerId, mccId, yesterday)
 
 function buildBiddingUpdateBody(strategy, options = {}) {
     const s = strategy.toUpperCase();
+    // Update masks may only list leaf fields (parent scheme fields are rejected
+    // with FIELD_HAS_SUBFIELDS), so strategy switches set bidding_strategy_type
+    // directly; Maximize Clicks is the TARGET_SPEND scheme.
     if (s === "MANUAL_CPC") {
-        return { campaignFields: { manualCpc: {} }, updateMask: "manual_cpc" };
+        return { campaignFields: { biddingStrategyType: "MANUAL_CPC" }, updateMask: "bidding_strategy_type" };
     } else if (s === "ENHANCED_CPC") {
-        return { campaignFields: { manualCpc: { enhancedCpcEnabled: true } }, updateMask: "manual_cpc,manual_cpc.enhanced_cpc_enabled" };
+        throw new Error("Enhanced CPC was sunset by Google and can no longer be set via the API — use MANUAL_CPC or MAXIMIZE_CLICKS instead.");
     } else if (s === "MAXIMIZE_CLICKS") {
-        const mc = {};
-        if (options.cpc_bid_ceiling) mc.cpcBidCeilingMicros = String(Math.round(options.cpc_bid_ceiling * 1_000_000));
-        return {
-            campaignFields: { maximizeClicks: mc },
-            updateMask: options.cpc_bid_ceiling ? "maximize_clicks,maximize_clicks.cpc_bid_ceiling_micros" : "maximize_clicks",
-        };
+        if (options.cpc_bid_ceiling) {
+            return {
+                campaignFields: { biddingStrategyType: "TARGET_SPEND", targetSpend: { cpcBidCeilingMicros: String(Math.round(options.cpc_bid_ceiling * 1_000_000)) } },
+                updateMask: "bidding_strategy_type,target_spend.cpc_bid_ceiling_micros",
+            };
+        }
+        return { campaignFields: { biddingStrategyType: "TARGET_SPEND" }, updateMask: "bidding_strategy_type" };
     } else if (s === "MAXIMIZE_CONVERSIONS") {
-        return { campaignFields: { maximizeConversions: {} }, updateMask: "maximize_conversions" };
+        return { campaignFields: { biddingStrategyType: "MAXIMIZE_CONVERSIONS" }, updateMask: "bidding_strategy_type" };
     } else if (s === "TARGET_CPA") {
         if (!options.target_cpa) throw new Error("target_cpa (dollars) is required for TARGET_CPA strategy");
         return {
-            campaignFields: { targetCpa: { targetCpaMicros: String(Math.round(options.target_cpa * 1_000_000)) } },
-            updateMask: "target_cpa,target_cpa.target_cpa_micros",
+            campaignFields: { biddingStrategyType: "TARGET_CPA", targetCpa: { targetCpaMicros: String(Math.round(options.target_cpa * 1_000_000)) } },
+            updateMask: "bidding_strategy_type,target_cpa.target_cpa_micros",
         };
     } else if (s === "TARGET_ROAS") {
         if (!options.target_roas) throw new Error("target_roas is required for TARGET_ROAS strategy (e.g. 3.0 = 300% ROAS)");
         return {
-            campaignFields: { targetRoas: { targetRoas: options.target_roas } },
-            updateMask: "target_roas,target_roas.target_roas",
+            campaignFields: { biddingStrategyType: "TARGET_ROAS", targetRoas: { targetRoas: options.target_roas } },
+            updateMask: "bidding_strategy_type,target_roas.target_roas",
         };
     } else {
-        throw new Error(`Unknown strategy: ${strategy}. Valid: MANUAL_CPC, ENHANCED_CPC, MAXIMIZE_CLICKS, MAXIMIZE_CONVERSIONS, TARGET_CPA, TARGET_ROAS`);
+        throw new Error(`Unknown strategy: ${strategy}. Valid: MANUAL_CPC, MAXIMIZE_CLICKS, MAXIMIZE_CONVERSIONS, TARGET_CPA, TARGET_ROAS`);
     }
 }
 
@@ -2449,8 +2455,8 @@ async function listAdGroupsFull(token, customerId, mccId, campaignSearch) {
 async function fetchBiddingStrategies(token, customerId, mccId, campaignSearch) {
     const rows = await googleSearch(token, customerId, mccId, `
         SELECT campaign.name, campaign.status, campaign.bidding_strategy_type,
-               campaign.maximize_clicks.cpc_bid_ceiling_micros,
-               campaign.maximize_conversions.target_spend_micros,
+               campaign.target_spend.cpc_bid_ceiling_micros,
+               campaign.maximize_conversions.target_cpa_micros,
                campaign.target_cpa.target_cpa_micros,
                campaign.target_roas.target_roas,
                campaign.manual_cpc.enhanced_cpc_enabled
@@ -2468,10 +2474,10 @@ async function fetchBiddingStrategies(token, customerId, mccId, campaignSearch) 
             status:           c.status,
             bidding_strategy: c.biddingStrategyType,
         };
-        if (c.maximizeClicks?.cpcBidCeilingMicros) {
-            out.cpc_bid_ceiling = "$" + (parseInt(c.maximizeClicks.cpcBidCeilingMicros) / 1_000_000).toFixed(2);
-        } else if (c.biddingStrategyType === "MAXIMIZE_CLICKS") {
-            out.cpc_bid_ceiling = null; // strategy active but no cap set
+        if (c.targetSpend?.cpcBidCeilingMicros) {
+            out.cpc_bid_ceiling = "$" + (parseInt(c.targetSpend.cpcBidCeilingMicros) / 1_000_000).toFixed(2);
+        } else if (c.biddingStrategyType === "TARGET_SPEND" || c.biddingStrategyType === "MAXIMIZE_CLICKS") {
+            out.cpc_bid_ceiling = null; // Maximize Clicks active but no cap set
         }
         if (c.targetCpa?.targetCpaMicros) {
             out.target_cpa = "$" + (parseInt(c.targetCpa.targetCpaMicros) / 1_000_000).toFixed(2);
@@ -2482,8 +2488,8 @@ async function fetchBiddingStrategies(token, customerId, mccId, campaignSearch) 
         if (c.manualCpc != null) {
             out.enhanced_cpc = !!c.manualCpc.enhancedCpcEnabled;
         }
-        if (c.maximizeConversions?.targetSpendMicros) {
-            out.target_spend_cap = "$" + (parseInt(c.maximizeConversions.targetSpendMicros) / 1_000_000).toFixed(2);
+        if (!out.target_cpa && c.maximizeConversions?.targetCpaMicros) {
+            out.target_cpa = "$" + (parseInt(c.maximizeConversions.targetCpaMicros) / 1_000_000).toFixed(2);
         }
         return out;
     });
