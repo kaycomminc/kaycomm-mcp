@@ -1555,6 +1555,84 @@ async function updateGoogleCampaignStatus(token, customerId, mccId, resourceName
     return data;
 }
 
+async function updateGoogleAdGroupStatus(token, customerId, mccId, resourceName, status) {
+    const resp = await fetchFn(
+        `https://googleads.googleapis.com/${GOOGLE_API_VERSION}/customers/${customerId}/googleAds:mutate`,
+        {
+            method: "POST",
+            headers: {
+                "Authorization":     `Bearer ${token}`,
+                "developer-token":   GOOGLE_DEVELOPER_TOKEN,
+                "login-customer-id": mccId,
+                "Content-Type":      "application/json",
+            },
+            body: JSON.stringify({
+                mutateOperations: [{
+                    adGroupOperation: {
+                        update:     { resourceName, status },
+                        updateMask: "status",
+                    },
+                }],
+            }),
+        }
+    );
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data?.error?.message || JSON.stringify(data));
+    return data;
+}
+
+async function listKeywordCriteria(token, customerId, mccId, campaignSearch, adGroupSearch) {
+    const rows = await googleSearch(token, customerId, mccId, `
+        SELECT campaign.name, ad_group.name,
+               ad_group_criterion.resource_name,
+               ad_group_criterion.keyword.text,
+               ad_group_criterion.keyword.match_type,
+               ad_group_criterion.status
+        FROM ad_group_criterion
+        WHERE ad_group_criterion.type = 'KEYWORD'
+          AND ad_group_criterion.negative = FALSE
+          AND ad_group_criterion.status != 'REMOVED'
+          AND ad_group.status != 'REMOVED'
+          AND campaign.status != 'REMOVED'`);
+    return rows
+        .map(row => ({
+            resource_name: row.adGroupCriterion.resourceName,
+            keyword:       row.adGroupCriterion.keyword.text,
+            match_type:    row.adGroupCriterion.keyword.matchType,
+            status:        row.adGroupCriterion.status,
+            ad_group:      row.adGroup.name,
+            campaign:      row.campaign.name,
+        }))
+        .filter(k => !campaignSearch || k.campaign.toLowerCase().includes(campaignSearch))
+        .filter(k => !adGroupSearch || k.ad_group.toLowerCase().includes(adGroupSearch));
+}
+
+async function updateGoogleKeywordStatus(token, customerId, mccId, resourceNames, status) {
+    const resp = await fetchFn(
+        `https://googleads.googleapis.com/${GOOGLE_API_VERSION}/customers/${customerId}/googleAds:mutate`,
+        {
+            method: "POST",
+            headers: {
+                "Authorization":     `Bearer ${token}`,
+                "developer-token":   GOOGLE_DEVELOPER_TOKEN,
+                "login-customer-id": mccId,
+                "Content-Type":      "application/json",
+            },
+            body: JSON.stringify({
+                mutateOperations: resourceNames.map(resourceName => ({
+                    adGroupCriterionOperation: {
+                        update:     { resourceName, status },
+                        updateMask: "status",
+                    },
+                })),
+            }),
+        }
+    );
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data?.error?.message || JSON.stringify(data));
+    return data;
+}
+
 async function updateGoogleCampaignBudget(token, customerId, mccId, campaignResourceName, dailyBudgetDollars) {
     // Step 1: get the budget resource name for this campaign
     const rows = await googleSearch(token, customerId, mccId, `
@@ -3061,6 +3139,68 @@ function makeServer() {
             },
         },
         {
+            name: "pause_ad_group",
+            description: "Pause a Google Ads ad group. Dry run by default — set confirm=true to apply. Ad group names can repeat across campaigns, so pass campaign_name to disambiguate. Use list_ad_groups first to confirm the exact name.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    account_name:  { type: "string", description: "Client name (partial match ok)" },
+                    ad_group_name: { type: "string", description: "Ad group name (partial match ok)" },
+                    campaign_name: { type: "string", description: "Campaign to scope the match to (partial match ok). Recommended when ad group names repeat across campaigns." },
+                    confirm:       { type: "boolean", description: "Set true to actually pause. Omit for dry run." },
+                },
+                required: ["account_name", "ad_group_name"],
+            },
+        },
+        {
+            name: "enable_ad_group",
+            description: "Re-enable a paused Google Ads ad group. Dry run by default — set confirm=true to apply.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    account_name:  { type: "string", description: "Client name (partial match ok)" },
+                    ad_group_name: { type: "string", description: "Ad group name (partial match ok)" },
+                    campaign_name: { type: "string", description: "Campaign to scope the match to (partial match ok)." },
+                    confirm:       { type: "boolean", description: "Set true to actually enable. Omit for dry run." },
+                },
+                required: ["account_name", "ad_group_name"],
+            },
+        },
+        {
+            name: "pause_keyword",
+            description: "Pause a Google Ads keyword. Dry run by default — set confirm=true to apply. Matches on keyword text (exact text preferred, substring fallback); the same text often exists in multiple ad groups or match types, so pass campaign_name / ad_group_name / match_type to narrow, or all_matches=true to pause every match at once.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    account_name:  { type: "string", description: "Client name (partial match ok)" },
+                    keyword_text:  { type: "string", description: "Keyword text to pause (e.g. 'childhood speech')" },
+                    campaign_name: { type: "string", description: "Campaign to scope the match to (partial match ok)" },
+                    ad_group_name: { type: "string", description: "Ad group to scope the match to (partial match ok)" },
+                    match_type:    { type: "string", enum: ["EXACT", "PHRASE", "BROAD"], description: "Only match this match type" },
+                    all_matches:   { type: "boolean", description: "Set true to pause every matching keyword when more than one matches (e.g. same text across match types)" },
+                    confirm:       { type: "boolean", description: "Set true to actually pause. Omit for dry run." },
+                },
+                required: ["account_name", "keyword_text"],
+            },
+        },
+        {
+            name: "enable_keyword",
+            description: "Re-enable a paused Google Ads keyword. Dry run by default — set confirm=true to apply. Same matching rules as pause_keyword.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    account_name:  { type: "string", description: "Client name (partial match ok)" },
+                    keyword_text:  { type: "string", description: "Keyword text to enable" },
+                    campaign_name: { type: "string", description: "Campaign to scope the match to (partial match ok)" },
+                    ad_group_name: { type: "string", description: "Ad group to scope the match to (partial match ok)" },
+                    match_type:    { type: "string", enum: ["EXACT", "PHRASE", "BROAD"], description: "Only match this match type" },
+                    all_matches:   { type: "boolean", description: "Set true to enable every matching keyword when more than one matches" },
+                    confirm:       { type: "boolean", description: "Set true to actually enable. Omit for dry run." },
+                },
+                required: ["account_name", "keyword_text"],
+            },
+        },
+        {
             name: "update_budget",
             description: "Update the daily budget for a Google Ads campaign or Meta campaign/ad set. Dry run by default — set confirm=true to apply. Google budgets are daily amounts; Meta budgets are also daily in dollars.",
             inputSchema: {
@@ -3992,6 +4132,97 @@ async function handleToolCall(name, args = {}) {
                     } else {
                         await metaPost(camp.id, { status: metaStatus });
                         result = { success: true, account: info.name, campaign: camp.name, status: metaStatus };
+                    }
+                } catch (e) { result = { error: e.message }; }
+            }
+        }
+
+    } else if (name === "pause_ad_group" || name === "enable_ad_group") {
+        const search     = (args.account_name || "").toLowerCase();
+        const agSearch   = (args.ad_group_name || "").toLowerCase();
+        const campSearch = args.campaign_name ? args.campaign_name.toLowerCase() : null;
+        const confirm    = !!args.confirm;
+        const newStatus  = name === "pause_ad_group" ? "PAUSED" : "ENABLED";
+
+        const match = Object.entries(GOOGLE_ACCOUNTS).find(([, i]) => i.name.toLowerCase().includes(search));
+        if (!match) { result = { error: `No Google account matching '${args.account_name}'` }; }
+        else {
+            const [cid, info] = match;
+            const { token, error: authErr } = await getGoogleAccessToken();
+            if (authErr) { result = { error: `Auth: ${authErr}` }; }
+            else {
+                try {
+                    const adGroups = await listAdGroupsFull(token, cid, info.mcc, campSearch);
+                    const matches = adGroups.filter(ag => ag.name.toLowerCase().includes(agSearch));
+                    if (matches.length === 0) {
+                        result = {
+                            error: `No ad group matching '${args.ad_group_name}'` + (campSearch ? ` in campaigns matching '${args.campaign_name}'` : ""),
+                            available: adGroups.map(ag => ({ name: ag.name, campaign: ag.campaign })),
+                        };
+                    } else if (matches.length > 1) {
+                        result = {
+                            error: `${matches.length} ad groups match '${args.ad_group_name}' — use a more specific ad_group_name or add campaign_name to disambiguate.`,
+                            matches: matches.map(ag => ({ name: ag.name, campaign: ag.campaign, status: ag.status })),
+                        };
+                    } else {
+                        const ag = matches[0];
+                        if (!confirm) {
+                            result = { dry_run: true, message: `DRY RUN — set confirm=true to apply`, account: info.name, campaign: ag.campaign, ad_group: ag.name, current_status: ag.status, new_status: newStatus };
+                        } else {
+                            await updateGoogleAdGroupStatus(token, cid, info.mcc, ag.ad_group_resource, newStatus);
+                            result = { success: true, account: info.name, campaign: ag.campaign, ad_group: ag.name, status: newStatus };
+                        }
+                    }
+                } catch (e) { result = { error: e.message }; }
+            }
+        }
+
+    } else if (name === "pause_keyword" || name === "enable_keyword") {
+        const search     = (args.account_name || "").toLowerCase();
+        const kwSearch   = (args.keyword_text || "").toLowerCase().trim();
+        const campSearch = args.campaign_name ? args.campaign_name.toLowerCase() : null;
+        const agSearch   = args.ad_group_name ? args.ad_group_name.toLowerCase() : null;
+        const matchType  = args.match_type ? args.match_type.toUpperCase() : null;
+        const allMatches = !!args.all_matches;
+        const confirm    = !!args.confirm;
+        const newStatus  = name === "pause_keyword" ? "PAUSED" : "ENABLED";
+
+        const match = Object.entries(GOOGLE_ACCOUNTS).find(([, i]) => i.name.toLowerCase().includes(search));
+        if (!kwSearch) { result = { error: "keyword_text is required." }; }
+        else if (!match) { result = { error: `No Google account matching '${args.account_name}'` }; }
+        else {
+            const [cid, info] = match;
+            const { token, error: authErr } = await getGoogleAccessToken();
+            if (authErr) { result = { error: `Auth: ${authErr}` }; }
+            else {
+                try {
+                    const keywords = await listKeywordCriteria(token, cid, info.mcc, campSearch, agSearch);
+                    let matches = keywords.filter(k => k.keyword.toLowerCase().includes(kwSearch));
+                    const exact = matches.filter(k => k.keyword.toLowerCase() === kwSearch);
+                    if (exact.length > 0) matches = exact;
+                    if (matchType) matches = matches.filter(k => k.match_type === matchType);
+                    // No point pausing already-paused keywords (or enabling enabled ones)
+                    const actionable = matches.filter(k => k.status !== newStatus);
+
+                    if (matches.length === 0) {
+                        result = {
+                            error: `No keyword matching '${args.keyword_text}'` +
+                                   (campSearch ? ` in campaigns matching '${args.campaign_name}'` : "") +
+                                   (agSearch ? ` in ad groups matching '${args.ad_group_name}'` : "") +
+                                   (matchType ? ` with match type ${matchType}` : ""),
+                        };
+                    } else if (actionable.length === 0) {
+                        result = { message: `All ${matches.length} matching keyword(s) are already ${newStatus}.`, matches };
+                    } else if (actionable.length > 1 && !allMatches) {
+                        result = {
+                            error: `${actionable.length} keywords match '${args.keyword_text}' — narrow with campaign_name / ad_group_name / match_type, or set all_matches=true to ${name === "pause_keyword" ? "pause" : "enable"} all of them.`,
+                            matches: actionable,
+                        };
+                    } else if (!confirm) {
+                        result = { dry_run: true, message: `DRY RUN — set confirm=true to apply`, account: info.name, new_status: newStatus, keywords: actionable };
+                    } else {
+                        await updateGoogleKeywordStatus(token, cid, info.mcc, actionable.map(k => k.resource_name), newStatus);
+                        result = { success: true, account: info.name, status: newStatus, keywords: actionable.map(({ resource_name, ...k }) => ({ ...k, status: newStatus })) };
                     }
                 } catch (e) { result = { error: e.message }; }
             }
