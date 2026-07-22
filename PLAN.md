@@ -221,6 +221,54 @@ correct behavior; confirm the math rather than suppressing it).
 
 ---
 
+## Task 7 — Fix create_campaign INVALID_ARGUMENT (read-only bidding field in create payload)
+
+**Problem:** `create_campaign` with `confirm=true` consistently fails with
+"Request contains an invalid argument." (read tools work fine, so auth/access
+is not the issue). Root cause, found by inspection 2026-07-21:
+`createGoogleCampaignFull` (`server.js:2292`) builds the campaign create op's
+bidding fields by reusing `buildBiddingUpdateBody(...).campaignFields`
+(`server.js:2229`), which sets `biddingStrategyType` directly. That works for
+the **update** path (`set_bidding_strategy`), but per the API docs
+`campaign.bidding_strategy_type` is **read-only** — on **create** you must set
+the `campaign_bidding_strategy` oneof scheme field instead (`manualCpc: {}`,
+`targetSpend: {...}`, `maximizeConversions: {}`, ...). So every create is
+rejected regardless of strategy. (The dry-run path never hits the API, which is
+why this only surfaces with `confirm=true`. Network settings and geo targeting
+were suspected but are NOT the issue — `networkSettings` is already in the
+payload and geo targeting is not required.)
+
+**Change (two parts):**
+
+1. In `createGoogleCampaignFull`, stop reusing the update builder. Replace the
+   `let biddingFields = ...` block with create-shaped scheme fields:
+   - `MANUAL_CPC` (default) → `{ manualCpc: {} }`
+   - `MAXIMIZE_CLICKS` → `{ targetSpend: {} }`, plus
+     `cpcBidCeilingMicros` inside `targetSpend` when `cpc_bid_ceiling` given
+   - `MAXIMIZE_CONVERSIONS` → `{ maximizeConversions: {} }`; when a
+     `target_cpa` option is given, set `maximizeConversions: { targetCpaMicros }`
+   - `TARGET_CPA` / `TARGET_ROAS` → check current v24 guidance before wiring:
+     Google has been migrating standalone TargetCpa/TargetRoas schemes into
+     MaximizeConversions/MaximizeConversionValue with targets — prefer the
+     migrated form for new campaigns.
+   Keep `ENHANCED_CPC` rejected with the existing sunset message (call the
+   builder just for validation, or duplicate the check).
+2. While in there, fix error surfacing so the next API failure is debuggable:
+   `createGoogleCampaignFull` throws `data?.error?.message`, which for Google
+   Ads is always the generic "Request contains an invalid argument." — the
+   actual field path and error code live in `data.error.details[].errors[]`
+   (GoogleAdsFailure). Include those in the thrown message (and `console.error`
+   the full JSON so it lands in Railway logs). Apply the same to the other
+   `googleAds:mutate` helpers that throw only `error.message`.
+
+**Verify:** `node test.js create_campaign '{"account_name":"<account>", "campaign_name":"ZZZ API Test", "daily_budget":1, "ad_groups":[{"name":"Test AG","keywords":[{"text":"zzz test","match_type":"EXACT"}]}]}'`
+(dry run) still works; then ONE confirmed create of the $1/day "ZZZ API Test"
+campaign in an account the user names — it starts PAUSED — confirm success,
+then remove it in the UI. Do not retry the mutate on failure; capture the (now
+detailed) error instead.
+
+---
+
 ## Explicitly out of scope
 
 - Splitting server.js into modules.

@@ -339,6 +339,23 @@ async function getGoogleAccessToken() {
 }
 
 // ── Google Ads API ────────────────────────────────────────────────────────────
+// Google Ads buries the real failure (error code + field path) in
+// error.details[].errors[]; the top-level message is just "Request contains an
+// invalid argument." Flatten the detail errors into the message and log the
+// full error body so it's visible in Railway logs.
+function googleAdsError(data) {
+    const detailErrors = (data?.error?.details || []).flatMap(d => d.errors || []);
+    if (!detailErrors.length) return data?.error?.message || JSON.stringify(data);
+    console.error("Google Ads API error:", JSON.stringify(data.error));
+    return detailErrors.map(e => {
+        const code = e.errorCode ? Object.values(e.errorCode)[0] : "UNKNOWN";
+        const path = (e.location?.fieldPathElements || [])
+            .map(p => p.fieldName + (p.index != null ? `[${p.index}]` : ""))
+            .join(".");
+        return `${code}: ${e.message}${path ? ` (at ${path})` : ""}`;
+    }).join("; ");
+}
+
 async function googleSearch(token, customerId, mccId, query) {
     const results = [];
     let pageToken = null;
@@ -357,10 +374,7 @@ async function googleSearch(token, customerId, mccId, query) {
             }
         );
         const data = await resp.json();
-        if (!resp.ok) {
-            const msg = data?.error?.details?.[0]?.errors?.[0]?.message || data?.error?.message || JSON.stringify(data);
-            throw new Error(msg);
-        }
+        if (!resp.ok) throw new Error(googleAdsError(data));
         results.push(...(data.results || []));
         pageToken = data.nextPageToken || null;
     } while (pageToken);
@@ -606,10 +620,7 @@ async function mutateNegativeKeywords(token, customerId, mccId, campaignResource
         }
     );
     const data = await resp.json();
-    if (!resp.ok) {
-        const msg = data?.error?.details?.[0]?.errors?.[0]?.message || data?.error?.message || JSON.stringify(data);
-        throw new Error(msg);
-    }
+    if (!resp.ok) throw new Error(googleAdsError(data));
     return data.mutateOperationResponses || [];
 }
 
@@ -1380,7 +1391,7 @@ async function callKeywordPlannerIdeas(token, customerId, mccId, seedKeywords, u
         }
     );
     const data = await resp.json();
-    if (!resp.ok) throw new Error(data?.error?.message || JSON.stringify(data));
+    if (!resp.ok) throw new Error(googleAdsError(data));
     return (data.results || []).map(r => parseKwMetric(r));
 }
 
@@ -1403,7 +1414,7 @@ async function fetchKeywordHistoricalMetrics(token, customerId, mccId, keywords,
         }
     );
     const data = await resp.json();
-    if (!resp.ok) throw new Error(data?.error?.message || JSON.stringify(data));
+    if (!resp.ok) throw new Error(googleAdsError(data));
 
     return (data.results || []).map(r => {
         const base = parseKwMetric(r, "keywordMetrics");
@@ -1551,7 +1562,7 @@ async function updateGoogleCampaignStatus(token, customerId, mccId, resourceName
         }
     );
     const data = await resp.json();
-    if (!resp.ok) throw new Error(data?.error?.message || JSON.stringify(data));
+    if (!resp.ok) throw new Error(googleAdsError(data));
     return data;
 }
 
@@ -1577,7 +1588,7 @@ async function updateGoogleAdGroupStatus(token, customerId, mccId, resourceName,
         }
     );
     const data = await resp.json();
-    if (!resp.ok) throw new Error(data?.error?.message || JSON.stringify(data));
+    if (!resp.ok) throw new Error(googleAdsError(data));
     return data;
 }
 
@@ -1629,7 +1640,7 @@ async function updateGoogleKeywordStatus(token, customerId, mccId, resourceNames
         }
     );
     const data = await resp.json();
-    if (!resp.ok) throw new Error(data?.error?.message || JSON.stringify(data));
+    if (!resp.ok) throw new Error(googleAdsError(data));
     return data;
 }
 
@@ -1664,7 +1675,7 @@ async function updateGoogleCampaignBudget(token, customerId, mccId, campaignReso
         }
     );
     const data = await resp.json();
-    if (!resp.ok) throw new Error(data?.error?.message || JSON.stringify(data));
+    if (!resp.ok) throw new Error(googleAdsError(data));
     return { budget_resource: budgetResourceName, new_daily_budget: "$" + dailyBudgetDollars.toFixed(2) };
 }
 
@@ -1681,7 +1692,7 @@ async function listAccessibleCustomers(token) {
         }
     );
     const data = await resp.json();
-    if (!resp.ok) throw new Error(data?.error?.message || JSON.stringify(data));
+    if (!resp.ok) throw new Error(googleAdsError(data));
     // Returns resource names like "customers/1234567890"
     return (data.resourceNames || []).map(r => r.replace("customers/", ""));
 }
@@ -1829,11 +1840,7 @@ async function getGoogleAccountSpend(token, customerId, mccId) {
     } catch (_) { return 0; }
 }
 
-function googleAdsError(data) {
-    return data?.error?.details?.[0]?.errors?.[0]?.message
-        || data?.error?.message
-        || JSON.stringify(data);
-}
+// googleAdsError is defined near the top of the Google Ads API section
 
 function extractPolicyViolationKeys(data) {
     // Pull PolicyViolationKey objects from a Google Ads error response for retry with exemptions
@@ -2285,7 +2292,7 @@ async function setBiddingStrategy(token, customerId, mccId, campaignResourceName
         }
     );
     const data = await resp.json();
-    if (!resp.ok) throw new Error(data?.error?.message || JSON.stringify(data));
+    if (!resp.ok) throw new Error(googleAdsError(data));
     return data;
 }
 
@@ -2308,10 +2315,24 @@ async function createGoogleCampaignFull(token, customerId, mccId, config) {
         },
     });
 
-    // Op 1: Campaign
+    // Op 1: Campaign. campaign.bidding_strategy_type is read-only, so a create
+    // must set the bidding scheme oneof field — buildBiddingUpdateBody's output
+    // only works for updates.
     const strategy = (config.bidding_strategy || "MANUAL_CPC").toUpperCase();
-    let biddingFields = {};
-    try { biddingFields = buildBiddingUpdateBody(strategy, config).campaignFields; } catch (_) { biddingFields = { manualCpc: {} }; }
+    let biddingFields;
+    if (strategy === "MANUAL_CPC") {
+        biddingFields = { manualCpc: {} };
+    } else if (strategy === "MAXIMIZE_CLICKS") {
+        biddingFields = { targetSpend: {} };
+    } else if (strategy === "MAXIMIZE_CONVERSIONS") {
+        biddingFields = { maximizeConversions: {} };
+    } else if (strategy === "ENHANCED_CPC") {
+        throw new Error("Enhanced CPC was sunset by Google and can no longer be set via the API — use MANUAL_CPC or MAXIMIZE_CLICKS instead.");
+    } else if (strategy === "TARGET_CPA" || strategy === "TARGET_ROAS") {
+        throw new Error(`${strategy} needs a target value, which create_campaign doesn't collect — create with MANUAL_CPC or MAXIMIZE_CONVERSIONS, then switch via set_bidding_strategy.`);
+    } else {
+        throw new Error(`Unknown strategy: ${strategy}. Valid for creation: MANUAL_CPC, MAXIMIZE_CLICKS, MAXIMIZE_CONVERSIONS`);
+    }
     mutateOperations.push({
         campaignOperation: {
             create: {
@@ -2372,7 +2393,7 @@ async function createGoogleCampaignFull(token, customerId, mccId, config) {
         }
     );
     const data = await resp.json();
-    if (!resp.ok) throw new Error(data?.error?.message || JSON.stringify(data));
+    if (!resp.ok) throw new Error(googleAdsError(data));
 
     const results = data.mutateOperationResponses || [];
     return {
@@ -2436,7 +2457,7 @@ async function updateRSA(token, customerId, mccId, adResourceName, headlines, de
         }
     );
     const data = await resp.json();
-    if (!resp.ok) throw new Error(data?.error?.message || JSON.stringify(data));
+    if (!resp.ok) throw new Error(googleAdsError(data));
     return data;
 }
 
@@ -2496,7 +2517,7 @@ async function addCampaignExtensions(token, customerId, mccId, campaignResourceN
         }
     );
     const data = await resp.json();
-    if (!resp.ok) throw new Error(data?.error?.message || JSON.stringify(data));
+    if (!resp.ok) throw new Error(googleAdsError(data));
 
     const results       = data.mutateOperationResponses || [];
     const assetResults  = results.slice(0, assets.length).map(r => r.assetResult?.resourceName).filter(Boolean);
@@ -3462,7 +3483,7 @@ function makeServer() {
                     campaign_name:     { type: "string", description: "Name for the new campaign" },
                     daily_budget:      { type: "number", description: "Daily budget in dollars" },
                     campaign_type:     { type: "string", enum: ["SEARCH","DISPLAY","SHOPPING"], description: "Campaign type (default: SEARCH)" },
-                    bidding_strategy:  { type: "string", enum: ["MANUAL_CPC","ENHANCED_CPC","MAXIMIZE_CLICKS","MAXIMIZE_CONVERSIONS","TARGET_CPA","TARGET_ROAS"], description: "Bidding strategy (default: MANUAL_CPC)" },
+                    bidding_strategy:  { type: "string", enum: ["MANUAL_CPC","MAXIMIZE_CLICKS","MAXIMIZE_CONVERSIONS"], description: "Bidding strategy (default: MANUAL_CPC). For TARGET_CPA/TARGET_ROAS, create with MAXIMIZE_CONVERSIONS then switch via set_bidding_strategy." },
                     ad_groups: {
                         type: "array",
                         description: "Ad groups to create",
