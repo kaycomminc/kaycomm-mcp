@@ -2519,6 +2519,195 @@ async function updateAdFinalUrl(token, customerId, mccId, adResourceName, finalU
     return data;
 }
 
+async function listAccountAssets(token, customerId, mccId, assetTypes) {
+    // assetTypes: optional array of IMAGE, TEXT, YOUTUBE_VIDEO
+    let where = "asset.type != 'UNKNOWN'";
+    if (assetTypes?.length) where = `asset.type IN (${assetTypes.map(t => `'${t}'`).join(",")})`;
+    const rows = await googleSearch(token, customerId, mccId, `
+        SELECT asset.resource_name, asset.name, asset.type,
+               asset.text_asset.text,
+               asset.image_asset.full_size.url,
+               asset.image_asset.full_size.width_pixels,
+               asset.image_asset.full_size.height_pixels,
+               asset.youtube_video_asset.youtube_video_id,
+               asset.youtube_video_asset.youtube_video_title
+        FROM asset
+        WHERE ${where}
+        ORDER BY asset.type`);
+    return rows.map(r => {
+        const a = r.asset;
+        const base = { resource_name: a.resourceName, name: a.name || null, type: a.type };
+        if (a.type === "TEXT")  return { ...base, text: a.textAsset?.text };
+        if (a.type === "IMAGE") {
+            const img = a.imageAsset?.fullSize || {};
+            const w = parseInt(img.widthPixels || 0), h = parseInt(img.heightPixels || 0);
+            let ratio = null;
+            if (w && h) {
+                const r = w / h;
+                if (Math.abs(r - 1.91) < 0.1) ratio = "landscape_1.91:1";
+                else if (Math.abs(r - 1) < 0.1)   ratio = "square_1:1";
+                else if (Math.abs(r - 4) < 0.2)   ratio = "landscape_4:1";
+                else if (Math.abs(r - 0.8) < 0.1) ratio = "portrait_4:5";
+                else ratio = `${w}x${h}`;
+            }
+            return { ...base, url: img.url || null, width: w, height: h, ratio };
+        }
+        if (a.type === "YOUTUBE_VIDEO") return { ...base, video_id: a.youtubeVideoAsset?.youtubeVideoId, title: a.youtubeVideoAsset?.youtubeVideoTitle };
+        return base;
+    });
+}
+
+async function createPmaxCampaignFull(token, customerId, mccId, config) {
+    // config: {
+    //   campaign_name, daily_budget, bidding_strategy (MAXIMIZE_CONVERSIONS|MAXIMIZE_CONVERSION_VALUE),
+    //   final_url, business_name_asset (resource_name), logo_asset (resource_name),
+    //   asset_group_name,
+    //   headlines: [{text}], long_headlines: [{text}], descriptions: [{text}],
+    //   marketing_images: [resource_name], square_marketing_images: [resource_name],
+    //   youtube_videos: [resource_name] (optional),
+    //   geo_targets: [int] (required),
+    // }
+    const mutateOperations = [];
+    const budgetTemp   = `customers/${customerId}/campaignBudgets/-1`;
+    const campaignTemp = `customers/${customerId}/campaigns/-2`;
+    const agTemp       = `customers/${customerId}/assetGroups/-3`;
+
+    // 1. Budget
+    mutateOperations.push({
+        campaignBudgetOperation: {
+            create: {
+                resourceName:    budgetTemp,
+                name:            `${config.campaign_name} Budget`,
+                amountMicros:    String(Math.round(config.daily_budget * 1_000_000)),
+                deliveryMethod:  "STANDARD",
+                explicitlyShared: false,
+            },
+        },
+    });
+
+    // 2. Text assets (must be created before asset group links)
+    let tempId = -10;
+    const headlineRefs = [], longHeadlineRefs = [], descriptionRefs = [];
+    for (const h of (config.headlines || [])) {
+        const ref = `customers/${customerId}/assets/${tempId--}`;
+        mutateOperations.push({ assetOperation: { create: { resourceName: ref, textAsset: { text: h.text } } } });
+        headlineRefs.push(ref);
+    }
+    for (const lh of (config.long_headlines || [])) {
+        const ref = `customers/${customerId}/assets/${tempId--}`;
+        mutateOperations.push({ assetOperation: { create: { resourceName: ref, textAsset: { text: lh.text } } } });
+        longHeadlineRefs.push(ref);
+    }
+    for (const d of (config.descriptions || [])) {
+        const ref = `customers/${customerId}/assets/${tempId--}`;
+        mutateOperations.push({ assetOperation: { create: { resourceName: ref, textAsset: { text: d.text } } } });
+        descriptionRefs.push(ref);
+    }
+
+    // 3. Campaign
+    const strategy = (config.bidding_strategy || "MAXIMIZE_CONVERSIONS").toUpperCase();
+    let biddingFields;
+    if (strategy === "MAXIMIZE_CONVERSIONS") biddingFields = { maximizeConversions: {} };
+    else if (strategy === "MAXIMIZE_CONVERSION_VALUE") biddingFields = { maximizeConversionValue: {} };
+    else throw new Error(`PMax only supports MAXIMIZE_CONVERSIONS or MAXIMIZE_CONVERSION_VALUE, not ${strategy}`);
+
+    mutateOperations.push({
+        campaignOperation: {
+            create: {
+                resourceName:           campaignTemp,
+                name:                   config.campaign_name,
+                status:                 "PAUSED",
+                advertisingChannelType: "PERFORMANCE_MAX",
+                campaignBudget:         budgetTemp,
+                containsEuPoliticalAdvertising: "DOES_NOT_CONTAIN_EU_POLITICAL_ADVERTISING",
+                ...biddingFields,
+            },
+        },
+    });
+
+    // 4. Campaign-level brand assets (business name + logo)
+    mutateOperations.push({
+        campaignAssetOperation: {
+            create: { campaign: campaignTemp, asset: config.business_name_asset, fieldType: "BUSINESS_NAME" },
+        },
+    });
+    mutateOperations.push({
+        campaignAssetOperation: {
+            create: { campaign: campaignTemp, asset: config.logo_asset, fieldType: "LOGO" },
+        },
+    });
+
+    // 5. Asset group
+    mutateOperations.push({
+        assetGroupOperation: {
+            create: {
+                resourceName: agTemp,
+                campaign:     campaignTemp,
+                name:         config.asset_group_name || config.campaign_name,
+                status:       "PAUSED",
+                finalUrls:    [config.final_url],
+            },
+        },
+    });
+
+    // 6. Asset group asset links — all in one block after the asset group
+    const assetLinks = [];
+    for (const ref of headlineRefs)     assetLinks.push({ asset: ref, fieldType: "HEADLINE" });
+    for (const ref of longHeadlineRefs) assetLinks.push({ asset: ref, fieldType: "LONG_HEADLINE" });
+    for (const ref of descriptionRefs)  assetLinks.push({ asset: ref, fieldType: "DESCRIPTION" });
+    for (const ref of (config.marketing_images || []))        assetLinks.push({ asset: ref, fieldType: "MARKETING_IMAGE" });
+    for (const ref of (config.square_marketing_images || [])) assetLinks.push({ asset: ref, fieldType: "SQUARE_MARKETING_IMAGE" });
+    for (const ref of (config.youtube_videos || []))          assetLinks.push({ asset: ref, fieldType: "YOUTUBE_VIDEO" });
+    for (const ref of (config.logo_assets || []))             assetLinks.push({ asset: ref, fieldType: "LOGO" });
+
+    for (const link of assetLinks) {
+        mutateOperations.push({
+            assetGroupAssetOperation: {
+                create: { assetGroup: agTemp, ...link },
+            },
+        });
+    }
+
+    // 7. Geo targeting + language (English)
+    mutateOperations.push({
+        campaignCriterionOperation: {
+            create: { campaign: campaignTemp, language: { languageConstant: "languageConstants/1000" } },
+        },
+    });
+    for (const geoId of (config.geo_targets || [])) {
+        mutateOperations.push({
+            campaignCriterionOperation: {
+                create: { campaign: campaignTemp, location: { geoTargetConstant: `geoTargetConstants/${geoId}` } },
+            },
+        });
+    }
+
+    const resp = await fetchFn(
+        `https://googleads.googleapis.com/${GOOGLE_API_VERSION}/customers/${customerId}/googleAds:mutate`,
+        {
+            method: "POST",
+            headers: {
+                "Authorization":     `Bearer ${token}`,
+                "developer-token":   GOOGLE_DEVELOPER_TOKEN,
+                "login-customer-id": mccId,
+                "Content-Type":      "application/json",
+            },
+            body: JSON.stringify({ mutateOperations }),
+        }
+    );
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(googleAdsError(data));
+
+    const results = data.mutateOperationResponses || [];
+    return {
+        campaign_resource: results.find(r => r.campaignResult)?.campaignResult?.resourceName,
+        budget_resource:   results.find(r => r.campaignBudgetResult)?.campaignBudgetResult?.resourceName,
+        asset_group_resource: results.find(r => r.assetGroupResult)?.assetGroupResult?.resourceName,
+        total_ops:         mutateOperations.length,
+        results_count:     results.length,
+    };
+}
+
 async function addCampaignExtensions(token, customerId, mccId, campaignResourceName, extensionType, assets) {
     // extensionType: SITELINK | CALLOUT | STRUCTURED_SNIPPET
     // SITELINK assets: [{link_text, description1, description2, url}]
@@ -3572,6 +3761,91 @@ function makeServer() {
                     confirm: { type: "boolean", description: "Set true to actually create. Omit for dry run." },
                 },
                 required: ["account_name", "campaign_name", "daily_budget", "ad_groups", "geo_targets"],
+            },
+        },
+        {
+            name: "list_account_assets",
+            description: "List creative assets (images, text, YouTube videos) already uploaded to a Google Ads account. " +
+                "Use to find existing asset resource names for create_pmax_campaign. " +
+                "Filter by type: IMAGE, TEXT, YOUTUBE_VIDEO.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    account_name: { type: "string", description: "Client name (partial match ok)" },
+                    asset_types: {
+                        type: "array",
+                        description: "Filter to specific types (default: all). Options: IMAGE, TEXT, YOUTUBE_VIDEO.",
+                        items: { type: "string", enum: ["IMAGE", "TEXT", "YOUTUBE_VIDEO"] },
+                    },
+                },
+                required: ["account_name"],
+            },
+        },
+        {
+            name: "create_pmax_campaign",
+            description: "Create a Performance Max campaign with asset group, text assets, and links to existing image/video assets. " +
+                "Campaign is created in PAUSED status for review. " +
+                "Use list_account_assets to find existing image/logo resource names first. " +
+                "Dry run by default — set confirm=true to build it. " +
+                "Minimum: 3 headlines (30 char), 1 long headline (90 char), 2 descriptions (90 char), " +
+                "1 marketing image (landscape 1.91:1), 1 square marketing image, " +
+                "1 business name asset, 1 logo asset.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    account_name:      { type: "string", description: "Client name (partial match ok)" },
+                    campaign_name:     { type: "string", description: "Name for the new campaign" },
+                    daily_budget:      { type: "number", description: "Daily budget in dollars" },
+                    bidding_strategy:  { type: "string", enum: ["MAXIMIZE_CONVERSIONS", "MAXIMIZE_CONVERSION_VALUE"], description: "Bidding strategy (default: MAXIMIZE_CONVERSIONS)" },
+                    final_url:         { type: "string", description: "Final URL / landing page for the asset group" },
+                    geo_targets: {
+                        type: "array",
+                        description: "Geo target location IDs (required). Common: 2840=US, 2826=UK, 2124=Canada.",
+                        items: { type: "integer" },
+                    },
+                    business_name_asset: { type: "string", description: "Resource name of an existing text asset to use as business name (from list_account_assets)" },
+                    logo_asset:          { type: "string", description: "Resource name of an existing image asset to use as campaign logo (from list_account_assets)" },
+                    asset_group_name:    { type: "string", description: "Name for the asset group (defaults to campaign name)" },
+                    headlines: {
+                        type: "array",
+                        description: "3–15 headlines, each up to 30 characters",
+                        items: { type: "object", properties: { text: { type: "string" } }, required: ["text"] },
+                    },
+                    long_headlines: {
+                        type: "array",
+                        description: "1–5 long headlines, each up to 90 characters",
+                        items: { type: "object", properties: { text: { type: "string" } }, required: ["text"] },
+                    },
+                    descriptions: {
+                        type: "array",
+                        description: "2–5 descriptions, each up to 90 characters",
+                        items: { type: "object", properties: { text: { type: "string" } }, required: ["text"] },
+                    },
+                    marketing_images: {
+                        type: "array",
+                        description: "Resource names of existing landscape (1.91:1) image assets",
+                        items: { type: "string" },
+                    },
+                    square_marketing_images: {
+                        type: "array",
+                        description: "Resource names of existing square (1:1) image assets",
+                        items: { type: "string" },
+                    },
+                    logo_assets: {
+                        type: "array",
+                        description: "Additional logo asset resource names to link to the asset group (optional)",
+                        items: { type: "string" },
+                    },
+                    youtube_videos: {
+                        type: "array",
+                        description: "Resource names of existing YouTube video assets (optional)",
+                        items: { type: "string" },
+                    },
+                    confirm: { type: "boolean", description: "Set true to actually create. Omit for dry run." },
+                },
+                required: ["account_name", "campaign_name", "daily_budget", "final_url", "geo_targets",
+                           "business_name_asset", "logo_asset", "headlines", "long_headlines", "descriptions",
+                           "marketing_images", "square_marketing_images"],
             },
         },
         {
@@ -5489,6 +5763,114 @@ async function handleToolCall(name, args = {}) {
                                 budget_resource:   res.budget_resource,
                                 total_ops:         res.total_ops,
                                 status:            "PAUSED — review in Google Ads before enabling",
+                            };
+                        } catch (e) { result = { error: e.message }; }
+                    }
+                }
+            }
+        }
+
+    } else if (name === "list_account_assets") {
+        const search = (args.account_name || "").toLowerCase();
+        const match = Object.entries(GOOGLE_ACCOUNTS).find(([, i]) => i.name.toLowerCase().includes(search));
+        if (!match) {
+            result = { error: `No Google account matching '${args.account_name}'` };
+        } else {
+            const [cid, info] = match;
+            const { token, error: authErr } = await getGoogleAccessToken();
+            if (authErr) { result = { error: `Auth: ${authErr}` }; }
+            else {
+                try {
+                    const assets = await listAccountAssets(token, cid, info.mcc, args.asset_types || null);
+                    result = { account: info.name, total: assets.length, assets };
+                } catch (e) { result = { error: e.message }; }
+            }
+        }
+
+    } else if (name === "create_pmax_campaign") {
+        const search  = (args.account_name || "").toLowerCase();
+        const confirm = !!args.confirm;
+
+        // Validate minimums
+        const hCount  = args.headlines?.length || 0;
+        const lhCount = args.long_headlines?.length || 0;
+        const dCount  = args.descriptions?.length || 0;
+        const miCount = args.marketing_images?.length || 0;
+        const siCount = args.square_marketing_images?.length || 0;
+
+        if (hCount < 3)  { result = { error: `Need at least 3 headlines (got ${hCount}). Max 30 chars each.` }; }
+        else if (lhCount < 1) { result = { error: `Need at least 1 long headline (got ${lhCount}). Max 90 chars each.` }; }
+        else if (dCount < 2)  { result = { error: `Need at least 2 descriptions (got ${dCount}). Max 90 chars each.` }; }
+        else if (miCount < 1) { result = { error: `Need at least 1 marketing image — landscape 1.91:1 (got ${miCount}). Use list_account_assets to find existing images.` }; }
+        else if (siCount < 1) { result = { error: `Need at least 1 square marketing image — 1:1 (got ${siCount}). Use list_account_assets to find existing images.` }; }
+        else if (!args.business_name_asset) { result = { error: "business_name_asset (resource name of text asset) is required." }; }
+        else if (!args.logo_asset) { result = { error: "logo_asset (resource name of image asset) is required." }; }
+        else if (!args.final_url) { result = { error: "final_url is required." }; }
+        else if (!args.geo_targets?.length) { result = { error: "At least one geo_target is required." }; }
+        else {
+            const match = Object.entries(GOOGLE_ACCOUNTS).find(([, i]) => i.name.toLowerCase().includes(search));
+            if (!match) {
+                result = { error: `No Google account matching '${args.account_name}'` };
+            } else {
+                const [cid, info] = match;
+                const { token, error: authErr } = await getGoogleAccessToken();
+                if (authErr) { result = { error: `Auth: ${authErr}` }; }
+                else {
+                    const config = {
+                        campaign_name:          args.campaign_name,
+                        daily_budget:           args.daily_budget,
+                        bidding_strategy:       args.bidding_strategy || "MAXIMIZE_CONVERSIONS",
+                        final_url:              args.final_url,
+                        geo_targets:            args.geo_targets,
+                        business_name_asset:    args.business_name_asset,
+                        logo_asset:             args.logo_asset,
+                        asset_group_name:       args.asset_group_name || args.campaign_name,
+                        headlines:              args.headlines,
+                        long_headlines:         args.long_headlines,
+                        descriptions:           args.descriptions,
+                        marketing_images:       args.marketing_images,
+                        square_marketing_images: args.square_marketing_images,
+                        logo_assets:            args.logo_assets || [],
+                        youtube_videos:         args.youtube_videos || [],
+                    };
+
+                    if (!confirm) {
+                        result = {
+                            dry_run: true,
+                            message: "DRY RUN — set confirm=true to create. Campaign will start PAUSED.",
+                            account: info.name,
+                            planned_campaign: {
+                                name:             config.campaign_name,
+                                type:             "PERFORMANCE_MAX",
+                                daily_budget:     "$" + config.daily_budget.toFixed(2),
+                                bidding_strategy: config.bidding_strategy,
+                                final_url:        config.final_url,
+                                language:         "English",
+                                geo_targets:      config.geo_targets.map(id => `geoTargetConstants/${id}`),
+                                status:           "PAUSED (default for new campaigns)",
+                                business_name:    config.business_name_asset,
+                                logo:             config.logo_asset,
+                                asset_group:      config.asset_group_name,
+                                headlines:        config.headlines.map(h => h.text),
+                                long_headlines:   config.long_headlines.map(h => h.text),
+                                descriptions:     config.descriptions.map(d => d.text),
+                                marketing_images: config.marketing_images.length,
+                                square_images:    config.square_marketing_images.length,
+                                youtube_videos:   config.youtube_videos.length,
+                            },
+                        };
+                    } else {
+                        try {
+                            const res = await createPmaxCampaignFull(token, cid, info.mcc, config);
+                            result = {
+                                success: true,
+                                account:              info.name,
+                                campaign_name:        config.campaign_name,
+                                campaign_resource:    res.campaign_resource,
+                                budget_resource:      res.budget_resource,
+                                asset_group_resource: res.asset_group_resource,
+                                total_ops:            res.total_ops,
+                                status:               "PAUSED — review in Google Ads before enabling",
                             };
                         } catch (e) { result = { error: e.message }; }
                     }
