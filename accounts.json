@@ -122,7 +122,8 @@
     "6754409854": {
       "name": "Axis Office",
       "budget": 10000,
-      "mcc": "7631184147"
+      "mcc": "7631184147",
+      "health": false
     }
   },
   "meta": {
@@ -154,6 +155,12 @@
       "budget": 1445,
       "flight_start": "2026-05-25",
       "flight_end": "2026-06-05"
+    },
+    "act_1172134603935325": {
+      "name": "FAMU Online",
+      "budget": 2900,
+      "flight_start": "2026-07-01",
+      "flight_end": "2026-09-30"
     }
   },
   "stackadapt": {
