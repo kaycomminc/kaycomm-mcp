@@ -2435,6 +2435,7 @@ async function getAdGroupAds(token, customerId, mccId, campaignSearch, adGroupSe
     const rows = await googleSearch(token, customerId, mccId, `
         SELECT
             ad_group_ad.ad.resource_name,
+            ad_group_ad.ad.final_urls,
             ad_group_ad.ad.responsive_search_ad.headlines,
             ad_group_ad.ad.responsive_search_ad.descriptions,
             ad_group.name,
@@ -2449,6 +2450,7 @@ async function getAdGroupAds(token, customerId, mccId, campaignSearch, adGroupSe
         resource_name: r.adGroupAd.ad.resourceName,
         campaign:      r.campaign.name,
         ad_group:      r.adGroup.name,
+        final_urls:    r.adGroupAd.ad.finalUrls || [],
         headlines:     (r.adGroupAd.ad.responsiveSearchAd?.headlines || []).map(h => ({ text: h.text, pinned: h.pinnedField || null })),
         descriptions:  (r.adGroupAd.ad.responsiveSearchAd?.descriptions || []).map(d => ({ text: d.text, pinned: d.pinnedField || null })),
     }));
@@ -2478,6 +2480,35 @@ async function updateRSA(token, customerId, mccId, adResourceName, headlines, de
                             },
                         },
                         updateMask: "ad.responsive_search_ad.headlines,ad.responsive_search_ad.descriptions",
+                    },
+                }],
+            }),
+        }
+    );
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(googleAdsError(data));
+    return data;
+}
+
+async function updateAdFinalUrl(token, customerId, mccId, adResourceName, finalUrl) {
+    const resp = await fetchFn(
+        `https://googleads.googleapis.com/${GOOGLE_API_VERSION}/customers/${customerId}/googleAds:mutate`,
+        {
+            method: "POST",
+            headers: {
+                "Authorization":     `Bearer ${token}`,
+                "developer-token":   GOOGLE_DEVELOPER_TOKEN,
+                "login-customer-id": mccId,
+                "Content-Type":      "application/json",
+            },
+            body: JSON.stringify({
+                mutateOperations: [{
+                    adGroupAdOperation: {
+                        update: {
+                            resourceName: adResourceName,
+                            ad: { finalUrls: [finalUrl] },
+                        },
+                        updateMask: "ad.final_urls",
                     },
                 }],
             }),
@@ -3579,6 +3610,23 @@ function makeServer() {
                         },
                     },
                     confirm: { type: "boolean", description: "Set true to apply changes. Omit for dry run / preview." },
+                },
+                required: ["account_name", "campaign_name"],
+            },
+        },
+        {
+            name: "update_ad_url",
+            description: "View or update the Final URL on responsive search ads in a Google Ads campaign. " +
+                "Omit final_url to preview current URLs. Provide a new URL to update. " +
+                "Dry run by default — set confirm=true to apply.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    account_name:  { type: "string", description: "Client name (partial match ok)" },
+                    campaign_name: { type: "string", description: "Campaign name (partial match ok)" },
+                    ad_group_name: { type: "string", description: "Ad group name (partial match ok). Omit to search entire campaign." },
+                    final_url:     { type: "string", description: "New Final URL to set on the ad(s)" },
+                    confirm:       { type: "boolean", description: "Set true to apply. Omit for dry run / preview." },
                 },
                 required: ["account_name", "campaign_name"],
             },
@@ -5508,6 +5556,61 @@ async function handleToolCall(name, args = {}) {
                                 descriptions_set: descs.length,
                             };
                         }
+                    }
+                } catch (e) { result = { error: e.message }; }
+            }
+        }
+
+    } else if (name === "update_ad_url") {
+        const search     = (args.account_name || "").toLowerCase();
+        const campSearch = (args.campaign_name || "").toLowerCase();
+        const agSearch   = args.ad_group_name ? args.ad_group_name.toLowerCase() : null;
+        const confirm    = !!args.confirm;
+        const newUrl     = args.final_url || null;
+
+        const match = Object.entries(GOOGLE_ACCOUNTS).find(([, i]) => i.name.toLowerCase().includes(search));
+        if (!match) {
+            result = { error: `No Google account matching '${args.account_name}'` };
+        } else {
+            const [cid, info] = match;
+            const { token, error: authErr } = await getGoogleAccessToken();
+            if (authErr) { result = { error: `Auth: ${authErr}` }; }
+            else {
+                try {
+                    const ads = await getAdGroupAds(token, cid, info.mcc, campSearch, agSearch);
+                    if (!ads.length) {
+                        result = { error: `No responsive search ads found for campaign '${args.campaign_name}'${agSearch ? ` / ad group '${args.ad_group_name}'` : ""}` };
+                    } else if (!newUrl) {
+                        result = {
+                            account: info.name,
+                            message: "Current ad URLs — provide final_url to update",
+                            ads: ads.map(a => ({ resource_name: a.resource_name, campaign: a.campaign, ad_group: a.ad_group, final_urls: a.final_urls })),
+                        };
+                    } else if (!confirm) {
+                        result = {
+                            dry_run: true,
+                            message: "DRY RUN — set confirm=true to apply",
+                            account: info.name,
+                            ads_to_update: ads.map(a => ({
+                                resource_name: a.resource_name,
+                                campaign:      a.campaign,
+                                ad_group:      a.ad_group,
+                                current_urls:  a.final_urls,
+                                new_url:       newUrl,
+                            })),
+                        };
+                    } else {
+                        let updated = 0;
+                        for (const ad of ads) {
+                            await updateAdFinalUrl(token, cid, info.mcc, ad.resource_name, newUrl);
+                            updated++;
+                        }
+                        result = {
+                            success: true,
+                            account:      info.name,
+                            ads_updated:  updated,
+                            new_url:      newUrl,
+                        };
                     }
                 } catch (e) { result = { error: e.message }; }
             }
