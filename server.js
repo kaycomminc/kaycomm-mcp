@@ -2349,7 +2349,6 @@ async function createGoogleCampaignFull(token, customerId, mccId, config) {
                 },
                 geoTargetTypeSetting: {
                     positiveGeoTargetType: "PRESENCE",
-                    negativeGeoTargetType: "PRESENCE_OR_INTEREST",
                 },
                 containsEuPoliticalAdvertising: "DOES_NOT_CONTAIN_EU_POLITICAL_ADVERTISING",
                 ...biddingFields,
