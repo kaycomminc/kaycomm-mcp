@@ -2307,10 +2307,11 @@ async function createGoogleCampaignFull(token, customerId, mccId, config) {
     mutateOperations.push({
         campaignBudgetOperation: {
             create: {
-                resourceName:   budgetTempName,
-                name:           `${config.campaign_name} Budget`,
-                amountMicros:   String(Math.round(config.daily_budget * 1_000_000)),
-                deliveryMethod: "STANDARD",
+                resourceName:    budgetTempName,
+                name:            `${config.campaign_name} Budget`,
+                amountMicros:    String(Math.round(config.daily_budget * 1_000_000)),
+                deliveryMethod:  "STANDARD",
+                explicitlyShared: false,
             },
         },
     });
