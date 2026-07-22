@@ -2343,8 +2343,12 @@ async function createGoogleCampaignFull(token, customerId, mccId, config) {
                 campaignBudget:          budgetTempName,
                 networkSettings: {
                     targetGoogleSearch:  true,
-                    targetSearchNetwork: true,
+                    targetSearchNetwork: false,
                     targetContentNetwork: false,
+                },
+                geoTargetTypeSetting: {
+                    positiveGeoTargetType: "PRESENCE",
+                    negativeGeoTargetType: "PRESENCE_OR_INTEREST",
                 },
                 containsEuPoliticalAdvertising: 2,
                 ...biddingFields,
@@ -2378,6 +2382,28 @@ async function createGoogleCampaignFull(token, customerId, mccId, config) {
                 },
             });
         }
+    }
+
+    // Language targeting: English
+    mutateOperations.push({
+        campaignCriterionOperation: {
+            create: {
+                campaign: campaignTempName,
+                language: { languageConstant: "languageConstants/1000" },
+            },
+        },
+    });
+
+    // Geo targeting
+    for (const geoId of (config.geo_targets || [])) {
+        mutateOperations.push({
+            campaignCriterionOperation: {
+                create: {
+                    campaign: campaignTempName,
+                    location: { geoTargetConstant: `geoTargetConstants/${geoId}` },
+                },
+            },
+        });
     }
 
     const resp = await fetchFn(
@@ -3485,6 +3511,11 @@ function makeServer() {
                     daily_budget:      { type: "number", description: "Daily budget in dollars" },
                     campaign_type:     { type: "string", enum: ["SEARCH","DISPLAY","SHOPPING"], description: "Campaign type (default: SEARCH)" },
                     bidding_strategy:  { type: "string", enum: ["MANUAL_CPC","MAXIMIZE_CLICKS","MAXIMIZE_CONVERSIONS"], description: "Bidding strategy (default: MANUAL_CPC). For TARGET_CPA/TARGET_ROAS, create with MAXIMIZE_CONVERSIONS then switch via set_bidding_strategy." },
+                    geo_targets: {
+                        type: "array",
+                        description: "Geo target location IDs (required). Common: 2840=US, 2826=UK, 2124=Canada, 2036=Australia. Use keyword_research or Google's geo target docs for other IDs.",
+                        items: { type: "integer" },
+                    },
                     ad_groups: {
                         type: "array",
                         description: "Ad groups to create",
@@ -3509,7 +3540,7 @@ function makeServer() {
                     },
                     confirm: { type: "boolean", description: "Set true to actually create. Omit for dry run." },
                 },
-                required: ["account_name", "campaign_name", "daily_budget", "ad_groups"],
+                required: ["account_name", "campaign_name", "daily_budget", "ad_groups", "geo_targets"],
             },
         },
         {
@@ -5354,8 +5385,8 @@ async function handleToolCall(name, args = {}) {
         const search  = (args.account_name || "").toLowerCase();
         const confirm = !!args.confirm;
 
-        if (!args.campaign_name || !args.daily_budget || !args.ad_groups?.length) {
-            result = { error: "campaign_name, daily_budget, and at least one ad_group are required." };
+        if (!args.campaign_name || !args.daily_budget || !args.ad_groups?.length || !args.geo_targets?.length) {
+            result = { error: "campaign_name, daily_budget, at least one ad_group, and at least one geo_target are required." };
         } else {
             const match = Object.entries(GOOGLE_ACCOUNTS).find(([, i]) => i.name.toLowerCase().includes(search));
             if (!match) {
@@ -5370,6 +5401,7 @@ async function handleToolCall(name, args = {}) {
                         daily_budget:     args.daily_budget,
                         campaign_type:    args.campaign_type || "SEARCH",
                         bidding_strategy: args.bidding_strategy || "MANUAL_CPC",
+                        geo_targets:      args.geo_targets,
                         ad_groups:        args.ad_groups,
                     };
 
@@ -5386,6 +5418,10 @@ async function handleToolCall(name, args = {}) {
                                 daily_budget:     "$" + config.daily_budget.toFixed(2),
                                 bidding_strategy: config.bidding_strategy,
                                 status:           "PAUSED (default for new campaigns)",
+                                language:         "English",
+                                geo_targets:      config.geo_targets.map(id => `geoTargetConstants/${id}`),
+                                geo_targeting:    "PRESENCE (people in your targeted locations)",
+                                search_partners:  "OFF",
                                 ad_groups:        config.ad_groups.map(ag => ({
                                     name:          ag.name,
                                     keyword_count: ag.keywords?.length || 0,
