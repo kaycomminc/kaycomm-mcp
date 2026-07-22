@@ -21,6 +21,13 @@
         "conversion_type": "sale"
       }
     },
+    "1766078295": {
+      "name": "Denver Parade of Homes",
+      "budget": 1000,
+      "mcc": "7631184147",
+      "flight_start": "2026-08-03",
+      "flight_end": "2026-08-26"
+    },
     "2275371078": {
       "name": "Childrens Therapy Services of Colorado",
       "budget": 1000,
