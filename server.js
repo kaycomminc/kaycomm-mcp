@@ -2346,6 +2346,7 @@ async function createGoogleCampaignFull(token, customerId, mccId, config) {
                     targetSearchNetwork: true,
                     targetContentNetwork: false,
                 },
+                containsEuPoliticalAdvertising: false,
                 ...biddingFields,
             },
         },
