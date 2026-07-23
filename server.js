@@ -4344,21 +4344,22 @@ function makeServer() {
             name: "upload_meta_media",
             description: "Upload images or videos to a Meta ad account's Media Library. " +
                 "Returns image hashes or video IDs for use in create_meta_campaign. " +
-                "Supports local file paths and public URLs. Dry run by default — set confirm=true to upload.",
+                "Supports local file paths, public URLs, and base64 data (for drag-and-drop into chat). " +
+                "Dry run by default — set confirm=true to upload.",
             inputSchema: {
                 type: "object",
                 properties: {
                     account_name: { type: "string", description: "Client name (partial match ok)" },
                     files: {
                         type: "array",
-                        description: "Files to upload. Each needs a source (local path or URL) and optional name.",
+                        description: "Files to upload. Provide source (path/URL) OR base64_data (for images dragged into chat).",
                         items: {
                             type: "object",
                             properties: {
-                                source: { type: "string", description: "Local file path or public URL. Images: jpg/jpeg/png/gif/bmp/tiff. Videos: mp4/mov/avi/wmv/flv/mkv/webm." },
-                                name:   { type: "string", description: "Display name in Media Library. Defaults to filename." },
+                                source:      { type: "string", description: "Local file path or public URL. Images: jpg/jpeg/png/gif/bmp/tiff. Videos: mp4/mov/avi/wmv/flv/mkv/webm." },
+                                base64_data: { type: "string", description: "Base64-encoded file content. Use when a file is dragged into chat — Claude encodes it and passes it here. Must also provide name with extension." },
+                                name:        { type: "string", description: "Display name in Media Library (with extension). Required when using base64_data, optional for source." },
                             },
-                            required: ["source"],
                         },
                     },
                     confirm: { type: "boolean", description: "Set true to upload. Omit for dry run (validates files and formats)." },
@@ -6500,18 +6501,33 @@ async function handleToolCall(name, args = {}) {
                     const fileMeta = [];
                     const errors = [];
                     for (const f of args.files) {
-                        const isUrl = f.source.startsWith("http://") || f.source.startsWith("https://");
-                        const ext = path.extname(f.source).replace(".", "").toLowerCase();
+                        const isBase64 = !!f.base64_data;
+                        const isUrl = !isBase64 && f.source && (f.source.startsWith("http://") || f.source.startsWith("https://"));
+                        const isLocal = !isBase64 && !isUrl;
+
+                        if (isBase64 && !f.name) {
+                            errors.push({ source: "(base64)", error: "name with file extension is required when using base64_data" });
+                            continue;
+                        }
+                        if (!isBase64 && !f.source) {
+                            errors.push({ source: "(missing)", error: "Either source or base64_data is required" });
+                            continue;
+                        }
+
+                        const nameSource = isBase64 ? f.name : f.source;
+                        const ext = path.extname(nameSource).replace(".", "").toLowerCase();
                         const displayName = f.name || path.basename(f.source);
                         const mediaType = IMAGE_EXTS.has(ext) ? "image" : VIDEO_EXTS.has(ext) ? "video" : null;
 
                         if (!mediaType) {
-                            errors.push({ source: f.source, error: `Unsupported format '.${ext}'. Images: ${[...IMAGE_EXTS].join(", ")}. Videos: ${[...VIDEO_EXTS].join(", ")}.` });
+                            errors.push({ source: nameSource, error: `Unsupported format '.${ext}'. Images: ${[...IMAGE_EXTS].join(", ")}. Videos: ${[...VIDEO_EXTS].join(", ")}.` });
                             continue;
                         }
 
                         let size = null;
-                        if (!isUrl) {
+                        if (isBase64) {
+                            size = Math.round(f.base64_data.length * 3 / 4);
+                        } else if (isLocal) {
                             const resolved = path.isAbsolute(f.source) ? f.source : path.resolve(f.source);
                             if (!fs.existsSync(resolved)) {
                                 errors.push({ source: f.source, error: "File not found" });
@@ -6522,10 +6538,12 @@ async function handleToolCall(name, args = {}) {
                         }
 
                         fileMeta.push({
-                            source: f.source,
+                            source: f.source || "(base64)",
                             name: displayName,
                             type: mediaType,
                             isUrl,
+                            isBase64,
+                            base64_data: isBase64 ? f.base64_data : null,
                             size,
                             sizeLabel: size ? (size > 1048576 ? `${(size / 1048576).toFixed(1)} MB` : `${(size / 1024).toFixed(0)} KB`) : "(URL)",
                         });
@@ -6545,6 +6563,16 @@ async function handleToolCall(name, args = {}) {
                         const uploaded = [];
                         const failed = [];
 
+                        // Helper: get a Buffer from base64, local path, or null (for URL uploads)
+                        function getFileBuffer(f) {
+                            if (f.isBase64) return Buffer.from(f.base64_data, "base64");
+                            if (!f.isUrl) {
+                                const resolved = path.isAbsolute(f.source) ? f.source : path.resolve(f.source);
+                                return fs.readFileSync(resolved);
+                            }
+                            return null;
+                        }
+
                         for (const f of fileMeta) {
                             try {
                                 if (f.type === "image") {
@@ -6553,8 +6581,7 @@ async function handleToolCall(name, args = {}) {
                                         const imgData = res.images ? Object.values(res.images)[0] : res;
                                         uploaded.push({ name: f.name, type: "image", image_hash: imgData.hash, status: "ready" });
                                     } else {
-                                        const resolved = path.isAbsolute(f.source) ? f.source : path.resolve(f.source);
-                                        const fileBuffer = fs.readFileSync(resolved);
+                                        const fileBuffer = getFileBuffer(f);
                                         const blob = new Blob([fileBuffer]);
                                         const formData = new FormData();
                                         formData.append("access_token", META_ACCESS_TOKEN);
@@ -6574,8 +6601,7 @@ async function handleToolCall(name, args = {}) {
                                         const res = await metaPost(`${accountId}/advideos`, { file_url: f.source, title: f.name });
                                         videoId = res.id;
                                     } else {
-                                        const resolved = path.isAbsolute(f.source) ? f.source : path.resolve(f.source);
-                                        const fileBuffer = fs.readFileSync(resolved);
+                                        const fileBuffer = getFileBuffer(f);
                                         const blob = new Blob([fileBuffer]);
                                         const formData = new FormData();
                                         formData.append("access_token", META_ACCESS_TOKEN);
