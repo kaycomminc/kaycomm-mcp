@@ -670,13 +670,27 @@ async function metaGet(path, extraParams = {}) {
 }
 
 async function metaPost(path, body = {}) {
-    const resp = await fetchFn(`https://graph.facebook.com/${META_API_VERSION}/${path}`, {
+    const url = `https://graph.facebook.com/${META_API_VERSION}/${path}`;
+    const payload = { access_token: META_ACCESS_TOKEN, ...body };
+    const resp = await fetchFn(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ access_token: META_ACCESS_TOKEN, ...body }),
+        body: JSON.stringify(payload),
     });
     const data = await resp.json();
-    if (data.error) throw new Error(data.error.message);
+    if (data.error) {
+        const e = data.error;
+        const parts = [e.message];
+        if (e.error_user_msg) parts.push(`Detail: ${e.error_user_msg}`);
+        if (e.error_user_title) parts.push(`Title: ${e.error_user_title}`);
+        if (e.type) parts.push(`Type: ${e.type}`);
+        if (e.code) parts.push(`Code: ${e.code}`);
+        if (e.error_subcode) parts.push(`Subcode: ${e.error_subcode}`);
+        const err = new Error(parts.join(" | "));
+        err.metaPath = path;
+        err.metaBody = Object.fromEntries(Object.entries(payload).filter(([k]) => k !== "access_token"));
+        throw err;
+    }
     return data;
 }
 
@@ -845,20 +859,27 @@ async function buildMetaTargetingSpec(targeting) {
 }
 
 async function createMetaCampaignFull(accountId, pageId, config) {
-    const results = { campaign: null, ad_sets: [] };
+    const results = { campaign: null, ad_sets: [], debug: [] };
 
-    // Step 1: Create campaign
-    const campaignBody = {
-        name: config.campaign_name,
-        objective: config.objective,
-        status: "PAUSED",
-        special_ad_categories: "[]",
-    };
-    if (config.cbo) {
-        campaignBody.daily_budget = Math.round(config.daily_budget * 100);
+    try {
+        // Step 1: Create campaign
+        const campaignBody = {
+            name: config.campaign_name,
+            objective: config.objective,
+            status: "PAUSED",
+            special_ad_categories: [],
+        };
+        if (config.cbo) {
+            campaignBody.daily_budget = Math.round(config.daily_budget * 100);
+        }
+        results.debug.push({ step: "campaign", body: campaignBody });
+        const campRes = await metaPost(`${accountId}/campaigns`, campaignBody);
+        results.campaign = { id: campRes.id, name: config.campaign_name };
+    } catch (e) {
+        e.message = `Campaign creation failed: ${e.message}`;
+        if (e.metaBody) e.message += ` | Request body: ${JSON.stringify(e.metaBody)}`;
+        throw e;
     }
-    const campRes = await metaPost(`${accountId}/campaigns`, campaignBody);
-    results.campaign = { id: campRes.id, name: config.campaign_name };
 
     // Step 2: Create ad sets + ads
     for (const adSetDef of (config.ad_sets || [])) {
@@ -866,12 +887,12 @@ async function createMetaCampaignFull(accountId, pageId, config) {
 
         const adSetBody = {
             name: adSetDef.name,
-            campaign_id: campRes.id,
+            campaign_id: results.campaign.id,
             status: "PAUSED",
             optimization_goal: adSetDef.optimization_goal || "LINK_CLICKS",
             billing_event: adSetDef.billing_event || "IMPRESSIONS",
             bid_strategy: "LOWEST_COST_WITHOUT_CAP",
-            targeting: JSON.stringify(targetingSpec),
+            targeting: targetingSpec,
         };
         if (!config.cbo && adSetDef.daily_budget) {
             adSetBody.daily_budget = Math.round(adSetDef.daily_budget * 100);
@@ -879,12 +900,19 @@ async function createMetaCampaignFull(accountId, pageId, config) {
         if (adSetDef.start_time) adSetBody.start_time = adSetDef.start_time;
         if (adSetDef.end_time) adSetBody.end_time = adSetDef.end_time;
 
-        const adSetRes = await metaPost(`${accountId}/adsets`, adSetBody);
+        let adSetRes;
+        try {
+            results.debug.push({ step: "adset", name: adSetDef.name, body: adSetBody });
+            adSetRes = await metaPost(`${accountId}/adsets`, adSetBody);
+        } catch (e) {
+            e.message = `Ad set "${adSetDef.name}" creation failed: ${e.message}`;
+            if (e.metaBody) e.message += ` | Request body: ${JSON.stringify(e.metaBody)}`;
+            throw e;
+        }
         const adSetResult = { name: adSetDef.name, id: adSetRes.id, ads: [] };
 
         // Step 3: Create ads (creative + ad for each)
         for (const adDef of (adSetDef.ads || [])) {
-            // Build creative
             let storySpec;
             if (adDef.video_id) {
                 storySpec = {
@@ -917,19 +945,27 @@ async function createMetaCampaignFull(accountId, pageId, config) {
                 if (adDef.image_hash) storySpec.link_data.image_hash = adDef.image_hash;
             }
 
-            const creativeRes = await metaPost(`${accountId}/adcreatives`, {
-                name: `${adDef.name} Creative`,
-                object_story_spec: JSON.stringify(storySpec),
-            });
+            let creativeRes;
+            try {
+                const creativeBody = { name: `${adDef.name} Creative`, object_story_spec: storySpec };
+                results.debug.push({ step: "creative", name: adDef.name, body: creativeBody });
+                creativeRes = await metaPost(`${accountId}/adcreatives`, creativeBody);
+            } catch (e) {
+                e.message = `Creative "${adDef.name}" creation failed: ${e.message}`;
+                if (e.metaBody) e.message += ` | Request body: ${JSON.stringify(e.metaBody)}`;
+                throw e;
+            }
 
-            const adRes = await metaPost(`${accountId}/ads`, {
-                name: adDef.name,
-                adset_id: adSetRes.id,
-                creative: JSON.stringify({ creative_id: creativeRes.id }),
-                status: "PAUSED",
-            });
-
-            adSetResult.ads.push({ name: adDef.name, ad_id: adRes.id, creative_id: creativeRes.id });
+            try {
+                const adBody = { name: adDef.name, adset_id: adSetRes.id, creative: { creative_id: creativeRes.id }, status: "PAUSED" };
+                results.debug.push({ step: "ad", name: adDef.name, body: adBody });
+                const adRes = await metaPost(`${accountId}/ads`, adBody);
+                adSetResult.ads.push({ name: adDef.name, ad_id: adRes.id, creative_id: creativeRes.id });
+            } catch (e) {
+                e.message = `Ad "${adDef.name}" creation failed: ${e.message}`;
+                if (e.metaBody) e.message += ` | Request body: ${JSON.stringify(e.metaBody)}`;
+                throw e;
+            }
         }
 
         results.ad_sets.push(adSetResult);
