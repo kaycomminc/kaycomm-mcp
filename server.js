@@ -734,6 +734,209 @@ async function getMetaAdsets(accountId) {
     }));
 }
 
+// ── Meta Campaign Creation Helpers ───────────────────────────────────────────
+
+async function metaSearchGeo(query) {
+    return metaGet("search", { type: "adgeolocation", q: query, location_types: '["city"]' });
+}
+
+async function metaSearchInterests(query) {
+    const data = await metaGet("search", { type: "adinterest", q: query });
+    return (data.data || data || []).map(i => ({
+        id: i.id, name: i.name,
+        audience_size_lower_bound: i.audience_size_lower_bound,
+        audience_size_upper_bound: i.audience_size_upper_bound,
+        path: i.path, topic: i.topic,
+    }));
+}
+
+async function metaSearchBehaviors(query) {
+    const data = await metaGet("search", { type: "adTargetingCategory", class: "behaviors", q: query });
+    return (data.data || data || []).map(b => ({
+        id: b.id, name: b.name,
+        audience_size_lower_bound: b.audience_size_lower_bound,
+        audience_size_upper_bound: b.audience_size_upper_bound,
+    }));
+}
+
+async function resolveMetaInterestsByName(names) {
+    const resolved = [];
+    const unresolved = [];
+    for (const name of (names || [])) {
+        const results = await metaSearchInterests(name);
+        const match = results.find(r => r.name.toLowerCase() === name.toLowerCase()) || results[0];
+        if (match) resolved.push({ id: match.id, name: match.name });
+        else unresolved.push(name);
+    }
+    return { resolved, unresolved };
+}
+
+async function resolveMetaBehaviorsByName(names) {
+    const resolved = [];
+    const unresolved = [];
+    for (const name of (names || [])) {
+        const results = await metaSearchBehaviors(name);
+        const match = results.find(r => r.name.toLowerCase() === name.toLowerCase()) || results[0];
+        if (match) resolved.push({ id: match.id, name: match.name });
+        else unresolved.push(name);
+    }
+    return { resolved, unresolved };
+}
+
+async function buildMetaTargetingSpec(targeting) {
+    const spec = {};
+    const warnings = [];
+
+    // Geo targeting
+    if (targeting.geo_raw) {
+        spec.geo_locations = targeting.geo_raw;
+    } else if (targeting.geo) {
+        const geoResult = await metaSearchGeo(targeting.geo);
+        const cities = geoResult.data || geoResult || [];
+        if (cities.length === 0) {
+            warnings.push(`No geo results for '${targeting.geo}'`);
+        } else {
+            const city = cities[0];
+            spec.geo_locations = {
+                cities: [{
+                    key: city.key,
+                    radius: targeting.geo_radius || 25,
+                    distance_unit: "mile",
+                }],
+            };
+        }
+    }
+
+    // Age
+    if (targeting.age_min) spec.age_min = targeting.age_min;
+    if (targeting.age_max) spec.age_max = targeting.age_max;
+
+    // Interests + behaviors → flexible_spec
+    const flexSpec = {};
+    if (targeting.interests?.length) {
+        const { resolved, unresolved } = await resolveMetaInterestsByName(targeting.interests);
+        if (unresolved.length) warnings.push(`Could not resolve interests: ${unresolved.join(", ")}`);
+        if (resolved.length) flexSpec.interests = resolved;
+    }
+    if (targeting.behaviors?.length) {
+        const { resolved, unresolved } = await resolveMetaBehaviorsByName(targeting.behaviors);
+        if (unresolved.length) warnings.push(`Could not resolve behaviors: ${unresolved.join(", ")}`);
+        if (resolved.length) flexSpec.behaviors = resolved;
+    }
+    if (Object.keys(flexSpec).length) spec.flexible_spec = [flexSpec];
+
+    // Custom audiences
+    if (targeting.custom_audiences?.length) {
+        spec.custom_audiences = targeting.custom_audiences.map(id => ({ id }));
+    }
+    if (targeting.excluded_audiences?.length) {
+        spec.exclusions = { custom_audiences: targeting.excluded_audiences.map(id => ({ id })) };
+    }
+
+    // Placements (omit for Advantage+)
+    if (targeting.placements === "manual") {
+        if (targeting.publisher_platforms) spec.publisher_platforms = targeting.publisher_platforms;
+        if (targeting.facebook_positions) spec.facebook_positions = targeting.facebook_positions;
+        if (targeting.instagram_positions) spec.instagram_positions = targeting.instagram_positions;
+    }
+
+    return { spec, warnings };
+}
+
+async function createMetaCampaignFull(accountId, pageId, config) {
+    const results = { campaign: null, ad_sets: [] };
+
+    // Step 1: Create campaign
+    const campaignBody = {
+        name: config.campaign_name,
+        objective: config.objective,
+        status: "PAUSED",
+        special_ad_categories: "[]",
+    };
+    if (config.cbo) {
+        campaignBody.daily_budget = Math.round(config.daily_budget * 100);
+    }
+    const campRes = await metaPost(`${accountId}/campaigns`, campaignBody);
+    results.campaign = { id: campRes.id, name: config.campaign_name };
+
+    // Step 2: Create ad sets + ads
+    for (const adSetDef of (config.ad_sets || [])) {
+        const { spec: targetingSpec } = await buildMetaTargetingSpec(adSetDef.targeting || {});
+
+        const adSetBody = {
+            name: adSetDef.name,
+            campaign_id: campRes.id,
+            status: "PAUSED",
+            optimization_goal: adSetDef.optimization_goal || "LINK_CLICKS",
+            billing_event: adSetDef.billing_event || "IMPRESSIONS",
+            bid_strategy: "LOWEST_COST_WITHOUT_CAP",
+            targeting: JSON.stringify(targetingSpec),
+        };
+        if (!config.cbo && adSetDef.daily_budget) {
+            adSetBody.daily_budget = Math.round(adSetDef.daily_budget * 100);
+        }
+        if (adSetDef.start_time) adSetBody.start_time = adSetDef.start_time;
+        if (adSetDef.end_time) adSetBody.end_time = adSetDef.end_time;
+
+        const adSetRes = await metaPost(`${accountId}/adsets`, adSetBody);
+        const adSetResult = { name: adSetDef.name, id: adSetRes.id, ads: [] };
+
+        // Step 3: Create ads (creative + ad for each)
+        for (const adDef of (adSetDef.ads || [])) {
+            // Build creative
+            let storySpec;
+            if (adDef.video_id) {
+                storySpec = {
+                    page_id: pageId,
+                    video_data: {
+                        message: adDef.primary_text,
+                        video_id: adDef.video_id,
+                        title: adDef.headline,
+                        link_description: adDef.description || "",
+                        call_to_action: {
+                            type: adDef.cta || "LEARN_MORE",
+                            value: { link: adDef.url },
+                        },
+                    },
+                };
+            } else {
+                storySpec = {
+                    page_id: pageId,
+                    link_data: {
+                        message: adDef.primary_text,
+                        link: adDef.url,
+                        name: adDef.headline,
+                        description: adDef.description || "",
+                        call_to_action: {
+                            type: adDef.cta || "LEARN_MORE",
+                            value: { link: adDef.url },
+                        },
+                    },
+                };
+                if (adDef.image_hash) storySpec.link_data.image_hash = adDef.image_hash;
+            }
+
+            const creativeRes = await metaPost(`${accountId}/adcreatives`, {
+                name: `${adDef.name} Creative`,
+                object_story_spec: JSON.stringify(storySpec),
+            });
+
+            const adRes = await metaPost(`${accountId}/ads`, {
+                name: adDef.name,
+                adset_id: adSetRes.id,
+                creative: JSON.stringify({ creative_id: creativeRes.id }),
+                status: "PAUSED",
+            });
+
+            adSetResult.ads.push({ name: adDef.name, ad_id: adRes.id, creative_id: creativeRes.id });
+        }
+
+        results.ad_sets.push(adSetResult);
+    }
+
+    return results;
+}
+
 // ── Google Analytics 4 ───────────────────────────────────────────────────────
 function getGA4DateRange(range) {
     const { today, month_start } = getDateInfo();
@@ -4123,6 +4326,134 @@ function makeServer() {
                 required: [],
             },
         },
+        {
+            name: "list_meta_media",
+            description: "List images and videos uploaded to a Meta ad account's Media Library. " +
+                "Use to find image hashes or video IDs needed for create_meta_campaign.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    account_name: { type: "string", description: "Meta account name (partial match ok)" },
+                    media_type:   { type: "string", enum: ["image", "video", "both"], description: "Filter by media type (default: both)" },
+                    name_filter:  { type: "string", description: "Filter by filename (partial match, optional)" },
+                },
+                required: ["account_name"],
+            },
+        },
+        {
+            name: "search_meta_interests",
+            description: "Search Meta's interest targeting options by keyword. Returns IDs needed for targeting specs in create_meta_campaign.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    query: { type: "string", description: "Interest keyword to search (e.g. 'interior design', 'real estate')" },
+                },
+                required: ["query"],
+            },
+        },
+        {
+            name: "list_meta_audiences",
+            description: "List custom audiences in a Meta ad account. Use to find audience IDs for retargeting or exclusions in create_meta_campaign.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    account_name: { type: "string", description: "Meta account name (partial match ok)" },
+                },
+                required: ["account_name"],
+            },
+        },
+        {
+            name: "create_meta_campaign",
+            description: "Create a new Meta Ads campaign with ad sets and ads in one step. " +
+                "All objects are created PAUSED for review. Dry run by default — set confirm=true to build. " +
+                "Use list_meta_media to find image hashes / video IDs, search_meta_interests for targeting IDs, " +
+                "and list_meta_audiences for retargeting / exclusion audience IDs.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    account_name:  { type: "string", description: "Client name (partial match ok)" },
+                    campaign_name: { type: "string", description: "Name for the new campaign" },
+                    objective: {
+                        type: "string",
+                        enum: ["OUTCOME_TRAFFIC", "OUTCOME_LEADS", "OUTCOME_AWARENESS", "OUTCOME_ENGAGEMENT", "OUTCOME_SALES"],
+                        description: "Campaign objective. Most common: OUTCOME_TRAFFIC for link clicks, OUTCOME_LEADS for lead gen.",
+                    },
+                    daily_budget: { type: "number", description: "Campaign daily budget in dollars (when using CBO). Converted to cents for the API." },
+                    cbo: { type: "boolean", description: "Campaign Budget Optimization (default: true). When true, budget is at campaign level. When false, set budgets per ad set." },
+                    ad_sets: {
+                        type: "array",
+                        description: "Ad sets to create inside the campaign",
+                        items: {
+                            type: "object",
+                            properties: {
+                                name:         { type: "string", description: "Ad set name" },
+                                daily_budget: { type: "number", description: "Ad set daily budget in dollars (only when CBO is off)" },
+                                optimization_goal: {
+                                    type: "string",
+                                    enum: ["LINK_CLICKS", "LANDING_PAGE_VIEWS", "IMPRESSIONS", "REACH", "LEAD_GENERATION", "OFFSITE_CONVERSIONS"],
+                                    description: "Optimization goal (default: LINK_CLICKS)",
+                                },
+                                billing_event: {
+                                    type: "string",
+                                    enum: ["IMPRESSIONS", "LINK_CLICKS"],
+                                    description: "Billing event (default: IMPRESSIONS)",
+                                },
+                                targeting: {
+                                    type: "object",
+                                    description: "Simplified targeting spec. Fields: geo (string like 'Denver, CO'), geo_radius (miles, default 25), " +
+                                        "age_min, age_max, interests (array of names), behaviors (array of names), " +
+                                        "custom_audiences (array of IDs), excluded_audiences (array of IDs), " +
+                                        "placements ('advantage_plus' or 'manual' — default: advantage_plus). " +
+                                        "For manual placements, also provide publisher_platforms, facebook_positions, instagram_positions arrays.",
+                                    properties: {
+                                        geo:          { type: "string", description: "Location name to target (e.g. 'Denver, CO', 'Miami, FL')" },
+                                        geo_radius:   { type: "number", description: "Radius in miles around geo location (default: 25)" },
+                                        geo_raw:      { type: "array", description: "Raw geo_locations spec (cities/regions/countries) — use instead of geo for complex targeting", items: { type: "object" } },
+                                        age_min:      { type: "number", description: "Minimum age (default: 18)" },
+                                        age_max:      { type: "number", description: "Maximum age (default: 65)" },
+                                        interests:    { type: "array", items: { type: "string" }, description: "Interest names — resolved to IDs via search" },
+                                        behaviors:    { type: "array", items: { type: "string" }, description: "Behavior names — resolved to IDs via search" },
+                                        custom_audiences:  { type: "array", items: { type: "string" }, description: "Custom audience IDs for targeting" },
+                                        excluded_audiences:{ type: "array", items: { type: "string" }, description: "Custom audience IDs to exclude" },
+                                        placements:        { type: "string", enum: ["advantage_plus", "manual"], description: "Placement strategy (default: advantage_plus)" },
+                                        publisher_platforms:  { type: "array", items: { type: "string" }, description: "For manual placements: ['facebook', 'instagram']" },
+                                        facebook_positions:  { type: "array", items: { type: "string" }, description: "For manual placements: ['feed', 'story', 'reels', etc.]" },
+                                        instagram_positions: { type: "array", items: { type: "string" }, description: "For manual placements: ['stream', 'story', 'reels', 'explore']" },
+                                    },
+                                },
+                                start_time: { type: "string", description: "ISO 8601 start time (optional)" },
+                                end_time:   { type: "string", description: "ISO 8601 end time (optional)" },
+                                ads: {
+                                    type: "array",
+                                    description: "Ads to create inside this ad set",
+                                    items: {
+                                        type: "object",
+                                        properties: {
+                                            name:         { type: "string", description: "Ad name" },
+                                            primary_text: { type: "string", description: "Main ad body text" },
+                                            headline:     { type: "string", description: "Headline shown below creative" },
+                                            description:  { type: "string", description: "Short description / link description" },
+                                            cta: {
+                                                type: "string",
+                                                enum: ["LEARN_MORE", "SHOP_NOW", "SIGN_UP", "BUY_TICKETS", "BOOK_NOW", "CONTACT_US", "GET_OFFER", "NO_BUTTON"],
+                                                description: "Call-to-action button (default: LEARN_MORE)",
+                                            },
+                                            url:        { type: "string", description: "Destination URL" },
+                                            image_hash: { type: "string", description: "Image hash from Media Library (use list_meta_media to find)" },
+                                            video_id:   { type: "string", description: "Video ID from Media Library (use list_meta_media to find)" },
+                                        },
+                                        required: ["name", "primary_text", "headline", "url"],
+                                    },
+                                },
+                            },
+                            required: ["name"],
+                        },
+                    },
+                    confirm: { type: "boolean", description: "Set true to create. Omit for dry-run preview." },
+                },
+                required: ["account_name", "campaign_name", "objective", "daily_budget", "ad_sets"],
+            },
+        },
     ],
     }));
 
@@ -6088,6 +6419,191 @@ async function handleToolCall(name, args = {}) {
                 }
             } catch (e) {
                 result = { error: e.message };
+            }
+        }
+
+    } else if (name === "list_meta_media") {
+        const search    = (args.account_name || "").toLowerCase();
+        const mediaType = args.media_type || "both";
+        const nameFilter = (args.name_filter || "").toLowerCase();
+
+        const acctMatch = Object.entries(META_ACCOUNTS).find(([, info]) => info.name.toLowerCase().includes(search));
+        if (!acctMatch) {
+            result = { error: `No Meta account found matching '${args.account_name}'. Available: ${Object.values(META_ACCOUNTS).map(a => a.name).join(", ")}` };
+        } else {
+            const [accountId, acctInfo] = acctMatch;
+            try {
+                const out = { account: acctInfo.name };
+                if (mediaType === "image" || mediaType === "both") {
+                    const images = await metaGetAll(`${accountId}/adimages`, {
+                        fields: "hash,name,url,width,height,created_time",
+                    });
+                    out.images = nameFilter
+                        ? images.filter(i => (i.name || "").toLowerCase().includes(nameFilter))
+                        : images;
+                }
+                if (mediaType === "video" || mediaType === "both") {
+                    const videos = await metaGetAll(`${accountId}/advideos`, {
+                        fields: "id,title,length,picture,created_time",
+                    });
+                    out.videos = nameFilter
+                        ? videos.filter(v => (v.title || "").toLowerCase().includes(nameFilter))
+                        : videos;
+                }
+                result = out;
+            } catch (e) {
+                result = { error: e.message };
+            }
+        }
+
+    } else if (name === "search_meta_interests") {
+        if (!args.query) {
+            result = { error: "query is required" };
+        } else {
+            try {
+                result = { interests: await metaSearchInterests(args.query) };
+            } catch (e) {
+                result = { error: e.message };
+            }
+        }
+
+    } else if (name === "list_meta_audiences") {
+        const search = (args.account_name || "").toLowerCase();
+        const acctMatch = Object.entries(META_ACCOUNTS).find(([, info]) => info.name.toLowerCase().includes(search));
+        if (!acctMatch) {
+            result = { error: `No Meta account found matching '${args.account_name}'. Available: ${Object.values(META_ACCOUNTS).map(a => a.name).join(", ")}` };
+        } else {
+            const [accountId, acctInfo] = acctMatch;
+            try {
+                const audiences = await metaGetAll(`${accountId}/customaudiences`, {
+                    fields: "id,name,approximate_count,subtype,description",
+                });
+                result = {
+                    account: acctInfo.name,
+                    audiences: audiences.map(a => ({
+                        id: a.id, name: a.name,
+                        approximate_count: a.approximate_count,
+                        subtype: a.subtype,
+                        description: a.description,
+                    })),
+                };
+            } catch (e) {
+                result = { error: e.message };
+            }
+        }
+
+    } else if (name === "create_meta_campaign") {
+        const search  = (args.account_name || "").toLowerCase();
+        const confirm = !!args.confirm;
+        const cbo     = args.cbo !== false;
+
+        if (!args.campaign_name || !args.objective || !args.daily_budget || !args.ad_sets?.length) {
+            result = { error: "campaign_name, objective, daily_budget, and at least one ad_set are required." };
+        } else if (args.daily_budget < 1) {
+            result = { error: "daily_budget must be at least $1.00 (Meta minimum)." };
+        } else {
+            const acctMatch = Object.entries(META_ACCOUNTS).find(([, info]) => info.name.toLowerCase().includes(search));
+            if (!acctMatch) {
+                result = { error: `No Meta account found matching '${args.account_name}'. Available: ${Object.values(META_ACCOUNTS).map(a => a.name).join(", ")}` };
+            } else {
+                const [accountId, acctInfo] = acctMatch;
+                const pageId = acctInfo.page_id;
+                if (!pageId) {
+                    result = { error: `No page_id configured for '${acctInfo.name}'. Add page_id to this account's entry in accounts.json.` };
+                } else {
+                    try {
+                        if (!confirm) {
+                            // Dry run — resolve targeting and build preview
+                            const adSetPreviews = [];
+                            const allWarnings = [];
+                            for (const adSetDef of args.ad_sets) {
+                                const { spec: targetingSpec, warnings } = await buildMetaTargetingSpec(adSetDef.targeting || {});
+                                allWarnings.push(...warnings);
+
+                                const targetingSummary = [];
+                                if (targetingSpec.geo_locations?.cities?.length) {
+                                    const c = targetingSpec.geo_locations.cities[0];
+                                    targetingSummary.push(`${adSetDef.targeting?.geo || `city key ${c.key}`} +${c.radius}mi`);
+                                }
+                                if (targetingSpec.age_min || targetingSpec.age_max) {
+                                    targetingSummary.push(`ages ${targetingSpec.age_min || 18}-${targetingSpec.age_max || 65}`);
+                                }
+                                if (targetingSpec.flexible_spec?.[0]?.interests?.length) {
+                                    targetingSummary.push(`interests: ${targetingSpec.flexible_spec[0].interests.map(i => i.name).join(", ")}`);
+                                }
+                                if (targetingSpec.flexible_spec?.[0]?.behaviors?.length) {
+                                    targetingSummary.push(`behaviors: ${targetingSpec.flexible_spec[0].behaviors.map(b => b.name).join(", ")}`);
+                                }
+                                if (targetingSpec.custom_audiences?.length) {
+                                    targetingSummary.push(`audiences: ${targetingSpec.custom_audiences.length} included`);
+                                }
+                                if (targetingSpec.exclusions?.custom_audiences?.length) {
+                                    targetingSummary.push(`exclusions: ${targetingSpec.exclusions.custom_audiences.length} excluded`);
+                                }
+                                const placementNote = (!adSetDef.targeting?.placements || adSetDef.targeting?.placements === "advantage_plus")
+                                    ? "Advantage+ (auto)" : "Manual";
+                                targetingSummary.push(`placements: ${placementNote}`);
+
+                                adSetPreviews.push({
+                                    name: adSetDef.name,
+                                    optimization_goal: adSetDef.optimization_goal || "LINK_CLICKS",
+                                    daily_budget: !cbo && adSetDef.daily_budget ? `$${adSetDef.daily_budget.toFixed(2)}` : "(CBO)",
+                                    targeting_summary: targetingSummary.join(". ") + ".",
+                                    start_time: adSetDef.start_time || null,
+                                    end_time: adSetDef.end_time || null,
+                                    ads: (adSetDef.ads || []).map(ad => ({
+                                        name: ad.name,
+                                        headline: ad.headline,
+                                        cta: ad.cta || "LEARN_MORE",
+                                        creative_type: ad.video_id ? "video" : "image",
+                                        image_hash: ad.image_hash || null,
+                                        video_id: ad.video_id || null,
+                                    })),
+                                });
+                            }
+
+                            result = {
+                                dry_run: true,
+                                message: "DRY RUN. Set confirm=true to create. All objects will be PAUSED.",
+                                account: acctInfo.name,
+                                page_id: pageId,
+                                planned: {
+                                    campaign: {
+                                        name: args.campaign_name,
+                                        objective: args.objective,
+                                        daily_budget: `$${args.daily_budget.toFixed(2)}`,
+                                        cbo,
+                                    },
+                                    ad_sets: adSetPreviews,
+                                },
+                            };
+                            if (allWarnings.length) result.warnings = allWarnings;
+                        } else {
+                            // Confirmed — create everything
+                            const config = {
+                                campaign_name: args.campaign_name,
+                                objective: args.objective,
+                                daily_budget: args.daily_budget,
+                                cbo,
+                                ad_sets: args.ad_sets,
+                            };
+                            const res = await createMetaCampaignFull(accountId, pageId, config);
+                            const totalAds = res.ad_sets.reduce((s, as) => s + as.ads.length, 0);
+                            result = {
+                                success: true,
+                                account: acctInfo.name,
+                                campaign_id: res.campaign.id,
+                                campaign_name: res.campaign.name,
+                                ad_sets_created: res.ad_sets.length,
+                                ads_created: totalAds,
+                                status: "All objects PAUSED. Review in Ads Manager before enabling.",
+                                details: res.ad_sets,
+                            };
+                        }
+                    } catch (e) {
+                        result = { error: e.message };
+                    }
+                }
             }
         }
 
