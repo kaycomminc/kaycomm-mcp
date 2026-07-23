@@ -75,6 +75,7 @@ const BUILTIN_HEALTH_DEFAULTS = {
 const KNOWN_ACCOUNT_KEYS = new Set([
     "name", "budget", "mcc", "nc_budget", "ga4", "health",
     "flight_start", "flight_end", "budget_schedule",
+    "page_id", "instagram_account_id",
 ]);
 
 // Per-account health overrides beyond BUILTIN_HEALTH_DEFAULTS that
