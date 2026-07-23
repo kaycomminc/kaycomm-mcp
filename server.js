@@ -4341,6 +4341,32 @@ function makeServer() {
             },
         },
         {
+            name: "upload_meta_media",
+            description: "Upload images or videos to a Meta ad account's Media Library. " +
+                "Returns image hashes or video IDs for use in create_meta_campaign. " +
+                "Supports local file paths and public URLs. Dry run by default — set confirm=true to upload.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    account_name: { type: "string", description: "Client name (partial match ok)" },
+                    files: {
+                        type: "array",
+                        description: "Files to upload. Each needs a source (local path or URL) and optional name.",
+                        items: {
+                            type: "object",
+                            properties: {
+                                source: { type: "string", description: "Local file path or public URL. Images: jpg/jpeg/png/gif/bmp/tiff. Videos: mp4/mov/avi/wmv/flv/mkv/webm." },
+                                name:   { type: "string", description: "Display name in Media Library. Defaults to filename." },
+                            },
+                            required: ["source"],
+                        },
+                    },
+                    confirm: { type: "boolean", description: "Set true to upload. Omit for dry run (validates files and formats)." },
+                },
+                required: ["account_name", "files"],
+            },
+        },
+        {
             name: "search_meta_interests",
             description: "Search Meta's interest targeting options by keyword. Returns IDs needed for targeting specs in create_meta_campaign.",
             inputSchema: {
@@ -6453,6 +6479,147 @@ async function handleToolCall(name, args = {}) {
                 result = out;
             } catch (e) {
                 result = { error: e.message };
+            }
+        }
+
+    } else if (name === "upload_meta_media") {
+        const search  = (args.account_name || "").toLowerCase();
+        const confirm = !!args.confirm;
+        const IMAGE_EXTS = new Set(["jpg", "jpeg", "png", "gif", "bmp", "tiff"]);
+        const VIDEO_EXTS = new Set(["mp4", "mov", "avi", "wmv", "flv", "mkv", "webm"]);
+
+        if (!args.files?.length) {
+            result = { error: "files array is required and must contain at least one item." };
+        } else {
+            const acctMatch = Object.entries(META_ACCOUNTS).find(([, info]) => info.name.toLowerCase().includes(search));
+            if (!acctMatch) {
+                result = { error: `No Meta account found matching '${args.account_name}'. Available: ${Object.values(META_ACCOUNTS).map(a => a.name).join(", ")}` };
+            } else {
+                const [accountId, acctInfo] = acctMatch;
+                try {
+                    const fileMeta = [];
+                    const errors = [];
+                    for (const f of args.files) {
+                        const isUrl = f.source.startsWith("http://") || f.source.startsWith("https://");
+                        const ext = path.extname(f.source).replace(".", "").toLowerCase();
+                        const displayName = f.name || path.basename(f.source);
+                        const mediaType = IMAGE_EXTS.has(ext) ? "image" : VIDEO_EXTS.has(ext) ? "video" : null;
+
+                        if (!mediaType) {
+                            errors.push({ source: f.source, error: `Unsupported format '.${ext}'. Images: ${[...IMAGE_EXTS].join(", ")}. Videos: ${[...VIDEO_EXTS].join(", ")}.` });
+                            continue;
+                        }
+
+                        let size = null;
+                        if (!isUrl) {
+                            const resolved = path.isAbsolute(f.source) ? f.source : path.resolve(f.source);
+                            if (!fs.existsSync(resolved)) {
+                                errors.push({ source: f.source, error: "File not found" });
+                                continue;
+                            }
+                            const stat = fs.statSync(resolved);
+                            size = stat.size;
+                        }
+
+                        fileMeta.push({
+                            source: f.source,
+                            name: displayName,
+                            type: mediaType,
+                            isUrl,
+                            size,
+                            sizeLabel: size ? (size > 1048576 ? `${(size / 1048576).toFixed(1)} MB` : `${(size / 1024).toFixed(0)} KB`) : "(URL)",
+                        });
+                    }
+
+                    if (errors.length && fileMeta.length === 0) {
+                        result = { error: "All files failed validation", details: errors };
+                    } else if (!confirm) {
+                        result = {
+                            dry_run: true,
+                            account: acctInfo.name,
+                            files: fileMeta.map(f => ({ name: f.name, source: f.source, type: f.type, size: f.sizeLabel, status: "ready" })),
+                            message: `${fileMeta.length} file(s) ready to upload. Set confirm=true to proceed.`,
+                        };
+                        if (errors.length) result.errors = errors;
+                    } else {
+                        const uploaded = [];
+                        const failed = [];
+
+                        for (const f of fileMeta) {
+                            try {
+                                if (f.type === "image") {
+                                    if (f.isUrl) {
+                                        const res = await metaPost(`${accountId}/adimages`, { url: f.source });
+                                        const imgData = res.images ? Object.values(res.images)[0] : res;
+                                        uploaded.push({ name: f.name, type: "image", image_hash: imgData.hash, status: "ready" });
+                                    } else {
+                                        const resolved = path.isAbsolute(f.source) ? f.source : path.resolve(f.source);
+                                        const fileBuffer = fs.readFileSync(resolved);
+                                        const blob = new Blob([fileBuffer]);
+                                        const formData = new FormData();
+                                        formData.append("access_token", META_ACCESS_TOKEN);
+                                        formData.append("filename", blob, f.name);
+                                        const resp = await fetchFn(
+                                            `https://graph.facebook.com/${META_API_VERSION}/${accountId}/adimages`,
+                                            { method: "POST", body: formData }
+                                        );
+                                        const data = await resp.json();
+                                        if (data.error) throw new Error(data.error.message);
+                                        const imgData = data.images ? Object.values(data.images)[0] : data;
+                                        uploaded.push({ name: f.name, type: "image", image_hash: imgData.hash, status: "ready" });
+                                    }
+                                } else {
+                                    let videoId;
+                                    if (f.isUrl) {
+                                        const res = await metaPost(`${accountId}/advideos`, { file_url: f.source, title: f.name });
+                                        videoId = res.id;
+                                    } else {
+                                        const resolved = path.isAbsolute(f.source) ? f.source : path.resolve(f.source);
+                                        const fileBuffer = fs.readFileSync(resolved);
+                                        const blob = new Blob([fileBuffer]);
+                                        const formData = new FormData();
+                                        formData.append("access_token", META_ACCESS_TOKEN);
+                                        formData.append("title", f.name);
+                                        formData.append("source", blob, f.name);
+                                        const resp = await fetchFn(
+                                            `https://graph.facebook.com/${META_API_VERSION}/${accountId}/advideos`,
+                                            { method: "POST", body: formData }
+                                        );
+                                        const data = await resp.json();
+                                        if (data.error) throw new Error(data.error.message);
+                                        videoId = data.id;
+                                    }
+                                    // Poll for video processing status
+                                    let videoStatus = "processing";
+                                    const deadline = Date.now() + 120000;
+                                    while (videoStatus === "processing" && Date.now() < deadline) {
+                                        await new Promise(r => setTimeout(r, 3000));
+                                        const statusRes = await metaGet(videoId, { fields: "status" });
+                                        videoStatus = statusRes.status?.video_status || "processing";
+                                    }
+                                    uploaded.push({
+                                        name: f.name, type: "video", video_id: videoId, status: videoStatus,
+                                        ...(videoStatus === "processing" ? { note: "Still processing — will be available shortly in Ads Manager." } : {}),
+                                        ...(videoStatus === "error" ? { note: "Processing failed. Check Ads Manager or retry." } : {}),
+                                    });
+                                }
+                            } catch (e) {
+                                failed.push({ name: f.name, source: f.source, error: e.message });
+                            }
+                        }
+
+                        result = {
+                            success: failed.length === 0,
+                            account: acctInfo.name,
+                            uploaded,
+                            summary: `${uploaded.length} file(s) uploaded. Use image_hash / video_id values in create_meta_campaign.`,
+                        };
+                        if (failed.length) result.failed = failed;
+                        if (errors.length) result.validation_errors = errors;
+                    }
+                } catch (e) {
+                    result = { error: e.message };
+                }
             }
         }
 
