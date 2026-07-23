@@ -168,6 +168,13 @@
       "budget": 2900,
       "flight_start": "2026-07-01",
       "flight_end": "2026-09-30"
+    },
+    "act_1371124644901073": {
+      "name": "Denver Parade of Homes",
+      "budget": 1000,
+      "page_id": "121015354580784",
+      "flight_start": "2026-08-03",
+      "flight_end": "2026-08-26"
     }
   },
   "stackadapt": {
