@@ -868,6 +868,7 @@ async function createMetaCampaignFull(accountId, pageId, config) {
             objective: config.objective,
             status: "PAUSED",
             special_ad_categories: [],
+            bid_strategy: "LOWEST_COST_WITHOUT_CAP",
         };
         if (config.cbo) {
             campaignBody.daily_budget = Math.round(config.daily_budget * 100);
