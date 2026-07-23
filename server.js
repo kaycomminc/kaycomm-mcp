@@ -26,6 +26,8 @@ const GOOGLE_REFRESH_TOKEN   = process.env.GOOGLE_REFRESH_TOKEN;
 const GOOGLE_API_VERSION     = "v24";
 
 const META_ACCESS_TOKEN = process.env.META_ACCESS_TOKEN;
+const META_APP_ID       = process.env.META_APP_ID;
+const META_APP_SECRET   = process.env.META_APP_SECRET;
 const META_API_VERSION  = "v25.0";
 
 const STACKADAPT_API_KEY = process.env.STACKADAPT_API_KEY;
@@ -694,6 +696,33 @@ async function metaPost(path, body = {}) {
     return data;
 }
 
+async function metaPatch(path, body = {}) {
+    const url = `https://graph.facebook.com/${META_API_VERSION}/${path}`;
+    const payload = { access_token: META_ACCESS_TOKEN, ...body };
+    const resp = await fetchFn(url, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+    });
+    const data = await resp.json();
+    if (data.error) {
+        const e = data.error;
+        const parts = [e.message];
+        if (e.error_user_msg) parts.push(`Detail: ${e.error_user_msg}`);
+        if (e.code) parts.push(`Code: ${e.code}`);
+        throw new Error(parts.join(" | "));
+    }
+    return data;
+}
+
+async function metaDelete(path) {
+    const url = `https://graph.facebook.com/${META_API_VERSION}/${path}?access_token=${META_ACCESS_TOKEN}`;
+    const resp = await fetchFn(url, { method: "DELETE" });
+    const data = await resp.json();
+    if (data.error) throw new Error(data.error.message);
+    return data;
+}
+
 // Single definition of "conversions" for every Meta tool: lead + purchase +
 // offsite_conversion.fb_pixel_lead (some accounts report pixel leads only
 // under the latter, so dropping it undercounts).
@@ -746,6 +775,24 @@ async function getMetaAdsets(accountId) {
         daily_budget:    s.daily_budget    ? parseFloat(s.daily_budget) / 100    : null,
         lifetime_budget: s.lifetime_budget ? parseFloat(s.lifetime_budget) / 100 : null,
         level: "adset",
+    }));
+}
+
+async function getMetaAds(accountId, campaignName) {
+    const params = {
+        fields: "id,name,status,effective_status,creative{id,name,thumbnail_url},adset{id,name}",
+        limit: 200,
+    };
+    if (campaignName) {
+        params.filtering = JSON.stringify([{ field: "campaign.name", operator: "CONTAIN", value: campaignName }]);
+    }
+    const rows = await metaGetAll(`${accountId}/ads`, params);
+    return rows.map(a => ({
+        id: a.id, name: a.name, status: a.status, effective_status: a.effective_status,
+        adset: a.adset?.name || null,
+        creative_id: a.creative?.id || null,
+        creative_name: a.creative?.name || null,
+        level: "ad",
     }));
 }
 
@@ -805,6 +852,8 @@ async function buildMetaTargetingSpec(targeting) {
     // Geo targeting
     if (targeting.geo_raw) {
         spec.geo_locations = targeting.geo_raw;
+    } else if (targeting.countries?.length) {
+        spec.geo_locations = { countries: targeting.countries };
     } else if (targeting.geo) {
         const geoResult = await metaSearchGeo(targeting.geo);
         const cities = geoResult.data || geoResult || [];
@@ -858,7 +907,7 @@ async function buildMetaTargetingSpec(targeting) {
     return { spec, warnings };
 }
 
-async function createMetaCampaignFull(accountId, pageId, config) {
+async function createMetaCampaignFull(accountId, pageId, config, instagramAccountId) {
     const results = { campaign: null, ad_sets: [], debug: [] };
 
     try {
@@ -868,10 +917,14 @@ async function createMetaCampaignFull(accountId, pageId, config) {
             objective: config.objective,
             status: "PAUSED",
             special_ad_categories: [],
-            bid_strategy: "LOWEST_COST_WITHOUT_CAP",
+            bid_strategy: config.campaign_bid_strategy || "LOWEST_COST_WITHOUT_CAP",
         };
         if (config.cbo) {
-            campaignBody.daily_budget = Math.round(config.daily_budget * 100);
+            if (config.lifetime_budget) {
+                campaignBody.lifetime_budget = Math.round(config.lifetime_budget * 100);
+            } else {
+                campaignBody.daily_budget = Math.round(config.daily_budget * 100);
+            }
         }
         results.debug.push({ step: "campaign", body: campaignBody });
         const campRes = await metaPost(`${accountId}/campaigns`, campaignBody);
@@ -897,8 +950,14 @@ async function createMetaCampaignFull(accountId, pageId, config) {
         if (!config.cbo && adSetDef.daily_budget) {
             adSetBody.daily_budget = Math.round(adSetDef.daily_budget * 100);
         }
+        if (adSetDef.bid_strategy) adSetBody.bid_strategy = adSetDef.bid_strategy;
+        if (adSetDef.bid_amount)   adSetBody.bid_amount   = Math.round(adSetDef.bid_amount * 100);
+        if (adSetDef.roas_control) adSetBody.roas_control  = adSetDef.roas_control;
         if (adSetDef.start_time) adSetBody.start_time = adSetDef.start_time;
         if (adSetDef.end_time) adSetBody.end_time = adSetDef.end_time;
+        if (adSetDef.daily_min_spend_target) adSetBody.daily_min_spend_target = Math.round(adSetDef.daily_min_spend_target * 100);
+        if (adSetDef.daily_spend_cap) adSetBody.daily_spend_cap = Math.round(adSetDef.daily_spend_cap * 100);
+        if (adSetDef.is_dynamic_creative) adSetBody.is_dynamic_creative = true;
 
         let adSetRes;
         try {
@@ -945,9 +1004,13 @@ async function createMetaCampaignFull(accountId, pageId, config) {
                 if (adDef.image_hash) storySpec.link_data.image_hash = adDef.image_hash;
             }
 
+            if (instagramAccountId) storySpec.instagram_actor_id = instagramAccountId;
+
             let creativeRes;
             try {
-                const creativeBody = { name: `${adDef.name} Creative`, object_story_spec: storySpec };
+                const creativeBody = adDef.object_story_id
+                    ? { name: `${adDef.name} Creative`, object_story_id: adDef.object_story_id }
+                    : { name: `${adDef.name} Creative`, object_story_spec: storySpec };
                 results.debug.push({ step: "creative", name: adDef.name, body: creativeBody });
                 creativeRes = await metaPost(`${accountId}/adcreatives`, creativeBody);
             } catch (e) {
@@ -3530,23 +3593,23 @@ function makeServer() {
         },
         {
             name: "manage_meta",
-            description: "View and manage Meta Ads campaigns and ad sets — list, pause, resume, update budgets, or duplicate. " +
+            description: "View and manage Meta Ads campaigns, ad sets, and ads — list, pause, resume, archive, update budgets, or duplicate. " +
                 "Dry run by default. Set confirm=true to apply changes. " +
-                "Actions: list_campaigns, list_adsets, pause, resume, set_daily_budget, duplicate.",
+                "Actions: list_campaigns, list_adsets, list_ads, pause, resume, archive, set_daily_budget, duplicate.",
             inputSchema: {
                 type: "object",
                 properties: {
                     account_name: { type: "string", description: "Meta account name (partial match ok)" },
                     action: {
                         type: "string",
-                        description: "list_campaigns | list_adsets | pause | resume | set_daily_budget | duplicate",
-                        enum: ["list_campaigns", "list_adsets", "pause", "resume", "set_daily_budget", "duplicate"],
+                        description: "list_campaigns | list_adsets | list_ads | pause | resume | archive | set_daily_budget | duplicate",
+                        enum: ["list_campaigns", "list_adsets", "list_ads", "pause", "resume", "archive", "set_daily_budget", "duplicate"],
                     },
-                    target: { type: "string", description: "Campaign or ad set name to target (partial match ok). Required for pause/resume/set_daily_budget/duplicate." },
+                    target: { type: "string", description: "Campaign, ad set, or ad name to target (partial match ok). Required for pause/resume/archive/set_daily_budget/duplicate." },
                     level: {
                         type: "string",
-                        description: "Whether target is a campaign or adset (default: campaign for duplicate, adset for others)",
-                        enum: ["campaign", "adset"],
+                        description: "Whether target is a campaign, adset, or ad (default: campaign for duplicate, adset for others)",
+                        enum: ["campaign", "adset", "ad"],
                     },
                     new_name: { type: "string", description: "Name for the duplicated campaign or ad set. Optional for duplicate — defaults to 'Copy of [original name]'." },
                     status:   { type: "string", enum: ["PAUSED", "ACTIVE", "INHERITED_FROM_SOURCE"], description: "Status for the duplicate (default: PAUSED)." },
@@ -4443,6 +4506,12 @@ function makeServer() {
                         description: "Campaign objective. Most common: OUTCOME_TRAFFIC for link clicks, OUTCOME_LEADS for lead gen.",
                     },
                     daily_budget: { type: "number", description: "Campaign daily budget in dollars (when using CBO). Converted to cents for the API." },
+                    lifetime_budget: { type: "number", description: "Campaign lifetime budget in dollars (alternative to daily_budget for CBO). Requires end_time on ad sets." },
+                    campaign_bid_strategy: {
+                        type: "string",
+                        enum: ["LOWEST_COST_WITHOUT_CAP", "COST_CAP", "LOWEST_COST_WITH_BID_CAP", "LOWEST_COST_WITH_MIN_ROAS"],
+                        description: "Campaign-level bid strategy for CBO. Default: LOWEST_COST_WITHOUT_CAP. COST_CAP/BID_CAP require bid_amount on ad sets.",
+                    },
                     cbo: { type: "boolean", description: "Campaign Budget Optimization (default: true). When true, budget is at campaign level. When false, set budgets per ad set." },
                     ad_sets: {
                         type: "array",
@@ -4462,9 +4531,20 @@ function makeServer() {
                                     enum: ["IMPRESSIONS", "LINK_CLICKS"],
                                     description: "Billing event (default: IMPRESSIONS)",
                                 },
+                                bid_strategy: {
+                                    type: "string",
+                                    enum: ["LOWEST_COST_WITHOUT_CAP", "COST_CAP", "BID_CAP", "LOWEST_COST_WITH_MIN_ROAS"],
+                                    description: "Bid strategy for this ad set (default: inherited from campaign). COST_CAP requires bid_amount as cost target. BID_CAP requires bid_amount as max bid. LOWEST_COST_WITH_MIN_ROAS requires roas_control.",
+                                },
+                                bid_amount: { type: "number", description: "Bid/cost cap in dollars (for COST_CAP or BID_CAP strategies). Converted to cents for the API." },
+                                roas_control: { type: "number", description: "Minimum ROAS target (for LOWEST_COST_WITH_MIN_ROAS). E.g. 2.0 means $2 revenue per $1 spent." },
+                                daily_min_spend_target: { type: "number", description: "CBO only: minimum daily spend target for this ad set (dollars)" },
+                                daily_spend_cap: { type: "number", description: "CBO only: maximum daily spend cap for this ad set (dollars)" },
+                                is_dynamic_creative: { type: "boolean", description: "Enable Dynamic Creative — Meta auto-combines creative assets. When true, provide multiple images/videos/texts in the ad's asset_feed_spec." },
                                 targeting: {
                                     type: "object",
                                     description: "Simplified targeting spec. Fields: geo (string like 'Denver, CO'), geo_radius (miles, default 25), " +
+                                        "countries (array of country codes like ['US'] for broad reach), " +
                                         "age_min, age_max, interests (array of names), behaviors (array of names), " +
                                         "custom_audiences (array of IDs), excluded_audiences (array of IDs), " +
                                         "placements ('advantage_plus' or 'manual' — default: advantage_plus). " +
@@ -4472,6 +4552,7 @@ function makeServer() {
                                     properties: {
                                         geo:          { type: "string", description: "Location name to target (e.g. 'Denver, CO', 'Miami, FL')" },
                                         geo_radius:   { type: "number", description: "Radius in miles around geo location (default: 25)" },
+                                        countries:    { type: "array", items: { type: "string" }, description: "Country codes for country-level targeting (e.g. ['US', 'CA', 'GB']). Use instead of geo for broad reach." },
                                         geo_raw:      { type: "array", description: "Raw geo_locations spec (cities/regions/countries) — use instead of geo for complex targeting", items: { type: "object" } },
                                         age_min:      { type: "number", description: "Minimum age (default: 18)" },
                                         age_max:      { type: "number", description: "Maximum age (default: 65)" },
@@ -4505,8 +4586,9 @@ function makeServer() {
                                             url:        { type: "string", description: "Destination URL" },
                                             image_hash: { type: "string", description: "Image hash from Media Library (use list_meta_media to find)" },
                                             video_id:   { type: "string", description: "Video ID from Media Library (use list_meta_media to find)" },
+                                            object_story_id: { type: "string", description: "Existing Page post ID (PAGE_ID_POST_ID) to promote as an ad. When set, primary_text/headline/url are not needed." },
                                         },
-                                        required: ["name", "primary_text", "headline", "url"],
+                                        required: ["name"],
                                     },
                                 },
                             },
@@ -4516,6 +4598,331 @@ function makeServer() {
                     confirm: { type: "boolean", description: "Set true to create. Omit for dry-run preview." },
                 },
                 required: ["account_name", "campaign_name", "objective", "daily_budget", "ad_sets"],
+            },
+        },
+        {
+            name: "preview_meta_ad",
+            description: "Generate a preview of a Meta ad by ad ID, creative ID, or creative spec. Returns an iframe HTML preview valid for 24 hours.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    account_name: { type: "string", description: "Meta account name (partial match ok)" },
+                    ad_id:        { type: "string", description: "Existing ad ID to preview" },
+                    creative_id:  { type: "string", description: "Existing creative ID to preview" },
+                    ad_format: {
+                        type: "string",
+                        enum: ["DESKTOP_FEED_STANDARD", "MOBILE_FEED_STANDARD", "RIGHT_COLUMN_STANDARD", "INSTAGRAM_STANDARD", "INSTAGRAM_STORY", "FACEBOOK_STORY_MOBILE", "FACEBOOK_REELS_MOBILE"],
+                        description: "Ad format / placement to preview (default: DESKTOP_FEED_STANDARD)",
+                    },
+                },
+                required: ["account_name"],
+            },
+        },
+        {
+            name: "subscribe_meta_webhooks",
+            description: "Subscribe the Meta app to ad_account webhook fields (effective_status, subscriptions, creative_fatigue, ad_recommendations, in_process_ad_objects, with_issues_ad_objects). " +
+                "Requires META_APP_ID and META_APP_SECRET env vars. This is a one-time setup call that registers the callback URL and fields with Meta.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    callback_url:  { type: "string", description: "HTTPS callback URL to receive webhook POSTs" },
+                    verify_token:  { type: "string", description: "A secret string your endpoint checks against hub.verify_token during verification" },
+                    fields:        {
+                        type: "array",
+                        items: { type: "string", enum: ["effective_status", "subscriptions", "creative_fatigue", "ad_recommendations", "in_process_ad_objects", "with_issues_ad_objects"] },
+                        description: "Webhook fields to subscribe to. Defaults to all six if omitted.",
+                    },
+                    confirm: { type: "boolean", description: "Set true to apply. Omit for dry-run preview." },
+                },
+                required: ["callback_url", "verify_token"],
+            },
+        },
+        {
+            name: "connect_meta_webhooks",
+            description: "Connect a Meta ad account to receive webhook events from the subscribed app. " +
+                "Run subscribe_meta_webhooks first to register fields, then this tool for each account.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    account_name: { type: "string", description: "Meta account name (partial match ok)" },
+                    confirm: { type: "boolean", description: "Set true to connect. Omit for dry-run preview." },
+                },
+                required: ["account_name"],
+            },
+        },
+        {
+            name: "list_meta_subscriptions",
+            description: "List event subscriptions on a Meta ad account (the per-account subscriptions endpoint for granular alerts like spend thresholds, new objects, metric milestones).",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    account_name: { type: "string", description: "Meta account name (partial match ok)" },
+                },
+                required: ["account_name"],
+            },
+        },
+        {
+            name: "create_meta_subscription",
+            description: "Create a subscription on a Meta ad account to receive granular webhook alerts. " +
+                "Event types: OBJECT_CREATED (new campaign/adset/ad), OBJECT_UPDATED (metadata field changed), " +
+                "INSIGHTS_UPDATED (metric crosses a threshold), INSIGHTS_MILESTONE_REACHED (metric hits a milestone). " +
+                "Amounts (budgets, spend, bids) are in cents.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    account_name: { type: "string", description: "Meta account name (partial match ok)" },
+                    event_type: {
+                        type: "string",
+                        enum: ["OBJECT_CREATED", "OBJECT_UPDATED", "INSIGHTS_UPDATED", "INSIGHTS_MILESTONE_REACHED"],
+                        description: "What the subscription listens for",
+                    },
+                    filters: {
+                        type: "array",
+                        items: {
+                            type: "object",
+                            properties: {
+                                field:    { type: "string", description: "Condition field (e.g. entity_type, objective)" },
+                                value:    { type: "string", description: "Value to compare against" },
+                                operator: { type: "string", description: "Comparison operator (EQUAL, GREATER_THAN, LESS_THAN, IN_RANGE, NOT_IN_RANGE, IN, NOT_IN, CONTAIN, NOT_CONTAIN, ANY, ALL, NONE)" },
+                            },
+                            required: ["field", "value", "operator"],
+                        },
+                        description: "Filter conditions (up to 20). Use entity_type to scope to CAMPAIGN, ADSET, or AD.",
+                    },
+                    field:    { type: "string", description: "Metric or attribute to watch (required for OBJECT_UPDATED, INSIGHTS_UPDATED, INSIGHTS_MILESTONE_REACHED). E.g. spent, cpc, daily_budget, name." },
+                    value:    { type: "string", description: "Threshold value (required for INSIGHTS_UPDATED and INSIGHTS_MILESTONE_REACHED). Amounts in cents." },
+                    operator: { type: "string", description: "Comparison operator for the field/value (required for INSIGHTS_UPDATED and INSIGHTS_MILESTONE_REACHED). E.g. GREATER_THAN, LESS_THAN, EQUAL, IN_RANGE, NOT_IN_RANGE." },
+                    confirm:  { type: "boolean", description: "Set true to create. Omit for dry-run preview." },
+                },
+                required: ["account_name", "event_type", "filters"],
+            },
+        },
+        {
+            name: "update_meta_subscription",
+            description: "Enable or disable a Meta ad account subscription without deleting it.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    account_name:    { type: "string", description: "Meta account name (partial match ok)" },
+                    subscription_id: { type: "string", description: "Subscription ID to update" },
+                    status:          { type: "string", enum: ["ENABLED", "DISABLED"], description: "New status" },
+                    confirm:         { type: "boolean", description: "Set true to apply. Omit for dry-run preview." },
+                },
+                required: ["account_name", "subscription_id", "status"],
+            },
+        },
+        {
+            name: "delete_meta_subscription",
+            description: "Delete a Meta ad account subscription permanently.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    account_name:    { type: "string", description: "Meta account name (partial match ok)" },
+                    subscription_id: { type: "string", description: "Subscription ID to delete" },
+                    confirm:         { type: "boolean", description: "Set true to delete. Omit for dry-run preview." },
+                },
+                required: ["account_name", "subscription_id"],
+            },
+        },
+        {
+            name: "create_meta_audience",
+            description: "Create a Meta custom audience (customer file) or lookalike audience. " +
+                "For custom audiences, creates an empty audience ready for user uploads via manage_meta_audience_users. " +
+                "For lookalike audiences, creates from a seed custom audience, campaign conversions, or page fans. " +
+                "Dry run by default — set confirm=true to create.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    account_name: { type: "string", description: "Meta account name (partial match ok)" },
+                    type: { type: "string", enum: ["custom", "lookalike"], description: "Audience type to create" },
+                    name: { type: "string", description: "Audience name" },
+                    description: { type: "string", description: "Audience description (custom only)" },
+                    customer_file_source: {
+                        type: "string",
+                        enum: ["USER_PROVIDED_ONLY", "PARTNER_PROVIDED_ONLY", "BOTH_USER_AND_PARTNER_PROVIDED"],
+                        description: "Source of customer data (custom only, default: USER_PROVIDED_ONLY)",
+                    },
+                    seed_audience_id: { type: "string", description: "Lookalike: seed custom audience ID (min 100 members)" },
+                    country: { type: "string", description: "Lookalike: country code for the lookalike (e.g. 'US')" },
+                    countries: { type: "array", items: { type: "string" }, description: "Lookalike: multiple country codes for multi-country lookalike" },
+                    ratio: { type: "number", description: "Lookalike: audience size ratio 0.01-0.20 (e.g. 0.01 = top 1%, 0.05 = top 5%)" },
+                    starting_ratio: { type: "number", description: "Lookalike: starting ratio for banded lookalike (must be < ratio)" },
+                    lookalike_type: { type: "string", enum: ["similarity", "reach"], description: "Lookalike: 'similarity' (top 1%) or 'reach' (top 5%). Alternative to ratio." },
+                    page_id: { type: "string", description: "Lookalike from page fans: Facebook page ID" },
+                    campaign_id: { type: "string", description: "Lookalike from campaign conversions: campaign ID" },
+                    confirm: { type: "boolean", description: "Set true to create. Omit for dry-run preview." },
+                },
+                required: ["account_name", "type", "name"],
+            },
+        },
+        {
+            name: "manage_meta_audience_users",
+            description: "Add, remove, or replace users in a Meta custom audience. " +
+                "Accepts hashed (SHA256) or unhashed email/phone data — unhashed data is hashed client-side before upload. " +
+                "For replace: atomically swaps all users (no learning phase reset). " +
+                "Dry run by default — set confirm=true to apply.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    account_name: { type: "string", description: "Meta account name (partial match ok)" },
+                    audience_id: { type: "string", description: "Custom audience ID to modify" },
+                    action: { type: "string", enum: ["add", "remove", "replace"], description: "Action to perform" },
+                    schema: {
+                        type: "array",
+                        items: { type: "string", enum: ["EMAIL", "PHONE", "FN", "LN", "GEN", "DOBY", "DOBM", "DOBD", "ST", "CT", "ZIP", "COUNTRY", "MADID", "EXTERN_ID"] },
+                        description: "Data schema — column types in order. E.g. ['EMAIL'] or ['EMAIL', 'PHONE', 'FN', 'LN']",
+                    },
+                    data: {
+                        type: "array",
+                        description: "Array of user records. Each record is an array matching the schema order. E.g. [['user@example.com'], ['other@example.com']]",
+                        items: { type: "array", items: { type: "string" } },
+                    },
+                    confirm: { type: "boolean", description: "Set true to apply. Omit for dry-run preview." },
+                },
+                required: ["account_name", "audience_id", "action", "schema", "data"],
+            },
+        },
+        {
+            name: "get_meta_reach_estimate",
+            description: "Estimate the potential reach for a Meta targeting spec. " +
+                "Returns estimated audience size for given targeting parameters. " +
+                "Use to validate targeting before creating campaigns.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    account_name: { type: "string", description: "Meta account name (partial match ok)" },
+                    countries: { type: "array", items: { type: "string" }, description: "Country codes (e.g. ['US', 'CA'])" },
+                    age_min: { type: "number", description: "Minimum age (default: 18)" },
+                    age_max: { type: "number", description: "Maximum age (default: 65)" },
+                    genders: { type: "array", items: { type: "number" }, description: "1=male, 2=female. Omit for all." },
+                    interests: { type: "array", items: { type: "string" }, description: "Interest names (resolved to IDs)" },
+                    behaviors: { type: "array", items: { type: "string" }, description: "Behavior names (resolved to IDs)" },
+                    custom_audiences: { type: "array", items: { type: "string" }, description: "Custom audience IDs" },
+                    excluded_audiences: { type: "array", items: { type: "string" }, description: "Excluded audience IDs" },
+                    publisher_platforms: { type: "array", items: { type: "string" }, description: "e.g. ['facebook', 'instagram']" },
+                    optimize_for: { type: "string", description: "Optimization goal (e.g. 'IMPRESSIONS', 'LINK_CLICKS')" },
+                },
+                required: ["account_name", "countries"],
+            },
+        },
+        {
+            name: "manage_meta_ad_rules",
+            description: "Create, list, read, update, delete, preview, or execute automated ad rules on a Meta account. " +
+                "Rules can automatically pause/unpause ads, change budgets/bids, send notifications, or rotate creatives " +
+                "based on performance metrics or metadata changes. " +
+                "Dry run by default for create/update/delete/execute — set confirm=true to apply.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    account_name: { type: "string", description: "Meta account name (partial match ok)" },
+                    action: {
+                        type: "string",
+                        enum: ["list", "read", "create", "update", "delete", "preview", "execute", "history"],
+                        description: "Action to perform (default: list)",
+                    },
+                    rule_id: { type: "string", description: "Rule ID — required for read/update/delete/preview/execute/history" },
+                    name: { type: "string", description: "Rule name (for create/update)" },
+                    evaluation_spec: {
+                        type: "object",
+                        description: "Evaluation spec — defines what triggers the rule. Must include evaluation_type ('SCHEDULE' or 'TRIGGER'), " +
+                            "filters array, and optionally trigger object. See Meta ad rules docs for filter fields and operators.",
+                    },
+                    execution_spec: {
+                        type: "object",
+                        description: "Execution spec — defines what action to take. Must include execution_type " +
+                            "('NOTIFICATION', 'PAUSE', 'UNPAUSE', 'CHANGE_BUDGET', 'CHANGE_BID', 'ROTATE', 'REBALANCE_BUDGET'). " +
+                            "Optionally includes execution_options array for user_ids, change_spec, etc.",
+                    },
+                    schedule_spec: {
+                        type: "object",
+                        description: "Schedule spec for scheduled rules. Type: 'DAILY', 'HOURLY', 'SEMI_HOURLY', or 'CUSTOM'. " +
+                            "CUSTOM requires schedule array with start_minute, end_minute, days.",
+                    },
+                    status: { type: "string", enum: ["ENABLED", "DISABLED"], description: "Rule status (for create/update)" },
+                    confirm: { type: "boolean", description: "Set true to apply. Omit for dry-run preview." },
+                },
+                required: ["account_name", "action"],
+            },
+        },
+        {
+            name: "get_meta_ad_issues",
+            description: "Find Meta ads with delivery issues — disapproved, in review, or with policy violations. " +
+                "Checks effective_status and ad_review_feedback for all ads in the account.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    account_name: { type: "string", description: "Meta account name (partial match ok). Omit to check all Meta accounts." },
+                },
+                required: [],
+            },
+        },
+        {
+            name: "get_meta_insights",
+            description: "Get Meta Ads performance broken down by segment — age, gender, country, region, placement, device, platform, or date. " +
+                "Returns spend, impressions, clicks, CTR, CPC, and conversions per segment. " +
+                "Similar to get_performance_breakdown but for Meta accounts.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    account_name: { type: "string", description: "Meta account name (partial match ok)" },
+                    breakdown: {
+                        type: "string",
+                        enum: ["age", "gender", "country", "region", "publisher_platform", "platform_position", "device_platform", "impression_device"],
+                        description: "Dimension to break down by",
+                    },
+                    date_preset: {
+                        type: "string",
+                        enum: ["today", "yesterday", "this_month", "last_month", "last_7d", "last_14d", "last_30d", "last_90d"],
+                        description: "Date range preset (default: last_30d)",
+                    },
+                    start_date: { type: "string", description: "Start date YYYY-MM-DD (use instead of date_preset for custom range)" },
+                    end_date: { type: "string", description: "End date YYYY-MM-DD (use with start_date)" },
+                    campaign_name: { type: "string", description: "Filter to campaigns matching this name (optional)" },
+                    level: {
+                        type: "string",
+                        enum: ["account", "campaign", "adset", "ad"],
+                        description: "Reporting level (default: account)",
+                    },
+                },
+                required: ["account_name", "breakdown"],
+            },
+        },
+        {
+            name: "update_meta_object",
+            description: "Update properties on a Meta campaign, ad set, or ad — name, bid strategy, schedule, targeting, status, and more. " +
+                "Supports any writable field on campaigns (name, status, daily_budget, lifetime_budget, bid_strategy, spend_cap), " +
+                "ad sets (name, status, daily_budget, lifetime_budget, bid_amount, bid_strategy, targeting, start_time, end_time, optimization_goal, billing_event, pacing_type), " +
+                "and ads (name, status, creative). Dry run by default — set confirm=true to apply.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    account_name: { type: "string", description: "Meta account name (partial match ok)" },
+                    object_id: { type: "string", description: "The campaign, ad set, or ad ID to update" },
+                    level: { type: "string", enum: ["campaign", "adset", "ad"], description: "Object type being updated" },
+                    updates: {
+                        type: "object",
+                        description: "Fields to update. Examples: {name: 'New Name'}, {daily_budget: 50} (dollars, converted to cents), " +
+                            "{bid_strategy: 'COST_CAP', bid_amount: 10}, {status: 'ACTIVE'}, {end_time: '2024-12-31T23:59:59-0500'}. " +
+                            "Budget values are in dollars and automatically converted to cents.",
+                    },
+                    confirm: { type: "boolean", description: "Set true to apply. Omit for dry-run preview." },
+                },
+                required: ["account_name", "object_id", "level", "updates"],
+            },
+        },
+        {
+            name: "manage_meta_leads",
+            description: "List lead forms on a Facebook Page, or retrieve leads from a lead form. " +
+                "Use to check lead gen form setup or download lead data.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    account_name: { type: "string", description: "Meta account name (partial match ok) — used to find the page_id" },
+                    action: { type: "string", enum: ["list_forms", "get_leads"], description: "Action to perform" },
+                    form_id: { type: "string", description: "Lead form ID — required for get_leads" },
+                    limit: { type: "number", description: "Max leads to return (default: 100)" },
+                },
+                required: ["account_name", "action"],
             },
         },
     ],
@@ -5306,6 +5713,10 @@ async function handleToolCall(name, args = {}) {
                     const adsets = await getMetaAdsets(accountId);
                     result = { account: acctInfo.name, adsets };
 
+                } else if (action === "list_ads") {
+                    const ads = await getMetaAds(accountId, args.target || null);
+                    result = { account: acctInfo.name, filter: args.target || null, ads };
+
                 } else if (action === "duplicate") {
                     const dupLevel  = args.level || "campaign";
                     const dupStatus = (args.status || "PAUSED").toUpperCase();
@@ -5344,9 +5755,9 @@ async function handleToolCall(name, args = {}) {
                     }
 
                 } else {
-                    // pause / resume / set_daily_budget — need a target
+                    // pause / resume / archive / set_daily_budget — need a target
                     if (!args.target) {
-                        result = { error: `'target' is required for action '${action}'. Run list_campaigns or list_adsets first to find the name.` };
+                        result = { error: `'target' is required for action '${action}'. Run list_campaigns, list_adsets, or list_ads first to find the name.` };
                     } else {
                         const targetSearch = args.target.toLowerCase();
                         let items;
@@ -5354,19 +5765,23 @@ async function handleToolCall(name, args = {}) {
                         if (level === "campaign") {
                             const all = await getMetaCampaigns(accountId);
                             items = all.filter(c => c.name.toLowerCase().includes(targetSearch));
+                        } else if (level === "ad") {
+                            const all = await getMetaAds(accountId);
+                            items = all.filter(a => a.name.toLowerCase().includes(targetSearch));
                         } else {
                             const all = await getMetaAdsets(accountId);
                             items = all.filter(s => s.name.toLowerCase().includes(targetSearch));
                         }
 
                         if (items.length === 0) {
-                            const all = level === "campaign" ? await getMetaCampaigns(accountId) : await getMetaAdsets(accountId);
+                            const all = level === "campaign" ? await getMetaCampaigns(accountId) : level === "ad" ? await getMetaAds(accountId) : await getMetaAdsets(accountId);
                             result = { error: `No ${level} found matching '${args.target}'`, available: all.map(i => i.name) };
                         } else {
                             // Build preview
                             const changes = items.map(item => {
                                 if (action === "pause")   return { id: item.id, name: item.name, level, change: "status → PAUSED",   current_status: item.status };
                                 if (action === "resume")  return { id: item.id, name: item.name, level, change: "status → ACTIVE",   current_status: item.status };
+                                if (action === "archive") return { id: item.id, name: item.name, level, change: "status → ARCHIVED", current_status: item.status };
                                 if (action === "set_daily_budget") {
                                     const bd = args.budget;
                                     return { id: item.id, name: item.name, level, change: `daily_budget → $${bd}`, current_budget: item.daily_budget != null ? `$${item.daily_budget}` : "lifetime" };
@@ -5380,8 +5795,9 @@ async function handleToolCall(name, args = {}) {
                                 const outcomes = [];
                                 for (const item of items) {
                                     let body = {};
-                                    if (action === "pause")  body = { status: "PAUSED" };
-                                    if (action === "resume") body = { status: "ACTIVE" };
+                                    if (action === "pause")   body = { status: "PAUSED" };
+                                    if (action === "resume")  body = { status: "ACTIVE" };
+                                    if (action === "archive") body = { status: "ARCHIVED" };
                                     if (action === "set_daily_budget") {
                                         if (!args.budget) throw new Error("budget is required for set_daily_budget");
                                         body = { daily_budget: Math.round(args.budget * 100) }; // Meta uses cents
@@ -6751,7 +7167,9 @@ async function handleToolCall(name, args = {}) {
                                 allWarnings.push(...warnings);
 
                                 const targetingSummary = [];
-                                if (targetingSpec.geo_locations?.cities?.length) {
+                                if (targetingSpec.geo_locations?.countries?.length) {
+                                    targetingSummary.push(`countries: ${targetingSpec.geo_locations.countries.join(", ")}`);
+                                } else if (targetingSpec.geo_locations?.cities?.length) {
                                     const c = targetingSpec.geo_locations.cities[0];
                                     targetingSummary.push(`${adSetDef.targeting?.geo || `city key ${c.key}`} +${c.radius}mi`);
                                 }
@@ -6778,6 +7196,9 @@ async function handleToolCall(name, args = {}) {
                                     name: adSetDef.name,
                                     optimization_goal: adSetDef.optimization_goal || "LINK_CLICKS",
                                     daily_budget: !cbo && adSetDef.daily_budget ? `$${adSetDef.daily_budget.toFixed(2)}` : "(CBO)",
+                                    bid_strategy: adSetDef.bid_strategy || "(campaign default)",
+                                    bid_amount: adSetDef.bid_amount ? `$${adSetDef.bid_amount.toFixed(2)}` : null,
+                                    roas_control: adSetDef.roas_control || null,
                                     targeting_summary: targetingSummary.join(". ") + ".",
                                     start_time: adSetDef.start_time || null,
                                     end_time: adSetDef.end_time || null,
@@ -6814,10 +7235,12 @@ async function handleToolCall(name, args = {}) {
                                 campaign_name: args.campaign_name,
                                 objective: args.objective,
                                 daily_budget: args.daily_budget,
+                                lifetime_budget: args.lifetime_budget,
+                                campaign_bid_strategy: args.campaign_bid_strategy,
                                 cbo,
                                 ad_sets: args.ad_sets,
                             };
-                            const res = await createMetaCampaignFull(accountId, pageId, config);
+                            const res = await createMetaCampaignFull(accountId, pageId, config, acctInfo.instagram_account_id);
                             const totalAds = res.ad_sets.reduce((s, as) => s + as.ads.length, 0);
                             result = {
                                 success: true,
@@ -7555,6 +7978,630 @@ async function handleToolCall(name, args = {}) {
                         } else {
                             result = { error: `Unknown action '${action}'. Valid: list, view, create, add_keywords, attach.` };
                         }
+                    }
+                } catch (e) { result = { error: e.message }; }
+            }
+        }
+
+    } else if (name === "preview_meta_ad") {
+        const search = (args.account_name || "").toLowerCase();
+        const acctMatch = Object.entries(META_ACCOUNTS).find(([, info]) => info.name.toLowerCase().includes(search));
+        if (!acctMatch) {
+            result = { error: `No Meta account found matching '${args.account_name}'. Available: ${Object.values(META_ACCOUNTS).map(a => a.name).join(", ")}` };
+        } else {
+            const [accountId] = acctMatch;
+            const adFormat = args.ad_format || "DESKTOP_FEED_STANDARD";
+            try {
+                if (args.ad_id) {
+                    const data = await metaGet(`${args.ad_id}/previews`, { ad_format: adFormat });
+                    result = { ad_id: args.ad_id, ad_format: adFormat, previews: data.data || [] };
+                } else if (args.creative_id) {
+                    const data = await metaGet(`act_${accountId}/generatepreviews`, {
+                        creative: JSON.stringify({ creative_id: args.creative_id }),
+                        ad_format: adFormat,
+                    });
+                    result = { creative_id: args.creative_id, ad_format: adFormat, previews: data.data || [] };
+                } else {
+                    result = { error: "Provide ad_id or creative_id to preview." };
+                }
+            } catch (e) { result = { error: e.message }; }
+        }
+
+    } else if (name === "subscribe_meta_webhooks") {
+        if (!META_APP_ID || !META_APP_SECRET) {
+            result = { error: "META_APP_ID and META_APP_SECRET env vars are required for webhook subscriptions." };
+        } else {
+            const allFields = ["effective_status", "subscriptions", "creative_fatigue", "ad_recommendations", "in_process_ad_objects", "with_issues_ad_objects"];
+            const fields = args.fields && args.fields.length ? args.fields : allFields;
+            const confirm = !!args.confirm;
+            if (!confirm) {
+                result = {
+                    dry_run: true,
+                    message: "DRY RUN — set confirm=true to subscribe",
+                    app_id: META_APP_ID,
+                    callback_url: args.callback_url,
+                    fields,
+                    note: "This will POST to graph.facebook.com/<APP_ID>/subscriptions with object=ad_account. Meta will send a GET verification request to your callback_url.",
+                };
+            } else {
+                try {
+                    const appToken = `${META_APP_ID}|${META_APP_SECRET}`;
+                    const url = `https://graph.facebook.com/${META_API_VERSION}/${META_APP_ID}/subscriptions`;
+                    const resp = await fetchFn(url, {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({
+                            object: "ad_account",
+                            callback_url: args.callback_url,
+                            fields: fields.join(","),
+                            verify_token: args.verify_token,
+                            access_token: appToken,
+                        }),
+                    });
+                    const data = await resp.json();
+                    if (data.error) throw new Error(data.error.message);
+                    result = { success: true, app_id: META_APP_ID, fields, callback_url: args.callback_url, response: data };
+                } catch (e) { result = { error: e.message }; }
+            }
+        }
+
+    } else if (name === "connect_meta_webhooks") {
+        const search = (args.account_name || "").toLowerCase();
+        const acctMatch = Object.entries(META_ACCOUNTS).find(([, info]) => info.name.toLowerCase().includes(search));
+        if (!acctMatch) {
+            result = { error: `No Meta account found matching '${args.account_name}'. Available: ${Object.values(META_ACCOUNTS).map(a => a.name).join(", ")}` };
+        } else {
+            const [accountId, info] = acctMatch;
+            const confirm = !!args.confirm;
+            if (!confirm) {
+                result = {
+                    dry_run: true,
+                    message: "DRY RUN — set confirm=true to connect",
+                    account: info.name,
+                    account_id: accountId,
+                    note: "This will POST to graph.facebook.com/act_<ID>/subscribed_apps to start delivering webhook events for this account.",
+                };
+            } else {
+                try {
+                    const data = await metaPost(`act_${accountId}/subscribed_apps`);
+                    result = { success: true, account: info.name, account_id: accountId, response: data };
+                } catch (e) { result = { error: e.message }; }
+            }
+        }
+
+    } else if (name === "list_meta_subscriptions") {
+        const search = (args.account_name || "").toLowerCase();
+        const acctMatch = Object.entries(META_ACCOUNTS).find(([, info]) => info.name.toLowerCase().includes(search));
+        if (!acctMatch) {
+            result = { error: `No Meta account found matching '${args.account_name}'. Available: ${Object.values(META_ACCOUNTS).map(a => a.name).join(", ")}` };
+        } else {
+            const [accountId, info] = acctMatch;
+            try {
+                const data = await metaGetAll(`act_${accountId}/subscriptions`);
+                result = { account: info.name, subscriptions: data };
+            } catch (e) { result = { error: e.message }; }
+        }
+
+    } else if (name === "create_meta_subscription") {
+        const search = (args.account_name || "").toLowerCase();
+        const acctMatch = Object.entries(META_ACCOUNTS).find(([, info]) => info.name.toLowerCase().includes(search));
+        if (!acctMatch) {
+            result = { error: `No Meta account found matching '${args.account_name}'. Available: ${Object.values(META_ACCOUNTS).map(a => a.name).join(", ")}` };
+        } else {
+            const [accountId, info] = acctMatch;
+            const confirm = !!args.confirm;
+            const body = { event_type: args.event_type, filters: args.filters };
+            if (args.field)    body.field    = args.field;
+            if (args.value)    body.value    = args.value;
+            if (args.operator) body.operator = args.operator;
+            if (!confirm) {
+                result = {
+                    dry_run: true,
+                    message: "DRY RUN — set confirm=true to create",
+                    account: info.name,
+                    subscription: body,
+                };
+            } else {
+                try {
+                    const data = await metaPost(`act_${accountId}/subscriptions`, body);
+                    result = { success: true, account: info.name, subscription_id: data.subscription_id, subscription: body };
+                } catch (e) { result = { error: e.message }; }
+            }
+        }
+
+    } else if (name === "update_meta_subscription") {
+        const search = (args.account_name || "").toLowerCase();
+        const acctMatch = Object.entries(META_ACCOUNTS).find(([, info]) => info.name.toLowerCase().includes(search));
+        if (!acctMatch) {
+            result = { error: `No Meta account found matching '${args.account_name}'. Available: ${Object.values(META_ACCOUNTS).map(a => a.name).join(", ")}` };
+        } else {
+            const [accountId, info] = acctMatch;
+            const confirm = !!args.confirm;
+            if (!confirm) {
+                result = {
+                    dry_run: true,
+                    message: "DRY RUN — set confirm=true to update",
+                    account: info.name,
+                    subscription_id: args.subscription_id,
+                    new_status: args.status,
+                };
+            } else {
+                try {
+                    const data = await metaPatch(`act_${accountId}/subscriptions/${args.subscription_id}`, { status: args.status });
+                    result = { success: true, account: info.name, subscription_id: args.subscription_id, status: args.status, response: data };
+                } catch (e) { result = { error: e.message }; }
+            }
+        }
+
+    } else if (name === "delete_meta_subscription") {
+        const search = (args.account_name || "").toLowerCase();
+        const acctMatch = Object.entries(META_ACCOUNTS).find(([, info]) => info.name.toLowerCase().includes(search));
+        if (!acctMatch) {
+            result = { error: `No Meta account found matching '${args.account_name}'. Available: ${Object.values(META_ACCOUNTS).map(a => a.name).join(", ")}` };
+        } else {
+            const [accountId, info] = acctMatch;
+            const confirm = !!args.confirm;
+            if (!confirm) {
+                result = {
+                    dry_run: true,
+                    message: "DRY RUN — set confirm=true to delete",
+                    account: info.name,
+                    subscription_id: args.subscription_id,
+                    warning: "This permanently deletes the subscription.",
+                };
+            } else {
+                try {
+                    const data = await metaDelete(`act_${accountId}/subscriptions/${args.subscription_id}`);
+                    result = { success: true, account: info.name, subscription_id: args.subscription_id, response: data };
+                } catch (e) { result = { error: e.message }; }
+            }
+        }
+
+    } else if (name === "create_meta_audience") {
+        const search = (args.account_name || "").toLowerCase();
+        const acctMatch = Object.entries(META_ACCOUNTS).find(([, info]) => info.name.toLowerCase().includes(search));
+        if (!acctMatch) {
+            result = { error: `No Meta account found matching '${args.account_name}'. Available: ${Object.values(META_ACCOUNTS).map(a => a.name).join(", ")}` };
+        } else {
+            const [accountId, info] = acctMatch;
+            const confirm = !!args.confirm;
+            try {
+                if (args.type === "custom") {
+                    const body = {
+                        name: args.name,
+                        subtype: "CUSTOM",
+                        description: args.description || "",
+                        customer_file_source: args.customer_file_source || "USER_PROVIDED_ONLY",
+                    };
+                    if (!confirm) {
+                        result = { dry_run: true, message: "DRY RUN — set confirm=true to create", account: info.name, audience: body };
+                    } else {
+                        const data = await metaPost(`act_${accountId}/customaudiences`, body);
+                        result = { success: true, account: info.name, audience_id: data.id, name: args.name };
+                    }
+                } else if (args.type === "lookalike") {
+                    const lookalikeSpec = {};
+                    if (args.seed_audience_id) lookalikeSpec.origin_audience_id = args.seed_audience_id;
+                    if (args.campaign_id) {
+                        lookalikeSpec.origin_ids = [args.campaign_id];
+                        lookalikeSpec.conversion_type = "campaign_conversions";
+                    }
+                    if (args.page_id) {
+                        lookalikeSpec.page_id = args.page_id;
+                        lookalikeSpec.conversion_type = "page_like";
+                    }
+                    if (args.ratio) lookalikeSpec.ratio = args.ratio;
+                    else if (args.lookalike_type === "similarity") lookalikeSpec.type = "similarity";
+                    else if (args.lookalike_type === "reach") lookalikeSpec.type = "reach";
+                    else lookalikeSpec.ratio = 0.01;
+                    if (args.starting_ratio) lookalikeSpec.starting_ratio = args.starting_ratio;
+                    if (args.countries?.length) {
+                        lookalikeSpec.location_spec = { geo_locations: { countries: args.countries } };
+                    } else {
+                        lookalikeSpec.country = args.country || "US";
+                    }
+                    const body = {
+                        name: args.name,
+                        subtype: "LOOKALIKE",
+                        lookalike_spec: JSON.stringify(lookalikeSpec),
+                    };
+                    if (args.seed_audience_id) body.origin_audience_id = args.seed_audience_id;
+                    if (!confirm) {
+                        result = { dry_run: true, message: "DRY RUN — set confirm=true to create", account: info.name, audience: body, lookalike_spec: lookalikeSpec };
+                    } else {
+                        const data = await metaPost(`act_${accountId}/customaudiences`, body);
+                        result = { success: true, account: info.name, audience_id: data.id, name: args.name, note: "Lookalike audience takes 1-6 hours to populate." };
+                    }
+                } else {
+                    result = { error: "type must be 'custom' or 'lookalike'" };
+                }
+            } catch (e) { result = { error: e.message }; }
+        }
+
+    } else if (name === "manage_meta_audience_users") {
+        const search = (args.account_name || "").toLowerCase();
+        const acctMatch = Object.entries(META_ACCOUNTS).find(([, info]) => info.name.toLowerCase().includes(search));
+        if (!acctMatch) {
+            result = { error: `No Meta account found matching '${args.account_name}'. Available: ${Object.values(META_ACCOUNTS).map(a => a.name).join(", ")}` };
+        } else {
+            const [, info] = acctMatch;
+            const confirm = !!args.confirm;
+            const schemaFields = args.schema || [];
+            const dataRows = args.data || [];
+            const noHashFields = new Set(["MADID", "EXTERN_ID"]);
+            const hashIfNeeded = (val, field) => {
+                if (noHashFields.has(field)) return val;
+                if (/^[a-f0-9]{64}$/.test(val)) return val;
+                const { createHash } = require("crypto");
+                const normalized = val.trim().toLowerCase();
+                return createHash("sha256").update(normalized).digest("hex");
+            };
+            const hashedData = dataRows.map(row =>
+                row.map((val, i) => hashIfNeeded(String(val), schemaFields[i]))
+            );
+            if (!confirm) {
+                result = {
+                    dry_run: true,
+                    message: `DRY RUN — set confirm=true to ${args.action} ${dataRows.length} user(s)`,
+                    account: info.name,
+                    audience_id: args.audience_id,
+                    action: args.action,
+                    schema: schemaFields,
+                    user_count: dataRows.length,
+                    sample_hashed: hashedData.slice(0, 2),
+                };
+            } else {
+                try {
+                    const sessionId = Date.now();
+                    const payload = { schema: schemaFields, data: hashedData };
+                    const session = { session_id: sessionId, batch_seq: 1, last_batch_flag: true, estimated_num_total: hashedData.length };
+                    const endpoint = args.action === "remove"
+                        ? `${args.audience_id}/users`
+                        : args.action === "replace"
+                        ? `${args.audience_id}/usersreplace`
+                        : `${args.audience_id}/users`;
+                    const method = args.action === "remove" ? "DELETE" : "POST";
+                    const body = { payload: JSON.stringify(payload), session: JSON.stringify(session) };
+                    let data;
+                    if (method === "DELETE") {
+                        const url = `https://graph.facebook.com/${META_API_VERSION}/${endpoint}`;
+                        const resp = await fetchFn(url, {
+                            method: "DELETE",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({ access_token: META_ACCESS_TOKEN, ...body }),
+                        });
+                        data = await resp.json();
+                        if (data.error) throw new Error(data.error.message);
+                    } else {
+                        data = await metaPost(endpoint, body);
+                    }
+                    result = {
+                        success: true, account: info.name, audience_id: args.audience_id,
+                        action: args.action, num_received: data.num_received, num_invalid: data.num_invalid_entries,
+                        invalid_samples: data.invalid_entry_samples,
+                    };
+                } catch (e) { result = { error: e.message }; }
+            }
+        }
+
+    } else if (name === "get_meta_reach_estimate") {
+        const search = (args.account_name || "").toLowerCase();
+        const acctMatch = Object.entries(META_ACCOUNTS).find(([, info]) => info.name.toLowerCase().includes(search));
+        if (!acctMatch) {
+            result = { error: `No Meta account found matching '${args.account_name}'. Available: ${Object.values(META_ACCOUNTS).map(a => a.name).join(", ")}` };
+        } else {
+            const [accountId, info] = acctMatch;
+            try {
+                const targetingSpec = {};
+                if (args.countries?.length) targetingSpec.geo_locations = { countries: args.countries };
+                if (args.age_min) targetingSpec.age_min = args.age_min;
+                if (args.age_max) targetingSpec.age_max = args.age_max;
+                if (args.genders?.length) targetingSpec.genders = args.genders;
+                if (args.interests?.length || args.behaviors?.length) {
+                    const flexSpec = {};
+                    if (args.interests?.length) {
+                        const resolved = [];
+                        for (const name of args.interests) {
+                            const results = await metaSearchInterests(name);
+                            if (results.length) resolved.push({ id: results[0].id, name: results[0].name });
+                        }
+                        if (resolved.length) flexSpec.interests = resolved;
+                    }
+                    if (args.behaviors?.length) {
+                        const resolved = [];
+                        for (const name of args.behaviors) {
+                            const results = await metaSearchInterests(name);
+                            if (results.length) resolved.push({ id: results[0].id, name: results[0].name });
+                        }
+                        if (resolved.length) flexSpec.behaviors = resolved;
+                    }
+                    if (Object.keys(flexSpec).length) targetingSpec.flexible_spec = [flexSpec];
+                }
+                if (args.custom_audiences?.length) targetingSpec.custom_audiences = args.custom_audiences.map(id => ({ id }));
+                if (args.excluded_audiences?.length) targetingSpec.excluded_custom_audiences = args.excluded_audiences.map(id => ({ id }));
+                if (args.publisher_platforms?.length) targetingSpec.publisher_platforms = args.publisher_platforms;
+
+                const params = { targeting_spec: JSON.stringify(targetingSpec) };
+                if (args.optimize_for) params.optimize_for = args.optimize_for;
+                const data = await metaGet(`act_${accountId}/reachestimate`, params);
+                result = {
+                    account: info.name,
+                    targeting_spec: targetingSpec,
+                    estimated_users: data.data?.[0]?.users ?? data.users ?? null,
+                    estimate_ready: data.data?.[0]?.estimate_ready ?? data.estimate_ready ?? null,
+                    bid_estimations: data.data?.[0]?.bid_estimations ?? null,
+                };
+            } catch (e) { result = { error: e.message }; }
+        }
+
+    } else if (name === "manage_meta_ad_rules") {
+        const search = (args.account_name || "").toLowerCase();
+        const acctMatch = Object.entries(META_ACCOUNTS).find(([, info]) => info.name.toLowerCase().includes(search));
+        if (!acctMatch) {
+            result = { error: `No Meta account found matching '${args.account_name}'. Available: ${Object.values(META_ACCOUNTS).map(a => a.name).join(", ")}` };
+        } else {
+            const [accountId, info] = acctMatch;
+            const action = args.action || "list";
+            const confirm = !!args.confirm;
+            try {
+                if (action === "list") {
+                    const rules = await metaGetAll(`act_${accountId}/adrules_library`, {
+                        fields: "id,name,status,evaluation_spec,execution_spec,schedule_spec",
+                    });
+                    result = { account: info.name, total: rules.length, rules: rules.map(r => ({
+                        id: r.id, name: r.name, status: r.status,
+                        evaluation_type: r.evaluation_spec?.evaluation_type,
+                        execution_type: r.execution_spec?.execution_type,
+                    })) };
+
+                } else if (action === "read") {
+                    if (!args.rule_id) { result = { error: "rule_id is required for read." }; }
+                    else {
+                        const rule = await metaGet(args.rule_id, { fields: "id,name,status,evaluation_spec,execution_spec,schedule_spec,created_time,updated_time" });
+                        result = { account: info.name, rule };
+                    }
+
+                } else if (action === "create") {
+                    if (!args.name || !args.evaluation_spec || !args.execution_spec) {
+                        result = { error: "name, evaluation_spec, and execution_spec are required for create." };
+                    } else {
+                        const body = {
+                            name: args.name,
+                            evaluation_spec: JSON.stringify(args.evaluation_spec),
+                            execution_spec: JSON.stringify(args.execution_spec),
+                        };
+                        if (args.schedule_spec) body.schedule_spec = JSON.stringify(args.schedule_spec);
+                        if (args.status) body.status = args.status;
+                        if (!confirm) {
+                            result = { dry_run: true, message: "DRY RUN — set confirm=true to create", account: info.name, rule: { name: args.name, ...body } };
+                        } else {
+                            const data = await metaPost(`act_${accountId}/adrules_library`, body);
+                            result = { success: true, account: info.name, rule_id: data.id, name: args.name };
+                        }
+                    }
+
+                } else if (action === "update") {
+                    if (!args.rule_id) { result = { error: "rule_id is required for update." }; }
+                    else {
+                        const body = {};
+                        if (args.name) body.name = args.name;
+                        if (args.evaluation_spec) body.evaluation_spec = JSON.stringify(args.evaluation_spec);
+                        if (args.execution_spec) body.execution_spec = JSON.stringify(args.execution_spec);
+                        if (args.schedule_spec) body.schedule_spec = JSON.stringify(args.schedule_spec);
+                        if (args.status) body.status = args.status;
+                        if (!confirm) {
+                            result = { dry_run: true, message: "DRY RUN — set confirm=true to update", account: info.name, rule_id: args.rule_id, updates: body };
+                        } else {
+                            await metaPost(args.rule_id, body);
+                            result = { success: true, account: info.name, rule_id: args.rule_id, updated_fields: Object.keys(body) };
+                        }
+                    }
+
+                } else if (action === "delete") {
+                    if (!args.rule_id) { result = { error: "rule_id is required for delete." }; }
+                    else if (!confirm) {
+                        result = { dry_run: true, message: "DRY RUN — set confirm=true to delete", account: info.name, rule_id: args.rule_id, warning: "This permanently deletes the rule." };
+                    } else {
+                        await metaDelete(args.rule_id);
+                        result = { success: true, account: info.name, rule_id: args.rule_id, deleted: true };
+                    }
+
+                } else if (action === "preview") {
+                    if (!args.rule_id) { result = { error: "rule_id is required for preview." }; }
+                    else {
+                        const data = await metaPost(`${args.rule_id}/preview`, {});
+                        result = { account: info.name, rule_id: args.rule_id, preview: data };
+                    }
+
+                } else if (action === "execute") {
+                    if (!args.rule_id) { result = { error: "rule_id is required for execute." }; }
+                    else if (!confirm) {
+                        result = { dry_run: true, message: "DRY RUN — set confirm=true to execute", account: info.name, rule_id: args.rule_id, warning: "This will run the rule immediately." };
+                    } else {
+                        const data = await metaPost(`${args.rule_id}/execute`, {});
+                        result = { success: true, account: info.name, rule_id: args.rule_id, execution: data };
+                    }
+
+                } else if (action === "history") {
+                    if (!args.rule_id) { result = { error: "rule_id is required for history." }; }
+                    else {
+                        const history = await metaGetAll(`${args.rule_id}/history`, {});
+                        result = { account: info.name, rule_id: args.rule_id, total: history.length, entries: history.slice(0, 50) };
+                    }
+                } else {
+                    result = { error: `Unknown action '${action}'. Valid: list, read, create, update, delete, preview, execute, history.` };
+                }
+            } catch (e) { result = { error: e.message }; }
+        }
+
+    } else if (name === "get_meta_ad_issues") {
+        const search = (args.account_name || "").toLowerCase();
+        const targets = Object.entries(META_ACCOUNTS).filter(([, info]) => !search || info.name.toLowerCase().includes(search));
+        if (!targets.length) {
+            result = { error: `No Meta account found matching '${args.account_name}'. Available: ${Object.values(META_ACCOUNTS).map(a => a.name).join(", ")}` };
+        } else {
+            const accounts = [];
+            let totalIssues = 0;
+            for (const [accountId, info] of targets) {
+                try {
+                    const ads = await metaGetAll(`act_${accountId}/ads`, {
+                        fields: "id,name,status,effective_status,ad_review_feedback,campaign{name}",
+                        filtering: JSON.stringify([{ field: "effective_status", operator: "IN", value: ["DISAPPROVED", "PENDING_REVIEW", "WITH_ISSUES"] }]),
+                    });
+                    if (ads.length) {
+                        totalIssues += ads.length;
+                        accounts.push({
+                            account: info.name,
+                            issue_count: ads.length,
+                            ads: ads.map(a => ({
+                                id: a.id, name: a.name, status: a.status,
+                                effective_status: a.effective_status,
+                                campaign: a.campaign?.name,
+                                review_feedback: a.ad_review_feedback,
+                            })),
+                        });
+                    }
+                } catch (e) { accounts.push({ account: info.name, error: e.message }); }
+            }
+            result = {
+                checked: targets.length,
+                total_issues: totalIssues,
+                message: totalIssues === 0 ? "All Meta ads are approved and delivering." : `${totalIssues} ad(s) have issues.`,
+                accounts,
+            };
+        }
+
+    } else if (name === "get_meta_insights") {
+        const search = (args.account_name || "").toLowerCase();
+        const acctMatch = Object.entries(META_ACCOUNTS).find(([, info]) => info.name.toLowerCase().includes(search));
+        if (!acctMatch) {
+            result = { error: `No Meta account found matching '${args.account_name}'. Available: ${Object.values(META_ACCOUNTS).map(a => a.name).join(", ")}` };
+        } else {
+            const [accountId, info] = acctMatch;
+            try {
+                const params = {
+                    fields: "spend,impressions,clicks,ctr,cpc,cpm,actions,cost_per_action_type,reach,frequency",
+                    breakdowns: args.breakdown,
+                };
+                const datePreset = args.date_preset || (args.start_date ? undefined : "last_30d");
+                if (datePreset) params.date_preset = datePreset;
+                if (args.start_date && args.end_date) {
+                    params.time_range = JSON.stringify({ since: args.start_date, until: args.end_date });
+                }
+                const level = args.level || "account";
+                let endpoint = `act_${accountId}/insights`;
+                if (level === "campaign") endpoint = `act_${accountId}/insights`;
+                if (args.campaign_name && level !== "account") {
+                    params.filtering = JSON.stringify([{ field: "campaign.name", operator: "CONTAIN", value: args.campaign_name }]);
+                }
+                params.level = level;
+                params.limit = 200;
+
+                const rows = await metaGetAll(endpoint, params);
+                const formatted = rows.map(r => {
+                    const row = {
+                        [args.breakdown]: r[args.breakdown],
+                        spend: parseFloat(r.spend || 0),
+                        impressions: parseInt(r.impressions || 0),
+                        clicks: parseInt(r.clicks || 0),
+                        ctr: parseFloat(r.ctr || 0),
+                        cpc: parseFloat(r.cpc || 0),
+                        cpm: parseFloat(r.cpm || 0),
+                        reach: parseInt(r.reach || 0),
+                    };
+                    if (r.actions) {
+                        for (const a of r.actions) {
+                            row[`actions_${a.action_type}`] = parseInt(a.value);
+                        }
+                    }
+                    if (r.cost_per_action_type) {
+                        for (const a of r.cost_per_action_type) {
+                            row[`cost_per_${a.action_type}`] = parseFloat(a.value);
+                        }
+                    }
+                    if (level !== "account") {
+                        row.campaign_name = r.campaign_name;
+                        if (level === "adset" || level === "ad") row.adset_name = r.adset_name;
+                        if (level === "ad") row.ad_name = r.ad_name;
+                    }
+                    return row;
+                });
+                result = { account: info.name, breakdown: args.breakdown, level, date_preset: datePreset, total_rows: formatted.length, rows: formatted };
+            } catch (e) { result = { error: e.message }; }
+        }
+
+    } else if (name === "update_meta_object") {
+        const search = (args.account_name || "").toLowerCase();
+        const acctMatch = Object.entries(META_ACCOUNTS).find(([, info]) => info.name.toLowerCase().includes(search));
+        if (!acctMatch) {
+            result = { error: `No Meta account found matching '${args.account_name}'. Available: ${Object.values(META_ACCOUNTS).map(a => a.name).join(", ")}` };
+        } else {
+            const [, info] = acctMatch;
+            const confirm = !!args.confirm;
+            const updates = args.updates || {};
+            const body = { ...updates };
+            const budgetFields = ["daily_budget", "lifetime_budget", "spend_cap", "bid_amount", "daily_min_spend_target", "daily_spend_cap", "lifetime_min_spend_target", "lifetime_spend_cap"];
+            for (const f of budgetFields) {
+                if (body[f] !== undefined) body[f] = Math.round(body[f] * 100);
+            }
+            if (body.bid_strategy === "BID_CAP") body.bid_strategy = "LOWEST_COST_WITH_BID_CAP";
+            if (body.roas_control) {
+                body.bid_constraints = JSON.stringify({ roas_average_floor: Math.round(body.roas_control * 10000) });
+                delete body.roas_control;
+            }
+            if (!confirm) {
+                result = { dry_run: true, message: "DRY RUN — set confirm=true to apply", account: info.name, object_id: args.object_id, level: args.level, updates: body };
+            } else {
+                try {
+                    await metaPost(args.object_id, body);
+                    result = { success: true, account: info.name, object_id: args.object_id, level: args.level, updated_fields: Object.keys(updates) };
+                } catch (e) { result = { error: e.message }; }
+            }
+        }
+
+    } else if (name === "manage_meta_leads") {
+        const search = (args.account_name || "").toLowerCase();
+        const acctMatch = Object.entries(META_ACCOUNTS).find(([, info]) => info.name.toLowerCase().includes(search));
+        if (!acctMatch) {
+            result = { error: `No Meta account found matching '${args.account_name}'. Available: ${Object.values(META_ACCOUNTS).map(a => a.name).join(", ")}` };
+        } else {
+            const [, info] = acctMatch;
+            const pageId = info.page_id;
+            if (!pageId && args.action === "list_forms") {
+                result = { error: `No page_id configured for '${info.name}'. Add page_id to accounts.json.` };
+            } else {
+                try {
+                    if (args.action === "list_forms") {
+                        const forms = await metaGetAll(`${pageId}/leadgen_forms`, {
+                            fields: "id,name,status,leads_count,created_time,questions",
+                        });
+                        result = {
+                            account: info.name, page_id: pageId, total: forms.length,
+                            forms: forms.map(f => ({
+                                id: f.id, name: f.name, status: f.status,
+                                leads_count: f.leads_count, created_time: f.created_time,
+                                questions: f.questions?.map(q => q.label || q.key),
+                            })),
+                        };
+                    } else if (args.action === "get_leads") {
+                        if (!args.form_id) { result = { error: "form_id is required for get_leads." }; }
+                        else {
+                            const limit = args.limit || 100;
+                            const leads = await metaGetAll(`${args.form_id}/leads`, {
+                                fields: "id,created_time,field_data,ad_id,ad_name",
+                                limit,
+                            });
+                            result = {
+                                account: info.name, form_id: args.form_id, total: leads.length,
+                                leads: leads.slice(0, limit).map(l => ({
+                                    id: l.id, created_time: l.created_time,
+                                    ad_name: l.ad_name,
+                                    fields: l.field_data?.reduce((acc, f) => { acc[f.name] = f.values?.join(", "); return acc; }, {}),
+                                })),
+                            };
+                        }
+                    } else {
+                        result = { error: `Unknown action '${args.action}'. Valid: list_forms, get_leads.` };
                     }
                 } catch (e) { result = { error: e.message }; }
             }
