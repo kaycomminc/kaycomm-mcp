@@ -891,7 +891,6 @@ async function createMetaCampaignFull(accountId, pageId, config) {
             status: "PAUSED",
             optimization_goal: adSetDef.optimization_goal || "LINK_CLICKS",
             billing_event: adSetDef.billing_event || "IMPRESSIONS",
-            bid_strategy: "LOWEST_COST_WITHOUT_CAP",
             targeting: targetingSpec,
         };
         if (!config.cbo && adSetDef.daily_budget) {
