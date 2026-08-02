@@ -629,37 +629,17 @@ async function mutateNegativeKeywords(token, customerId, mccId, campaignResource
 
 // ── Meta write helpers ────────────────────────────────────────────────────────
 async function metaDuplicate(id, level, newName, status = "PAUSED") {
-    // Uses Meta's /copies endpoint to deep-copy a campaign or ad set
     const body = {
-        access_token:  META_ACCESS_TOKEN,
-        deep_copy:     true,
+        deep_copy:     "true",
         status_option: status.toUpperCase(),
     };
     if (newName) {
-        body.rename_options = { rename_prefix: "", rename_suffix: "" };
-        // Meta's copies endpoint doesn't directly set the name, so we'll rename after
+        body.rename_options = JSON.stringify({ rename_prefix: "", rename_suffix: "" });
     }
-    const resp = await fetchFn(
-        `https://graph.facebook.com/${META_API_VERSION}/${id}/copies`,
-        {
-            method:  "POST",
-            headers: { "Content-Type": "application/json" },
-            body:    JSON.stringify(body),
-        }
-    );
-    const data = await resp.json();
-    if (data.error) throw new Error(data.error.message);
+    const data = await metaPost(`${id}/copies`, body);
     const newId = (data.copied_campaign_id || data.copied_adset_id || data.id);
-    // Rename if a new name was provided
     if (newName && newId) {
-        await fetchFn(
-            `https://graph.facebook.com/${META_API_VERSION}/${newId}`,
-            {
-                method:  "POST",
-                headers: { "Content-Type": "application/json" },
-                body:    JSON.stringify({ access_token: META_ACCESS_TOKEN, name: newName }),
-            }
-        );
+        await metaPost(newId, { name: newName });
     }
     return { new_id: newId, new_name: newName || null };
 }
