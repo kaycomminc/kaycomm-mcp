@@ -1906,6 +1906,11 @@ function inferNegatives(kwMetrics) {
 async function listGoogleCampaignsFull(token, customerId, mccId) {
     // Two queries merged: a date-filtered metrics query alone would hide
     // campaigns with zero spend this month (they have no data rows).
+    //
+    // THIS_MONTH includes today's partial spend, unlike fetchGoogleMTD, which
+    // stops at yesterday so pacing math isn't skewed by an incomplete day. Both
+    // windows are intentional, so the field is named for the one it uses —
+    // mtd_spend here would look comparable to the pacing report and isn't.
     const [all, spendRows] = await Promise.all([
         listGoogleCampaignsAll(token, customerId, mccId),
         googleSearch(token, customerId, mccId, `
@@ -1919,7 +1924,7 @@ async function listGoogleCampaignsFull(token, customerId, mccId) {
         spend[r.campaign.resourceName] = (spend[r.campaign.resourceName] || 0) + parseInt(r.metrics?.costMicros || 0);
     }
     return all
-        .map(c => ({ ...c, mtd_spend: "$" + ((spend[c.resource_name] || 0) / 1_000_000).toFixed(2) }))
+        .map(c => ({ ...c, mtd_spend_incl_today: "$" + ((spend[c.resource_name] || 0) / 1_000_000).toFixed(2) }))
         .sort((a, b) => (spend[b.resource_name] || 0) - (spend[a.resource_name] || 0));
 }
 
@@ -3707,7 +3712,7 @@ function makeServer() {
         },
         {
             name: "list_campaigns",
-            description: "List all campaigns and their status, daily budget, and MTD spend for a client. Works on Google and/or Meta. Use before pause/enable/update_budget to find exact campaign names.",
+            description: "List all campaigns and their status, daily budget, and month-to-date spend for a client. Works on Google and/or Meta. Use before pause/enable/update_budget to find exact campaign names. Google spend (mtd_spend_incl_today) runs the 1st through today and includes today's partial day — get_full_pacing stops at yesterday, so the two will not match. Use get_full_pacing for pacing decisions.",
             inputSchema: {
                 type: "object",
                 properties: {
@@ -4078,7 +4083,7 @@ function makeServer() {
         },
         {
             name: "get_budget_overview",
-            description: "Pull daily and lifetime budgets for all campaigns across all tracked Google Ads and Meta accounts. Shows which campaigns use daily vs lifetime budgets and current amounts.",
+            description: "Pull daily and lifetime budgets for all campaigns across all tracked Google Ads and Meta accounts. Shows which campaigns use daily vs lifetime budgets and current amounts. Google spend (mtd_spend_incl_today) runs the 1st through today and includes today's partial day, unlike get_full_pacing, which stops at yesterday.",
             inputSchema: {
                 type: "object",
                 properties: {
@@ -5174,7 +5179,17 @@ async function handleToolCall(name, args = {}) {
                 const { token, error: authErr } = await getGoogleAccessToken();
                 if (authErr) { result.google_error = authErr; }
                 else {
-                    try { result.google = { account: info.name, campaigns: await listGoogleCampaignsFull(token, cid, info.mcc) }; }
+                    try {
+                        result.google = {
+                            account: info.name,
+                            // Stated explicitly: this window runs through today, while
+                            // get_full_pacing stops at yesterday. Without the label the two
+                            // reports silently disagree on the same account.
+                            spend_through: getDateInfo().today,
+                            spend_note: "mtd_spend_incl_today covers the 1st through today, including today's partial spend. get_full_pacing stops at yesterday, so its figures will be lower.",
+                            campaigns: await listGoogleCampaignsFull(token, cid, info.mcc),
+                        };
+                    }
                     catch (e) { result.google_error = e.message; }
                 }
             }
@@ -6627,12 +6642,13 @@ async function handleToolCall(name, args = {}) {
                         if (filtered.length) {
                             result.google.push({
                                 account: info.name,
+                                spend_through: getDateInfo().today,
                                 campaigns: filtered.map(c => ({
                                     name:         c.name,
                                     status:       c.status,
                                     type:         c.type,
                                     daily_budget: c.daily_budget || null,
-                                    mtd_spend:    c.mtd_spend,
+                                    mtd_spend_incl_today: c.mtd_spend_incl_today,
                                 })),
                             });
                         }
@@ -8965,6 +8981,23 @@ async function main() {
         httpServer.listen(parseInt(PORT), () => {
             console.error(`KayComm MCP running on port ${PORT} (SSE mode: /sse + /messages; Streamable HTTP: /mcp; auth ${AUTH_TOKEN ? "enabled" : "NOT CONFIGURED"})`);
         });
+
+        // Railway sends SIGTERM on every redeploy. Without this, node dies
+        // instantly and in-flight requests / open SSE streams are severed.
+        let shuttingDown = false;
+        const shutdown = (sig) => {
+            if (shuttingDown) return;
+            shuttingDown = true;
+            console.error(`Received ${sig} — draining connections, then exiting`);
+            httpServer.close(() => process.exit(0));
+            // Railway allows ~10s before SIGKILL; don't hang past that.
+            setTimeout(() => {
+                console.error("Drain timed out — forcing exit");
+                process.exit(0);
+            }, 10000).unref();
+        };
+        process.on("SIGTERM", () => shutdown("SIGTERM"));
+        process.on("SIGINT", () => shutdown("SIGINT"));
 
     } else {
         // ── stdio mode (local Claude Desktop) ───────────────────────────────
