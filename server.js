@@ -750,6 +750,8 @@ async function metaGetAll(path, extraParams = {}) {
     return rows;
 }
 
+function metaActId(id) { return id.startsWith("act_") ? id : `act_${id}`; }
+
 async function getMetaCampaigns(accountId) {
     const rows = await metaGetAll(`${accountId}/campaigns`, {
         fields: "id,name,status,daily_budget,lifetime_budget,objective",
@@ -778,13 +780,13 @@ async function getMetaAdsets(accountId) {
     }));
 }
 
-async function getMetaAds(accountId, campaignName) {
+async function getMetaAds(accountId, filterName) {
     const params = {
         fields: "id,name,status,effective_status,creative{id,name,thumbnail_url},adset{id,name}",
         limit: 200,
     };
-    if (campaignName) {
-        params.filtering = JSON.stringify([{ field: "campaign.name", operator: "CONTAIN", value: campaignName }]);
+    if (filterName) {
+        params.filtering = JSON.stringify([{ field: "name", operator: "CONTAIN", value: filterName }]);
     }
     const rows = await metaGetAll(`${accountId}/ads`, params);
     return rows.map(a => ({
@@ -2066,7 +2068,7 @@ async function getMetaAccountSpend(accountId) {
     // Returns spend in last 30 days for a single ad account (0 if no data)
     try {
         const resp = await fetchFn(
-            `https://graph.facebook.com/${META_API_VERSION}/${accountId}/insights?fields=spend&date_preset=last_30_days&access_token=${META_ACCESS_TOKEN}`
+            `https://graph.facebook.com/${META_API_VERSION}/${accountId}/insights?fields=spend&date_preset=last_30d&access_token=${META_ACCESS_TOKEN}`
         );
         const data = await resp.json();
         if (data.error) return 0;
@@ -2082,7 +2084,7 @@ async function batchMetaSpend(accountIds) {
         const chunk = accountIds.slice(i, i + BATCH_SIZE);
         const batch = chunk.map(id => ({
             method:       "GET",
-            relative_url: `${id}/insights?fields=spend&date_preset=last_30_days`,
+            relative_url: `${id}/insights?fields=spend&date_preset=last_30d`,
         }));
         try {
             const resp = await fetchFn(
@@ -5494,7 +5496,8 @@ async function handleToolCall(name, args = {}) {
         const endDate   = args.end_date;
         const metaPresetMap = {
             THIS_MONTH: "this_month", LAST_MONTH: "last_month",
-            LAST_30_DAYS: "last_30_days", LAST_90_DAYS: "last_90_days", LAST_7_DAYS: "last_7_days",
+            LAST_7_DAYS: "last_7d", LAST_14_DAYS: "last_14d",
+            LAST_30_DAYS: "last_30d", LAST_90_DAYS: "last_90d",
             YEAR_TO_DATE: "this_year",
         };
 
@@ -7996,7 +7999,7 @@ async function handleToolCall(name, args = {}) {
                     const data = await metaGet(`${args.ad_id}/previews`, { ad_format: adFormat });
                     result = { ad_id: args.ad_id, ad_format: adFormat, previews: data.data || [] };
                 } else if (args.creative_id) {
-                    const data = await metaGet(`act_${accountId}/generatepreviews`, {
+                    const data = await metaGet(`${metaActId(accountId)}/generatepreviews`, {
                         creative: JSON.stringify({ creative_id: args.creative_id }),
                         ad_format: adFormat,
                     });
@@ -8063,7 +8066,7 @@ async function handleToolCall(name, args = {}) {
                 };
             } else {
                 try {
-                    const data = await metaPost(`act_${accountId}/subscribed_apps`);
+                    const data = await metaPost(`${metaActId(accountId)}/subscribed_apps`);
                     result = { success: true, account: info.name, account_id: accountId, response: data };
                 } catch (e) { result = { error: e.message }; }
             }
@@ -8077,7 +8080,7 @@ async function handleToolCall(name, args = {}) {
         } else {
             const [accountId, info] = acctMatch;
             try {
-                const data = await metaGetAll(`act_${accountId}/subscriptions`);
+                const data = await metaGetAll(`${metaActId(accountId)}/subscriptions`);
                 result = { account: info.name, subscriptions: data };
             } catch (e) { result = { error: e.message }; }
         }
@@ -8103,7 +8106,7 @@ async function handleToolCall(name, args = {}) {
                 };
             } else {
                 try {
-                    const data = await metaPost(`act_${accountId}/subscriptions`, body);
+                    const data = await metaPost(`${metaActId(accountId)}/subscriptions`, body);
                     result = { success: true, account: info.name, subscription_id: data.subscription_id, subscription: body };
                 } catch (e) { result = { error: e.message }; }
             }
@@ -8127,7 +8130,7 @@ async function handleToolCall(name, args = {}) {
                 };
             } else {
                 try {
-                    const data = await metaPatch(`act_${accountId}/subscriptions/${args.subscription_id}`, { status: args.status });
+                    const data = await metaPatch(`${metaActId(accountId)}/subscriptions/${args.subscription_id}`, { status: args.status });
                     result = { success: true, account: info.name, subscription_id: args.subscription_id, status: args.status, response: data };
                 } catch (e) { result = { error: e.message }; }
             }
@@ -8151,7 +8154,7 @@ async function handleToolCall(name, args = {}) {
                 };
             } else {
                 try {
-                    const data = await metaDelete(`act_${accountId}/subscriptions/${args.subscription_id}`);
+                    const data = await metaDelete(`${metaActId(accountId)}/subscriptions/${args.subscription_id}`);
                     result = { success: true, account: info.name, subscription_id: args.subscription_id, response: data };
                 } catch (e) { result = { error: e.message }; }
             }
@@ -8176,7 +8179,7 @@ async function handleToolCall(name, args = {}) {
                     if (!confirm) {
                         result = { dry_run: true, message: "DRY RUN — set confirm=true to create", account: info.name, audience: body };
                     } else {
-                        const data = await metaPost(`act_${accountId}/customaudiences`, body);
+                        const data = await metaPost(`${metaActId(accountId)}/customaudiences`, body);
                         result = { success: true, account: info.name, audience_id: data.id, name: args.name };
                     }
                 } else if (args.type === "lookalike") {
@@ -8209,7 +8212,7 @@ async function handleToolCall(name, args = {}) {
                     if (!confirm) {
                         result = { dry_run: true, message: "DRY RUN — set confirm=true to create", account: info.name, audience: body, lookalike_spec: lookalikeSpec };
                     } else {
-                        const data = await metaPost(`act_${accountId}/customaudiences`, body);
+                        const data = await metaPost(`${metaActId(accountId)}/customaudiences`, body);
                         result = { success: true, account: info.name, audience_id: data.id, name: args.name, note: "Lookalike audience takes 1-6 hours to populate." };
                     }
                 } else {
@@ -8323,7 +8326,7 @@ async function handleToolCall(name, args = {}) {
 
                 const params = { targeting_spec: JSON.stringify(targetingSpec) };
                 if (args.optimize_for) params.optimize_for = args.optimize_for;
-                const data = await metaGet(`act_${accountId}/reachestimate`, params);
+                const data = await metaGet(`${metaActId(accountId)}/reachestimate`, params);
                 result = {
                     account: info.name,
                     targeting_spec: targetingSpec,
@@ -8345,7 +8348,7 @@ async function handleToolCall(name, args = {}) {
             const confirm = !!args.confirm;
             try {
                 if (action === "list") {
-                    const rules = await metaGetAll(`act_${accountId}/adrules_library`, {
+                    const rules = await metaGetAll(`${metaActId(accountId)}/adrules_library`, {
                         fields: "id,name,status,evaluation_spec,execution_spec,schedule_spec",
                     });
                     result = { account: info.name, total: rules.length, rules: rules.map(r => ({
@@ -8375,7 +8378,7 @@ async function handleToolCall(name, args = {}) {
                         if (!confirm) {
                             result = { dry_run: true, message: "DRY RUN — set confirm=true to create", account: info.name, rule: { name: args.name, ...body } };
                         } else {
-                            const data = await metaPost(`act_${accountId}/adrules_library`, body);
+                            const data = await metaPost(`${metaActId(accountId)}/adrules_library`, body);
                             result = { success: true, account: info.name, rule_id: data.id, name: args.name };
                         }
                     }
@@ -8444,7 +8447,7 @@ async function handleToolCall(name, args = {}) {
             let totalIssues = 0;
             for (const [accountId, info] of targets) {
                 try {
-                    const ads = await metaGetAll(`act_${accountId}/ads`, {
+                    const ads = await metaGetAll(`${metaActId(accountId)}/ads`, {
                         fields: "id,name,status,effective_status,ad_review_feedback,campaign{name}",
                         filtering: JSON.stringify([{ field: "effective_status", operator: "IN", value: ["DISAPPROVED", "PENDING_REVIEW", "WITH_ISSUES"] }]),
                     });
@@ -8489,8 +8492,8 @@ async function handleToolCall(name, args = {}) {
                     params.time_range = JSON.stringify({ since: args.start_date, until: args.end_date });
                 }
                 const level = args.level || "account";
-                let endpoint = `act_${accountId}/insights`;
-                if (level === "campaign") endpoint = `act_${accountId}/insights`;
+                let endpoint = `${metaActId(accountId)}/insights`;
+                if (level === "campaign") endpoint = `${metaActId(accountId)}/insights`;
                 if (args.campaign_name && level !== "account") {
                     params.filtering = JSON.stringify([{ field: "campaign.name", operator: "CONTAIN", value: args.campaign_name }]);
                 }
