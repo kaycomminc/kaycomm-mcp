@@ -7125,13 +7125,12 @@ async function handleToolCall(name, args = {}) {
             const [accountId, acctInfo] = acctMatch;
             try {
                 const audiences = await metaGetAll(`${accountId}/customaudiences`, {
-                    fields: "id,name,approximate_count,subtype,description",
+                    fields: "id,name,subtype,description",
                 });
                 result = {
                     account: acctInfo.name,
                     audiences: audiences.map(a => ({
                         id: a.id, name: a.name,
-                        approximate_count: a.approximate_count,
                         subtype: a.subtype,
                         description: a.description,
                     })),
@@ -8445,6 +8444,7 @@ async function handleToolCall(name, args = {}) {
         } else {
             const accounts = [];
             let totalIssues = 0;
+            let errorCount = 0;
             for (const [accountId, info] of targets) {
                 try {
                     const ads = await metaGetAll(`${metaActId(accountId)}/ads`, {
@@ -8464,12 +8464,16 @@ async function handleToolCall(name, args = {}) {
                             })),
                         });
                     }
-                } catch (e) { accounts.push({ account: info.name, error: e.message }); }
+                } catch (e) { errorCount++; accounts.push({ account: info.name, error: e.message }); }
             }
+            const message = errorCount > 0
+                ? `${errorCount} account(s) failed to check — results are incomplete.`
+                : totalIssues === 0 ? "All Meta ads are approved and delivering." : `${totalIssues} ad(s) have issues.`;
             result = {
                 checked: targets.length,
+                errors: errorCount,
                 total_issues: totalIssues,
-                message: totalIssues === 0 ? "All Meta ads are approved and delivering." : `${totalIssues} ad(s) have issues.`,
+                message,
                 accounts,
             };
         }
