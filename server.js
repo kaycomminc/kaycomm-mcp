@@ -628,20 +628,118 @@ async function mutateNegativeKeywords(token, customerId, mccId, campaignResource
 }
 
 // ── Meta write helpers ────────────────────────────────────────────────────────
-async function metaDuplicate(id, level, newName, status = "PAUSED") {
+// Shallow-copy a single Meta object via /copies (stays under the 3-object limit).
+// `reparent` is { campaign_id } or { adset_id } to place the copy in a new parent.
+async function metaCopyOne(id, status, reparent = {}) {
     const body = {
-        deep_copy:     "true",
+        access_token:  META_ACCESS_TOKEN,
+        deep_copy:     false,
         status_option: status.toUpperCase(),
+        ...reparent,
     };
-    if (newName) {
-        body.rename_options = JSON.stringify({ rename_prefix: "", rename_suffix: "" });
+    const resp = await fetchFn(
+        `https://graph.facebook.com/${META_API_VERSION}/${id}/copies`,
+        {
+            method:  "POST",
+            headers: { "Content-Type": "application/json" },
+            body:    JSON.stringify(body),
+        }
+    );
+    const data = await resp.json();
+    if (data.error) {
+        const e = data.error;
+        const code = e.code;
+        // Rate limit — let the caller retry
+        if (code === 17 || code === 613 || code === 32) {
+            const err = new Error(e.message);
+            err.rateLimited = true;
+            throw err;
+        }
+        throw new Error(e.message);
     }
-    const data = await metaPost(`${id}/copies`, body);
-    const newId = (data.copied_campaign_id || data.copied_adset_id || data.id);
-    if (newName && newId) {
-        await metaPost(newId, { name: newName });
+    return data.copied_campaign_id || data.copied_adset_id || data.copied_ad_id || data.id;
+}
+
+// Read the full campaign tree: campaign → ad sets → ads per ad set.
+async function metaReadCampaignTree(campaignId) {
+    const campData = await metaGet(campaignId, {
+        fields: "name,objective,status,daily_budget,lifetime_budget,bid_strategy,special_ad_categories,start_time,stop_time",
+    });
+    const adsets = await metaGetAll(`${campaignId}/adsets`, {
+        fields: "id,name,status", limit: 200,
+    });
+    for (const adset of adsets) {
+        const ads = await metaGetAll(`${adset.id}/ads`, {
+            fields: "id,name,status", limit: 200,
+        });
+        adset.ads = ads;
     }
-    return { new_id: newId, new_name: newName || null };
+    return { campaign: campData, adsets };
+}
+
+// Recursive shallow-copy: campaign shell → each ad set → each ad, one call each.
+// Returns { new_campaign_id, id_map: { adsets: [{source,new}], ads: [{source,new}] }, failures: [] }.
+async function metaDuplicateCampaign(campaignId, newName, status, opts = {}) {
+    const COPY_DELAY_MS = 300;
+    const MAX_RETRIES = 3;
+
+    async function copyWithRetry(id, reparent) {
+        for (let attempt = 0; ; attempt++) {
+            try {
+                return await metaCopyOne(id, status, reparent);
+            } catch (e) {
+                if (e.rateLimited && attempt < MAX_RETRIES - 1) {
+                    await new Promise(r => setTimeout(r, (2 ** attempt) * 2000 + Math.random() * 500));
+                    continue;
+                }
+                throw e;
+            }
+        }
+    }
+
+    // 1. Read the source tree
+    const tree = await metaReadCampaignTree(campaignId);
+
+    // 2. Copy campaign shell (shallow — no ad sets)
+    const newCampaignId = await copyWithRetry(campaignId, {});
+    await new Promise(r => setTimeout(r, COPY_DELAY_MS));
+
+    // Set the final name and optional overrides on the new campaign
+    const updateBody = { name: newName };
+    if (opts.start_time) updateBody.start_time = opts.start_time;
+    if (opts.stop_time) updateBody.stop_time = opts.stop_time;
+    if (opts.daily_budget != null) updateBody.daily_budget = Math.round(opts.daily_budget * 100);
+    if (opts.lifetime_budget != null) updateBody.lifetime_budget = Math.round(opts.lifetime_budget * 100);
+    await metaPost(newCampaignId, updateBody);
+
+    const idMap = { adsets: [], ads: [] };
+    const failures = [];
+
+    // 3. Copy each ad set into the new campaign
+    for (const adset of tree.adsets) {
+        let newAdsetId;
+        try {
+            newAdsetId = await copyWithRetry(adset.id, { campaign_id: newCampaignId });
+            idMap.adsets.push({ source_id: adset.id, source_name: adset.name, new_id: newAdsetId });
+            await new Promise(r => setTimeout(r, COPY_DELAY_MS));
+        } catch (e) {
+            failures.push({ level: "adset", source_id: adset.id, source_name: adset.name, error: e.message });
+            continue; // skip ads under this ad set
+        }
+
+        // 4. Copy each ad into the matching new ad set
+        for (const ad of (adset.ads || [])) {
+            try {
+                const newAdId = await copyWithRetry(ad.id, { adset_id: newAdsetId });
+                idMap.ads.push({ source_id: ad.id, source_name: ad.name, new_id: newAdId, adset_source: adset.id, adset_new: newAdsetId });
+                await new Promise(r => setTimeout(r, COPY_DELAY_MS));
+            } catch (e) {
+                failures.push({ level: "ad", source_id: ad.id, source_name: ad.name, parent_adset: adset.name, error: e.message });
+            }
+        }
+    }
+
+    return { new_campaign_id: newCampaignId, new_name: newName, id_map: idMap, failures };
 }
 async function metaGet(path, extraParams = {}) {
     const params = new URLSearchParams({ access_token: META_ACCESS_TOKEN, ...extraParams });
@@ -3127,10 +3225,12 @@ async function fetchBiddingStrategies(token, customerId, mccId, campaignSearch) 
 }
 
 // get_change_history — queries the change_event resource for audit trail
+// change_event requires explicit BETWEEN dates (DURING not supported), max 30 days back.
 async function fetchChangeHistory(token, customerId, mccId, days, resourceType) {
-    const periodMap = { 7: "LAST_7_DAYS", 14: "LAST_14_DAYS", 30: "LAST_30_DAYS" };
-    const period = periodMap[days] || "LAST_14_DAYS";
-    let where = `change_event.change_date_time DURING ${period}`;
+    const { today, yesterday } = getDateInfo();
+    const lookbackDays = Math.min(days || 14, 30);
+    const startDate = daysAgo(lookbackDays, today);
+    let where = `change_event.change_date_time BETWEEN '${startDate}' AND '${today}'`;
     if (resourceType) where += ` AND change_event.change_resource_type = '${resourceType}'`;
     const rows = await googleSearch(token, customerId, mccId, `
         SELECT change_event.change_date_time,
@@ -4246,7 +4346,7 @@ function makeServer() {
         },
         {
             name: "duplicate_meta_campaign",
-            description: "Duplicate a Meta campaign (deep copy including ad sets and ads). " +
+            description: "Duplicate a Meta campaign (copies campaign, ad sets, and ads individually to avoid Meta's 3-object limit). " +
                 "Designed for monthly campaign cloning — e.g. copying NSW's campaign at the start of each month. " +
                 "Dry run by default — set confirm=true to apply.",
             inputSchema: {
@@ -4254,8 +4354,12 @@ function makeServer() {
                 properties: {
                     account_name:     { type: "string", description: "Meta account name (partial match ok)" },
                     source_campaign:  { type: "string", description: "Name of the campaign to duplicate (partial match ok)" },
-                    new_name:         { type: "string", description: "Name for the new campaign. Defaults to 'Copy of [original name]'." },
+                    new_name:         { type: "string", description: "Exact name for the new campaign. Defaults to 'Copy of [original name]'." },
                     status:           { type: "string", enum: ["PAUSED", "ACTIVE", "INHERITED_FROM_SOURCE"], description: "Status for the copy (default: PAUSED)" },
+                    start_time:       { type: "string", description: "ISO 8601 start time for the new campaign (e.g. '2026-09-01T00:00:00-0600'). Omit to inherit from source." },
+                    stop_time:        { type: "string", description: "ISO 8601 end time for the new campaign. Omit to inherit from source." },
+                    daily_budget:     { type: "number", description: "Daily budget in dollars for the new campaign. Omit to inherit from source." },
+                    lifetime_budget:  { type: "number", description: "Lifetime budget in dollars for the new campaign. Omit to inherit from source." },
                     confirm:          { type: "boolean", description: "Set true to create the copy. Omit for dry-run preview." },
                 },
                 required: ["account_name", "source_campaign"],
@@ -5697,20 +5801,123 @@ async function handleToolCall(name, args = {}) {
                     result = { account: acctInfo.name, adsets };
 
                 } else if (action === "list_ads") {
-                    const ads = await getMetaAds(accountId, args.target || null);
-                    result = { account: acctInfo.name, filter: args.target || null, ads };
+                    const target = args.target || null;
+                    const filterLevel = args.level || null;
+                    let ads;
+                    if (!target) {
+                        ads = await getMetaAds(accountId, null);
+                    } else {
+                        const targetLower = target.toLowerCase();
+                        // If target looks like a numeric ID, fetch ads under it directly
+                        if (/^\d+$/.test(target)) {
+                            // Try as ad set ID first, then campaign ID
+                            try {
+                                const adsetAds = await metaGetAll(`${target}/ads`, {
+                                    fields: "id,name,status,effective_status,creative{id,name,thumbnail_url},adset{id,name}",
+                                    limit: 200,
+                                });
+                                ads = adsetAds.map(a => ({
+                                    id: a.id, name: a.name, status: a.status, effective_status: a.effective_status,
+                                    adset: a.adset?.name || null, creative_id: a.creative?.id || null,
+                                    creative_name: a.creative?.name || null, level: "ad",
+                                }));
+                            } catch (_) {
+                                ads = await getMetaAds(accountId, null);
+                                ads = ads.filter(a => a.id === target);
+                            }
+                        } else if (filterLevel === "adset") {
+                            // Match ad set name, then get ads under matching ad sets
+                            const adsets = await getMetaAdsets(accountId);
+                            const matching = adsets.filter(s => s.name.toLowerCase().includes(targetLower));
+                            ads = [];
+                            for (const s of matching) {
+                                const adsetAds = await metaGetAll(`${s.id}/ads`, {
+                                    fields: "id,name,status,effective_status,creative{id,name,thumbnail_url},adset{id,name}",
+                                    limit: 200,
+                                });
+                                ads.push(...adsetAds.map(a => ({
+                                    id: a.id, name: a.name, status: a.status, effective_status: a.effective_status,
+                                    adset: a.adset?.name || null, creative_id: a.creative?.id || null,
+                                    creative_name: a.creative?.name || null, level: "ad",
+                                })));
+                            }
+                        } else {
+                            // Default: try campaign name filter (via Graph API filtering), which works well
+                            ads = await getMetaAds(accountId, target);
+                            // If no results, try matching as ad set name
+                            if (ads.length === 0) {
+                                const adsets = await getMetaAdsets(accountId);
+                                const matching = adsets.filter(s => s.name.toLowerCase().includes(targetLower));
+                                for (const s of matching) {
+                                    const adsetAds = await metaGetAll(`${s.id}/ads`, {
+                                        fields: "id,name,status,effective_status,creative{id,name,thumbnail_url},adset{id,name}",
+                                        limit: 200,
+                                    });
+                                    ads.push(...adsetAds.map(a => ({
+                                        id: a.id, name: a.name, status: a.status, effective_status: a.effective_status,
+                                        adset: a.adset?.name || null, creative_id: a.creative?.id || null,
+                                        creative_name: a.creative?.name || null, level: "ad",
+                                    })));
+                                }
+                            }
+                        }
+                    }
+                    result = { account: acctInfo.name, filter: target, ads };
 
                 } else if (action === "duplicate") {
                     const dupLevel  = args.level || "campaign";
                     const dupStatus = (args.status || "PAUSED").toUpperCase();
                     if (!args.target) {
                         result = { error: "'target' is required for duplicate. Run list_campaigns or list_adsets first to find the name." };
-                    } else {
+                    } else if (dupLevel === "campaign") {
+                        // Use the same recursive shallow-copy as duplicate_meta_campaign
                         const targetSearch = args.target.toLowerCase();
-                        const all  = dupLevel === "campaign" ? await getMetaCampaigns(accountId) : await getMetaAdsets(accountId);
+                        const all = await getMetaCampaigns(accountId);
                         const item = all.find(i => i.name.toLowerCase().includes(targetSearch));
                         if (!item) {
-                            result = { error: `No ${dupLevel} matching '${args.target}'`, available: all.map(i => i.name) };
+                            result = { error: `No campaign matching '${args.target}'`, available: all.map(i => i.name) };
+                        } else {
+                            const copyName = args.new_name || `Copy of ${item.name}`;
+                            const tree = await metaReadCampaignTree(item.id);
+                            const totalAds = tree.adsets.reduce((sum, s) => sum + (s.ads?.length || 0), 0);
+                            if (!confirm) {
+                                result = {
+                                    dry_run: true,
+                                    message: "DRY RUN — set confirm=true to duplicate",
+                                    account:      acctInfo.name,
+                                    source:       { id: item.id, name: item.name, level: dupLevel },
+                                    new_name:     copyName,
+                                    new_status:   dupStatus,
+                                    objects_to_copy: { campaigns: 1, ad_sets: tree.adsets.length, ads: totalAds },
+                                    ad_sets: tree.adsets.map(s => ({ name: s.name, ads: (s.ads || []).map(a => a.name) })),
+                                };
+                            } else {
+                                const res = await metaDuplicateCampaign(item.id, copyName, dupStatus, {});
+                                const hasFailures = res.failures.length > 0;
+                                result = {
+                                    success:        !hasFailures,
+                                    partial:        hasFailures,
+                                    account:        acctInfo.name,
+                                    source:         { id: item.id, name: item.name },
+                                    new_campaign_id: res.new_campaign_id,
+                                    new_name:       copyName,
+                                    new_status:     dupStatus,
+                                    id_map:         res.id_map,
+                                    copied:         { ad_sets: res.id_map.adsets.length, ads: res.id_map.ads.length },
+                                };
+                                if (hasFailures) {
+                                    result.failures = res.failures;
+                                    result.warning = `${res.failures.length} object(s) failed to copy. The new campaign exists but is incomplete.`;
+                                }
+                            }
+                        }
+                    } else {
+                        // Ad set level duplicate — single shallow copy is fine
+                        const targetSearch = args.target.toLowerCase();
+                        const all = await getMetaAdsets(accountId);
+                        const item = all.find(i => i.name.toLowerCase().includes(targetSearch));
+                        if (!item) {
+                            result = { error: `No adset matching '${args.target}'`, available: all.map(i => i.name) };
                         } else {
                             const copyName = args.new_name || `Copy of ${item.name}`;
                             if (!confirm) {
@@ -5721,15 +5928,15 @@ async function handleToolCall(name, args = {}) {
                                     source:       { id: item.id, name: item.name, level: dupLevel },
                                     new_name:     copyName,
                                     new_status:   dupStatus,
-                                    note:         "deep_copy=true — ad sets and ads will be copied too (for campaign level)",
                                 };
                             } else {
-                                const res = await metaDuplicate(item.id, dupLevel, copyName, dupStatus);
+                                const newId = await metaCopyOne(item.id, dupStatus, {});
+                                await metaPost(newId, { name: copyName });
                                 result = {
                                     success:    true,
                                     account:    acctInfo.name,
                                     source:     { id: item.id, name: item.name },
-                                    new_id:     res.new_id,
+                                    new_id:     newId,
                                     new_name:   copyName,
                                     new_status: dupStatus,
                                 };
@@ -6858,6 +7065,9 @@ async function handleToolCall(name, args = {}) {
                     result = { error: `No campaign matching '${args.source_campaign}'`, available: campaigns.map(c => c.name) };
                 } else {
                     const copyName = args.new_name || `Copy of ${camp.name}`;
+                    const tree = await metaReadCampaignTree(camp.id);
+                    const totalAds = tree.adsets.reduce((sum, s) => sum + (s.ads?.length || 0), 0);
+
                     if (!confirm) {
                         result = {
                             dry_run:    true,
@@ -6866,18 +7076,49 @@ async function handleToolCall(name, args = {}) {
                             source:     { id: camp.id, name: camp.name, status: camp.status },
                             new_name:   copyName,
                             new_status: dupStatus,
-                            note:       "deep_copy=true — ad sets and ads will be duplicated",
+                            overrides:  {
+                                start_time:      args.start_time || "(inherit from source)",
+                                stop_time:       args.stop_time || "(inherit from source)",
+                                daily_budget:    args.daily_budget != null ? `$${args.daily_budget}` : "(inherit from source)",
+                                lifetime_budget: args.lifetime_budget != null ? `$${args.lifetime_budget}` : "(inherit from source)",
+                            },
+                            objects_to_copy: {
+                                campaigns: 1,
+                                ad_sets:   tree.adsets.length,
+                                ads:       totalAds,
+                                total_api_calls: 1 + tree.adsets.length + totalAds,
+                            },
+                            ad_sets: tree.adsets.map(s => ({
+                                name: s.name,
+                                ads:  (s.ads || []).map(a => a.name),
+                            })),
                         };
                     } else {
-                        const res = await metaDuplicate(camp.id, "campaign", copyName, dupStatus);
+                        const res = await metaDuplicateCampaign(camp.id, copyName, dupStatus, {
+                            start_time:      args.start_time,
+                            stop_time:       args.stop_time,
+                            daily_budget:    args.daily_budget,
+                            lifetime_budget: args.lifetime_budget,
+                        });
+                        const hasFailures = res.failures.length > 0;
                         result = {
-                            success:    true,
-                            account:    acctInfo.name,
-                            source:     { id: camp.id, name: camp.name },
-                            new_id:     res.new_id,
-                            new_name:   copyName,
-                            new_status: dupStatus,
+                            success:        !hasFailures,
+                            partial:        hasFailures,
+                            account:        acctInfo.name,
+                            source:         { id: camp.id, name: camp.name },
+                            new_campaign_id: res.new_campaign_id,
+                            new_name:       copyName,
+                            new_status:     dupStatus,
+                            id_map:         res.id_map,
+                            copied:         {
+                                ad_sets: res.id_map.adsets.length,
+                                ads:     res.id_map.ads.length,
+                            },
                         };
+                        if (hasFailures) {
+                            result.failures = res.failures;
+                            result.warning = `${res.failures.length} object(s) failed to copy. The new campaign exists but is incomplete — review failures and finish manually.`;
+                        }
                     }
                 }
             } catch (e) {

@@ -23,10 +23,17 @@
     },
     "1766078295": {
       "name": "Denver Parade of Homes",
-      "budget": 1000,
+      "budget": 4300,
       "mcc": "7631184147",
-      "flight_start": "2026-08-03",
-      "flight_end": "2026-08-26"
+      "flight_start": "2026-07-23",
+      "flight_end": "2026-08-26",
+      "budget_schedule": [
+        { "from": "2026-07-30", "budget": 5000 },
+        { "from": "2026-08-06", "budget": 6000 },
+        { "from": "2026-08-13", "budget": 7200 },
+        { "from": "2026-08-20", "budget": 8500 },
+        { "from": "2026-08-27", "budget": 9000 }
+      ]
     },
     "2275371078": {
       "name": "Childrens Therapy Services of Colorado",
@@ -131,6 +138,14 @@
       "budget": 10000,
       "mcc": "7631184147",
       "health": false
+    },
+    "2944254697": {
+      "name": "Charlie's Soap",
+      "budget": 5500,
+      "mcc": "6000302846",
+      "health": {
+        "conversion_type": "sale"
+      }
     }
   },
   "meta": {
@@ -171,10 +186,17 @@
     },
     "act_1371124644901073": {
       "name": "Denver Parade of Homes",
-      "budget": 1000,
+      "budget": 4300,
       "page_id": "121015354580784",
-      "flight_start": "2026-08-03",
-      "flight_end": "2026-08-26"
+      "flight_start": "2026-07-23",
+      "flight_end": "2026-08-26",
+      "budget_schedule": [
+        { "from": "2026-07-30", "budget": 5000 },
+        { "from": "2026-08-06", "budget": 6000 },
+        { "from": "2026-08-13", "budget": 7200 },
+        { "from": "2026-08-20", "budget": 8500 },
+        { "from": "2026-08-27", "budget": 9000 }
+      ]
     }
   },
   "stackadapt": {
