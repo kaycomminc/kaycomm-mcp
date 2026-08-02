@@ -3695,6 +3695,10 @@ function makeServer() {
                     },
                     new_name: { type: "string", description: "Name for the duplicated campaign or ad set. Optional for duplicate — defaults to 'Copy of [original name]'." },
                     status:   { type: "string", enum: ["PAUSED", "ACTIVE", "INHERITED_FROM_SOURCE"], description: "Status for the duplicate (default: PAUSED)." },
+                    start_time:      { type: "string", description: "duplicate (campaign level) only: ISO 8601 start time for the copy (e.g. '2026-09-01T00:00:00-0600'). Omit to inherit from source." },
+                    stop_time:       { type: "string", description: "duplicate (campaign level) only: ISO 8601 end time for the copy. Omit to inherit from source." },
+                    daily_budget:    { type: "number", description: "duplicate (campaign level) only: daily budget in dollars for the copy. Omit to inherit from source." },
+                    lifetime_budget: { type: "number", description: "duplicate (campaign level) only: lifetime budget in dollars for the copy. Omit to inherit from source." },
                     budget: { type: "number", description: "New daily budget in dollars. Required for set_daily_budget." },
                     confirm: { type: "boolean", description: "Set true to apply changes. Omit for dry-run preview." },
                 },
@@ -5888,11 +5892,22 @@ async function handleToolCall(name, args = {}) {
                                     source:       { id: item.id, name: item.name, level: dupLevel },
                                     new_name:     copyName,
                                     new_status:   dupStatus,
+                                    overrides: {
+                                        start_time:      args.start_time || "(inherit from source)",
+                                        stop_time:       args.stop_time || "(inherit from source)",
+                                        daily_budget:    args.daily_budget != null ? `$${args.daily_budget}` : "(inherit from source)",
+                                        lifetime_budget: args.lifetime_budget != null ? `$${args.lifetime_budget}` : "(inherit from source)",
+                                    },
                                     objects_to_copy: { campaigns: 1, ad_sets: tree.adsets.length, ads: totalAds },
                                     ad_sets: tree.adsets.map(s => ({ name: s.name, ads: (s.ads || []).map(a => a.name) })),
                                 };
                             } else {
-                                const res = await metaDuplicateCampaign(item.id, copyName, dupStatus, {});
+                                const res = await metaDuplicateCampaign(item.id, copyName, dupStatus, {
+                                    start_time:      args.start_time,
+                                    stop_time:       args.stop_time,
+                                    daily_budget:    args.daily_budget,
+                                    lifetime_budget: args.lifetime_budget,
+                                });
                                 const hasFailures = res.failures.length > 0;
                                 result = {
                                     success:        !hasFailures,
