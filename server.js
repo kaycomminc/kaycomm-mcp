@@ -1656,7 +1656,7 @@ async function fetchSearchTerms(token, customerId, mccId, dateRange, startDate, 
 }
 
 // ── PMax search terms + DSA/catch-all fallback ───────────────────────────────
-async function fetchPmaxSearchTermInsights(token, customerId, mccId, dateRange, startDate, endDate) {
+async function fetchPmaxSearchTermInsights(token, customerId, mccId, dateRange, startDate, endDate, topN = 50) {
     const dateClause = resolveGaqlDateClause(dateRange, startDate, endDate);
     const mapTerm = (row, source) => ({
         term:         row.campaignSearchTermView?.searchTerm || row.searchTermView?.searchTerm,
@@ -1713,25 +1713,47 @@ async function fetchPmaxSearchTermInsights(token, customerId, mccId, dateRange, 
 
     const result = {};
 
-    if (pmaxTerms.length > 0) {
-        result.pmax_terms = {
-            total: pmaxTerms.length,
-            top_terms:   pmaxTerms.slice(0, 50),
-            converting:  pmaxTerms.filter(t => t.convs > 0),
-            wasted:      pmaxTerms.filter(t => t.cost > 3 && t.convs === 0).slice(0, 25),
+    // Every list below is capped and a rollup is returned alongside it. Dumping
+    // the full term list overflows a model context window on busy accounts.
+    const summarise = (terms, label) => {
+        const totals = terms.reduce((a, t) => ({
+            spend: a.spend + t.cost, clicks: a.clicks + t.clicks,
+            impressions: a.impressions + t.impressions,
+            conversions: a.conversions + t.convs, conv_value: a.conv_value + t.conv_value,
+        }), { spend: 0, clicks: 0, impressions: 0, conversions: 0, conv_value: 0 });
+        const bySpend  = [...terms].sort((a, b) => b.cost - a.cost);
+        const wastedAll = bySpend.filter(t => t.cost > 3 && t.convs === 0);
+        const convAll   = [...terms].filter(t => t.convs > 0).sort((a, b) => b.convs - a.convs);
+        const wastedSpend = wastedAll.reduce((s, t) => s + t.cost, 0);
+        return {
+            total: terms.length,
+            totals: {
+                spend:       Math.round(totals.spend * 100) / 100,
+                clicks:      totals.clicks,
+                impressions: totals.impressions,
+                conversions: Math.round(totals.conversions * 100) / 100,
+                conv_value:  Math.round(totals.conv_value * 100) / 100,
+            },
+            wasted_spend_total: Math.round(wastedSpend * 100) / 100,
+            wasted_terms_total: wastedAll.length,
+            converting_total:   convAll.length,
+            top_terms:  bySpend.slice(0, topN),
+            wasted:     wastedAll.slice(0, topN),
+            converting: convAll.slice(0, topN),
+            truncated:  terms.length > topN,
+            note:       terms.length > topN
+                ? `Showing the top ${topN} ${label} terms by spend. Totals above cover all ${terms.length}. Raise top_n for more.`
+                : undefined,
         };
+    };
+
+    if (pmaxTerms.length > 0) {
+        result.pmax_terms = summarise(pmaxTerms, "PMax");
     } else {
         result.pmax_terms = { total: 0, note: pmaxError || "No PMax search term data returned. Check the Google Ads UI (PMax campaign → Insights → Search categories) for theme-level data." };
     }
 
-    if (dsaTerms.length > 0) {
-        result.dsa_catch_all = {
-            total: dsaTerms.length,
-            wasted:     dsaTerms.filter(t => t.cost > 3 && t.convs === 0).slice(0, 25),
-            converting: dsaTerms.filter(t => t.convs > 0),
-            all_terms:  dsaTerms,
-        };
-    }
+    if (dsaTerms.length > 0) result.dsa_catch_all = summarise(dsaTerms, "DSA/catch-all");
 
     return result;
 }
@@ -3302,6 +3324,302 @@ async function googleMutateOps(token, customerId, mccId, mutateOperations) {
     return data.mutateOperationResponses || [];
 }
 
+// ── Shopping / product-level reporting ───────────────────────────────────────
+// shopping_performance_view is the product-level report in the Google Ads API.
+// It covers Shopping *and* Performance Max retail campaigns, segmented by the
+// Merchant Center product dimensions.
+//
+// Two field-naming traps, both verified against the v24 resource definitions:
+//   * There is no `product_custom_label*` segment. Feed custom labels come back
+//     as segments.product_custom_attribute0-4, so group_by names are mapped.
+//   * Product type is levelled (product_type_l1..l5); `product_type` alone is
+//     not a field. We group on l1, the level people actually merchandise on.
+//
+// MERCHANT CENTER (future integration point): everything below is Ads-side, so
+// a product only appears once it has served. Feed attributes that only Merchant
+// Center knows — full titles, GTIN/MPN, availability, price, and above all
+// disapprovals/product status — require the Merchant Center Content API and the
+// separate https://www.googleapis.com/auth/content OAuth scope. That would slot
+// in here as a fetchMerchantProducts() joined to these rows on item_id. See
+// README "Merchant Center (future)". Deliberately out of scope for this pass.
+const SHOPPING_GROUP_DIMENSIONS = {
+    item_id:        { field: "segments.product_item_id",           key: "productItemId" },
+    title:          { field: "segments.product_title",             key: "productTitle" },
+    product_type:   { field: "segments.product_type_l1",           key: "productTypeL1" },
+    brand:          { field: "segments.product_brand",             key: "productBrand" },
+    custom_label_0: { field: "segments.product_custom_attribute0", key: "productCustomAttribute0" },
+    custom_label_1: { field: "segments.product_custom_attribute1", key: "productCustomAttribute1" },
+    custom_label_2: { field: "segments.product_custom_attribute2", key: "productCustomAttribute2" },
+    custom_label_3: { field: "segments.product_custom_attribute3", key: "productCustomAttribute3" },
+    custom_label_4: { field: "segments.product_custom_attribute4", key: "productCustomAttribute4" },
+};
+
+// Row caps keep these reports inside a model context window. Anything that can
+// return thousands of rows (products, search terms, listing nodes) must cap.
+const TOP_N_MAX = 500;
+function clampTopN(value, fallback) {
+    const n = parseInt(value, 10);
+    if (!Number.isFinite(n) || n <= 0) return fallback;
+    return Math.min(n, TOP_N_MAX);
+}
+
+const emptyAgg = () => ({ spend: 0, impressions: 0, clicks: 0, conversions: 0, conv_value: 0 });
+
+function addAgg(agg, r) {
+    agg.spend       += parseInt(r.metrics?.costMicros || 0) / 1_000_000;
+    agg.impressions += parseInt(r.metrics?.impressions || 0);
+    agg.clicks      += parseInt(r.metrics?.clicks || 0);
+    agg.conversions += parseFloat(r.metrics?.conversions || 0);
+    agg.conv_value  += parseFloat(r.metrics?.conversionsValue || 0);
+}
+
+function mergeAgg(target, src) {
+    for (const k of Object.keys(target)) target[k] += src[k];
+}
+
+// Derived metrics are computed from the summed totals, never averaged from the
+// API's per-row ctr/average_cpc — averaging those across rolled-up rows is wrong.
+function shapeAgg(agg) {
+    const { spend, impressions, clicks, conversions, conv_value } = agg;
+    const cpa  = conversions > 0 ? Math.round((spend / conversions) * 100) / 100 : null;
+    const roas = spend > 0 && conv_value > 0 ? Math.round((conv_value / spend) * 100) / 100 : null;
+    return {
+        spend:       Math.round(spend * 100) / 100,
+        impressions,
+        clicks,
+        ctr:         impressions > 0 ? ((clicks / impressions) * 100).toFixed(2) + "%" : "0.00%",
+        avg_cpc:     "$" + (clicks > 0 ? (spend / clicks).toFixed(2) : "0.00"),
+        conversions: Math.round(conversions * 100) / 100,
+        conv_value:  Math.round(conv_value * 100) / 100,
+        cpa:         cpa != null ? "$" + cpa : null,
+        roas,
+    };
+}
+
+async function fetchShoppingPerformance(token, customerId, mccId, dateClause, groupBy, topN) {
+    const dim = SHOPPING_GROUP_DIMENSIONS[groupBy];
+    const rows = await googleSearch(token, customerId, mccId, `
+        SELECT ${dim.field},
+               metrics.cost_micros, metrics.impressions, metrics.clicks,
+               metrics.conversions, metrics.conversions_value
+        FROM shopping_performance_view
+        WHERE segments.date ${dateClause}`);
+
+    // The API returns one row per combination of every selected segment, so the
+    // same dimension value can appear more than once — roll up client-side.
+    const byValue = new Map();
+    const totals  = emptyAgg();
+    for (const r of rows) {
+        const value = r.segments?.[dim.key] ?? "(not set)";
+        if (!byValue.has(value)) byValue.set(value, emptyAgg());
+        addAgg(byValue.get(value), r);
+        addAgg(totals, r);
+    }
+
+    const all = [...byValue.entries()]
+        .map(([value, agg]) => ({ value, agg }))
+        .sort((a, b) => b.agg.spend - a.agg.spend);
+
+    const shown = all.slice(0, topN);
+    const shownSpend = shown.reduce((s, x) => s + x.agg.spend, 0);
+
+    return {
+        rows: shown.map(({ value, agg }) => ({ [groupBy]: value, ...shapeAgg(agg) })),
+        totals: {
+            ...shapeAgg(totals),
+            [`distinct_${groupBy}_values`]: all.length,
+        },
+        returned: {
+            rows_returned:      shown.length,
+            rows_total:         all.length,
+            spend_returned:     Math.round(shownSpend * 100) / 100,
+            share_of_spend:     totals.spend > 0 ? ((shownSpend / totals.spend) * 100).toFixed(1) + "%" : "0.0%",
+            truncated:          all.length > shown.length,
+        },
+    };
+}
+
+// Campaign-level spend for the campaign types that can serve product ads, used
+// to reconcile the product report against get_campaign_performance.
+async function fetchProductServingCampaignSpend(token, customerId, mccId, dateClause) {
+    const rows = await googleSearch(token, customerId, mccId, `
+        SELECT campaign.name, campaign.advertising_channel_type, metrics.cost_micros
+        FROM campaign
+        WHERE segments.date ${dateClause}
+          AND campaign.advertising_channel_type IN ('SHOPPING', 'PERFORMANCE_MAX')`);
+    const campaigns = new Map();
+    let spend = 0;
+    for (const r of rows) {
+        const cost = parseInt(r.metrics?.costMicros || 0) / 1_000_000;
+        const name = r.campaign.name;
+        if (!campaigns.has(name)) campaigns.set(name, { campaign: name, type: r.campaign.advertisingChannelType, spend: 0 });
+        campaigns.get(name).spend += cost;
+        spend += cost;
+    }
+    return {
+        spend,
+        campaigns: [...campaigns.values()]
+            .map(c => ({ ...c, spend: Math.round(c.spend * 100) / 100 }))
+            .sort((a, b) => b.spend - a.spend),
+    };
+}
+
+// ── PMax listing groups (product partitioning inside an asset group) ─────────
+// Structure lives on asset_group_listing_group_filter; metrics are only exposed
+// through asset_group_product_group_view, which joins back on the filter's
+// resource name. Verified against the v24 resource definitions.
+function listingCaseValueLabel(cv) {
+    if (!cv) return null;   // root node — the whole inventory
+    const val = v => (v === undefined || v === null || v === "" ? "(everything else)" : v);
+    if (cv.productItemId)   return `item_id = ${val(cv.productItemId.value)}`;
+    if (cv.productBrand)    return `brand = ${val(cv.productBrand.value)}`;
+    if (cv.productType)     return `product_type_${(cv.productType.level || "LEVEL1").toLowerCase()} = ${val(cv.productType.value)}`;
+    if (cv.productCategory) return `category_${(cv.productCategory.level || "LEVEL1").toLowerCase()} = ${val(cv.productCategory.categoryId)}`;
+    if (cv.productCondition) return `condition = ${val(cv.productCondition.condition)}`;
+    if (cv.productChannel)  return `channel = ${val(cv.productChannel.channel)}`;
+    if (cv.productCustomAttribute) {
+        // INDEX0..INDEX4 map to the feed's custom_label_0..4
+        const idx = (cv.productCustomAttribute.index || "INDEX0").replace("INDEX", "");
+        return `custom_label_${idx} = ${val(cv.productCustomAttribute.value)}`;
+    }
+    if (cv.webpage) return "webpage condition";
+    return null;
+}
+
+async function fetchPmaxListingGroups(token, customerId, mccId, dateClause, topN) {
+    const structRows = await googleSearch(token, customerId, mccId, `
+        SELECT campaign.name, campaign.advertising_channel_type,
+               asset_group.name, asset_group.id,
+               asset_group_listing_group_filter.id,
+               asset_group_listing_group_filter.type,
+               asset_group_listing_group_filter.listing_source,
+               asset_group_listing_group_filter.parent_listing_group_filter,
+               asset_group_listing_group_filter.case_value.product_item_id.value,
+               asset_group_listing_group_filter.case_value.product_brand.value,
+               asset_group_listing_group_filter.case_value.product_type.value,
+               asset_group_listing_group_filter.case_value.product_type.level,
+               asset_group_listing_group_filter.case_value.product_category.category_id,
+               asset_group_listing_group_filter.case_value.product_category.level,
+               asset_group_listing_group_filter.case_value.product_condition.condition,
+               asset_group_listing_group_filter.case_value.product_channel.channel,
+               asset_group_listing_group_filter.case_value.product_custom_attribute.value,
+               asset_group_listing_group_filter.case_value.product_custom_attribute.index
+        FROM asset_group_listing_group_filter`);
+
+    // Metrics are reported separately; if the view is unavailable we still
+    // return the tree rather than failing the whole call.
+    const metricsBy = new Map();
+    let metricsError = null;
+    try {
+        const metricRows = await googleSearch(token, customerId, mccId, `
+            SELECT asset_group_product_group_view.asset_group_listing_group_filter,
+                   metrics.cost_micros, metrics.impressions, metrics.clicks,
+                   metrics.conversions, metrics.conversions_value
+            FROM asset_group_product_group_view
+            WHERE segments.date ${dateClause}`);
+        for (const r of metricRows) {
+            const key = r.assetGroupProductGroupView?.assetGroupListingGroupFilter;
+            if (!key) continue;
+            if (!metricsBy.has(key)) metricsBy.set(key, emptyAgg());
+            addAgg(metricsBy.get(key), r);
+        }
+    } catch (e) {
+        metricsError = e.message;
+    }
+
+    // Group nodes by asset group, keeping only PMax (the resource is also used
+    // by other channel types whose listing_source is WEBPAGE).
+    const groups = new Map();
+    for (const r of structRows) {
+        if (r.campaign?.advertisingChannelType !== "PERFORMANCE_MAX") continue;
+        const f   = r.assetGroupListingGroupFilter;
+        const key = `${r.campaign.name}||${r.assetGroup.name}`;
+        if (!groups.has(key)) {
+            groups.set(key, { campaign: r.campaign.name, asset_group: r.assetGroup.name, nodes: [] });
+        }
+        groups.get(key).nodes.push({
+            resource_name:  f.resourceName,
+            id:             f.id,
+            type:           f.type,
+            listing_source: f.listingSource || null,
+            parent:         f.parentListingGroupFilter || null,
+            dimension:      listingCaseValueLabel(f.caseValue),
+            agg:            metricsBy.get(f.resourceName) || null,
+        });
+    }
+
+    const assetGroups = [];
+    const rollup = emptyAgg();
+    for (const g of groups.values()) {
+        const byResource = new Map(g.nodes.map(n => [n.resource_name, n]));
+        const depthOf = n => {
+            let d = 0, cur = n;
+            while (cur?.parent && byResource.has(cur.parent) && d < 20) { d++; cur = byResource.get(cur.parent); }
+            return d;
+        };
+        const units = g.nodes.filter(n => n.type === "UNIT_INCLUDED" || n.type === "UNIT_EXCLUDED");
+        // A single included unit hanging off the root with no dimension test means
+        // the whole feed is one undifferentiated bucket — the thing worth spotting.
+        const isCatchAll = units.length === 1 && units[0].type === "UNIT_INCLUDED" && !units[0].dimension;
+
+        // Roll up leaf (unit) nodes only. Subdivisions report the aggregate of
+        // their children, so summing every node would double-count.
+        const groupAgg = emptyAgg();
+        for (const n of units) if (n.agg) mergeAgg(groupAgg, n.agg);
+        mergeAgg(rollup, groupAgg);
+
+        const shaped = g.nodes
+            .map(n => ({
+                dimension:      n.dimension || (n.parent ? "(everything else)" : "(root — all products)"),
+                type:           n.type,
+                depth:          depthOf(n),
+                listing_source: n.listing_source,
+                ...(n.agg ? shapeAgg(n.agg) : {}),
+                _spend:         n.agg ? n.agg.spend : 0,
+            }))
+            .sort((a, b) => b._spend - a._spend);
+        const shown = shaped.slice(0, topN).map(({ _spend, ...rest }) => rest);
+
+        assetGroups.push({
+            campaign:        g.campaign,
+            asset_group:     g.asset_group,
+            _spend:          groupAgg.spend,
+            ...(metricsError ? {} : { asset_group_totals: shapeAgg(groupAgg) }),
+            total_nodes:     g.nodes.length,
+            subdivisions:    g.nodes.filter(n => n.type === "SUBDIVISION").length,
+            units_included:  g.nodes.filter(n => n.type === "UNIT_INCLUDED").length,
+            units_excluded:  g.nodes.filter(n => n.type === "UNIT_EXCLUDED").length,
+            max_depth:       g.nodes.reduce((m, n) => Math.max(m, depthOf(n)), 0),
+            is_single_catch_all: isCatchAll,
+            partitioning:    isCatchAll
+                ? "Single catch-all node — all products are in one bucket, so bidding and reporting cannot separate them."
+                : `Partitioned into ${units.length} unit node(s).`,
+            nodes_returned:  shown.length,
+            nodes_truncated: shaped.length > shown.length,
+            nodes:           shown,
+        });
+    }
+
+    assetGroups.sort((a, b) => b._spend - a._spend);
+    for (const g of assetGroups) delete g._spend;
+
+    const out = {
+        total_asset_groups: assetGroups.length,
+        catch_all_asset_groups: assetGroups.filter(g => g.is_single_catch_all).length,
+        metrics_available: !metricsError,
+        totals: shapeAgg(rollup),
+        asset_groups: assetGroups,
+    };
+    if (metricsError) {
+        out.metrics_note = `Listing group metrics unavailable in Google Ads API ${GOOGLE_API_VERSION} for this account — returning structure only. Reason: ${metricsError}`;
+        delete out.totals;
+    }
+    if (!assetGroups.length) {
+        out.note = "No Performance Max listing groups found. The account may not run PMax, or its asset groups have no product feed attached (listing groups only exist on retail asset groups).";
+    }
+    return out;
+}
+
 // ── PMax asset groups ─────────────────────────────────────────────────────────
 async function fetchPmaxAssetGroups(token, customerId, mccId, dateClause) {
     const rows = await googleSearch(token, customerId, mccId, `
@@ -3332,20 +3650,34 @@ async function fetchPmaxAssetGroups(token, customerId, mccId, dateClause) {
     });
 }
 
+// asset_group_asset has no performance_label field — Google removed aggregate
+// asset performance labels for asset groups, and in v24 performance_label only
+// survives on ad_group_ad_asset_view (Search/Display RSAs), which PMax asset
+// groups do not report into. Verified against the v24 resource definitions.
+//
+// What the API does still expose per linked asset is its *serving* health:
+// primary_status (+ reasons) and the policy approval status. That covers the
+// question this flag was really for — which assets are held back — so we
+// return those instead of a label that no longer exists.
 async function fetchPmaxAssetPerformance(token, customerId, mccId) {
     const rows = await googleSearch(token, customerId, mccId, `
         SELECT campaign.name, asset_group.name,
-               asset_group_asset.field_type, asset_group_asset.performance_label,
+               asset_group_asset.field_type, asset_group_asset.status,
+               asset_group_asset.primary_status,
+               asset_group_asset.primary_status_reasons,
+               asset_group_asset.policy_summary.approval_status,
                asset.type, asset.text_asset.text, asset.name
         FROM asset_group_asset
         WHERE asset_group_asset.status = 'ENABLED'
           AND campaign.status = 'ENABLED'`);
     return rows.map(r => ({
-        campaign:    r.campaign.name,
-        asset_group: r.assetGroup.name,
-        field_type:  r.assetGroupAsset.fieldType,
-        performance: r.assetGroupAsset.performanceLabel || null,
-        asset:       r.asset?.textAsset?.text || r.asset?.name || r.asset?.type || null,
+        campaign:        r.campaign.name,
+        asset_group:     r.assetGroup.name,
+        field_type:      r.assetGroupAsset.fieldType,
+        primary_status:  r.assetGroupAsset.primaryStatus || null,
+        status_reasons:  r.assetGroupAsset.primaryStatusReasons || [],
+        approval_status: r.assetGroupAsset.policySummary?.approvalStatus || null,
+        asset:           r.asset?.textAsset?.text || r.asset?.name || r.asset?.type || null,
     }));
 }
 
@@ -3542,7 +3874,7 @@ function makeServer() {
         },
         {
             name: "get_pmax_search_terms",
-            description: "Pull Performance Max search terms via campaign_search_term_view, plus DSA/catch-all terms running alongside PMax. PMax section shows queries triggering PMax campaigns with impressions, clicks, spend, conversions. DSA section shows dynamic and branded catch-all queries. Useful for understanding PMax query coverage and finding keyword migration opportunities.",
+            description: "Pull Performance Max search terms via campaign_search_term_view, plus DSA/catch-all terms running alongside PMax. PMax section shows queries triggering PMax campaigns with impressions, clicks, spend, conversions. DSA section shows dynamic and branded catch-all queries. Useful for understanding PMax query coverage and finding keyword migration opportunities. Term lists are capped by top_n and sorted by spend; totals and wasted-spend rollups always cover every term.",
             inputSchema: {
                 type: "object",
                 properties: {
@@ -3554,6 +3886,7 @@ function makeServer() {
                     },
                     start_date: { type: "string", description: "Start date YYYY-MM-DD (only with CUSTOM)" },
                     end_date:   { type: "string", description: "End date YYYY-MM-DD (only with CUSTOM)" },
+                    top_n:      { type: "integer", description: "Max terms per list (top/wasted/converting), sorted by spend descending (default 50, max 500). Totals always cover every term." },
                 },
                 required: ["account_name"],
             },
@@ -4437,7 +4770,56 @@ function makeServer() {
                     },
                     start_date:     { type: "string", description: "Start date YYYY-MM-DD (only with CUSTOM)" },
                     end_date:       { type: "string", description: "End date YYYY-MM-DD (only with CUSTOM)" },
-                    include_assets: { type: "boolean", description: "Also return asset-level performance labels (default false)" },
+                    include_assets: { type: "boolean", description: "Also return per-asset serving status (primary_status, policy approval) for enabled assets. Performance labels (BEST/GOOD/LOW) are no longer available from the API for PMax asset groups." },
+                    top_n:          { type: "integer", description: "Max asset groups to return, sorted by spend descending (default 50, max 500)" },
+                },
+                required: ["account_name"],
+            },
+        },
+        {
+            name: "get_shopping_performance",
+            description: "Product-level performance for Shopping and Performance Max retail campaigns, from shopping_performance_view. " +
+                "Group by item_id, title, product_type, brand, or custom_label_0-4 to find which products or merchandising buckets carry the spend and the return. " +
+                "Returns spend, impressions, clicks, CTR, avg CPC, conversions, conversion value, CPA and ROAS per row, plus account-level totals and a reconciliation block against campaign spend. " +
+                "Use this instead of get_campaign_performance when diagnosing an ecommerce account at the product level.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    account_name: { type: "string", description: "Client name (partial match ok)" },
+                    date_range: {
+                        type: "string",
+                        description: "LAST_30_DAYS (default), THIS_MONTH, LAST_7_DAYS, LAST_90_DAYS, LAST_MONTH, YEAR_TO_DATE, or CUSTOM (requires start_date + end_date)",
+                        enum: ["THIS_MONTH", "LAST_7_DAYS", "LAST_30_DAYS", "LAST_90_DAYS", "LAST_MONTH", "YEAR_TO_DATE", "CUSTOM"],
+                    },
+                    start_date: { type: "string", description: "Start date YYYY-MM-DD (only with CUSTOM)" },
+                    end_date:   { type: "string", description: "End date YYYY-MM-DD (only with CUSTOM)" },
+                    group_by: {
+                        type: "string",
+                        description: "Product dimension to group on: item_id (default), title, product_type (level 1), brand, or custom_label_0-4. Custom labels come from the Merchant Center feed.",
+                        enum: ["item_id", "title", "product_type", "brand", "custom_label_0", "custom_label_1", "custom_label_2", "custom_label_3", "custom_label_4"],
+                    },
+                    top_n: { type: "integer", description: "Max rows to return, sorted by spend descending (default 50, max 500). Totals always cover every row." },
+                },
+                required: ["account_name"],
+            },
+        },
+        {
+            name: "get_pmax_listing_groups",
+            description: "Performance Max listing group (product partition) tree per asset group, with metrics where available. " +
+                "Shows how product inventory is partitioned inside PMax — by item ID, brand, product type, condition, channel, or custom label — and flags asset groups that are a single undifferentiated catch-all node. " +
+                "Use when a retail PMax campaign needs diagnosing and you want to know whether inventory is actually segmented or all lumped together.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    account_name: { type: "string", description: "Client name (partial match ok)" },
+                    date_range: {
+                        type: "string",
+                        description: "LAST_30_DAYS (default), THIS_MONTH, LAST_7_DAYS, LAST_90_DAYS, LAST_MONTH, YEAR_TO_DATE, or CUSTOM (requires start_date + end_date)",
+                        enum: ["THIS_MONTH", "LAST_7_DAYS", "LAST_30_DAYS", "LAST_90_DAYS", "LAST_MONTH", "YEAR_TO_DATE", "CUSTOM"],
+                    },
+                    start_date: { type: "string", description: "Start date YYYY-MM-DD (only with CUSTOM)" },
+                    end_date:   { type: "string", description: "End date YYYY-MM-DD (only with CUSTOM)" },
+                    top_n: { type: "integer", description: "Max listing group nodes to return per asset group, sorted by spend descending (default 50, max 500)" },
                 },
                 required: ["account_name"],
             },
@@ -5159,7 +5541,8 @@ async function handleToolCall(name, args = {}) {
             if (error) { result = { error: `Auth failed: ${error}` }; }
             else {
                 try {
-                    result = { account: info.name, date_range: dateRange, ...(await fetchPmaxSearchTermInsights(token, cid, info.mcc, dateRange, startDate, endDate)) };
+                    const topN = clampTopN(args.top_n, 50);
+                    result = { account: info.name, date_range: dateRange, top_n: topN, ...(await fetchPmaxSearchTermInsights(token, cid, info.mcc, dateRange, startDate, endDate, topN)) };
                 } catch (e) {
                     result = { error: e.message };
                 }
@@ -8100,6 +8483,7 @@ async function handleToolCall(name, args = {}) {
     } else if (name === "get_pmax_asset_groups") {
         const search    = (args.account_name || "").toLowerCase();
         const dateRange = args.date_range || "THIS_MONTH";
+        const topN      = clampTopN(args.top_n, 50);
         const match     = Object.entries(GOOGLE_ACCOUNTS).find(([, i]) => i.name.toLowerCase().includes(search));
         if (!match) {
             result = { error: `No Google account found matching '${args.account_name}'` };
@@ -8111,16 +8495,112 @@ async function handleToolCall(name, args = {}) {
                 try {
                     const dateClause = resolveGaqlDateClause(dateRange, args.start_date, args.end_date);
                     const groups = await fetchPmaxAssetGroups(token, cid, info.mcc, dateClause);
-                    result = { account: info.name, date_range: dateRange, total: groups.length, asset_groups: groups };
+                    result = {
+                        account:     info.name,
+                        date_range:  dateRange,
+                        total:       groups.length,
+                        asset_groups: groups.slice(0, topN),
+                        truncated:   groups.length > topN,
+                    };
                     if (!groups.length) result.note = "No PMax asset groups with data in this range — the account may not run Performance Max.";
                     if (args.include_assets && groups.length) {
                         const assets = await fetchPmaxAssetPerformance(token, cid, info.mcc);
+                        const limited = assets.filter(a => a.primary_status && a.primary_status !== "ELIGIBLE");
                         result.assets = {
                             total: assets.length,
-                            low_performing: assets.filter(a => a.performance === "LOW"),
-                            all: assets,
+                            note: "Google removed asset-level performance labels (BEST/GOOD/LOW) for PMax asset groups; " +
+                                  `they are not available in Google Ads API ${GOOGLE_API_VERSION}. ` +
+                                  "Serving status is returned instead — use 'needs_attention' to find assets that are not running.",
+                            needs_attention: limited,
+                            all: assets.slice(0, topN),
+                            truncated: assets.length > topN,
                         };
                     }
+                } catch (e) { result = { error: e.message }; }
+            }
+        }
+
+    } else if (name === "get_shopping_performance") {
+        const search    = (args.account_name || "").toLowerCase();
+        const dateRange = args.date_range || "LAST_30_DAYS";
+        const groupBy   = args.group_by || "item_id";
+        const topN      = clampTopN(args.top_n, 50);
+        const match     = Object.entries(GOOGLE_ACCOUNTS).find(([, i]) => i.name.toLowerCase().includes(search));
+        if (!match) {
+            result = { error: `No Google account found matching '${args.account_name}'` };
+        } else if (!SHOPPING_GROUP_DIMENSIONS[groupBy]) {
+            result = { error: `Unknown group_by '${groupBy}'. Valid: ${Object.keys(SHOPPING_GROUP_DIMENSIONS).join(", ")}.` };
+        } else if (dateRange === "CUSTOM" && !(args.start_date && args.end_date)) {
+            result = { error: "date_range CUSTOM requires both start_date and end_date (YYYY-MM-DD)." };
+        } else {
+            const [cid, info] = match;
+            const { token, error: authErr } = await getGoogleAccessToken();
+            if (authErr) { result = { error: `Auth: ${authErr}` }; }
+            else {
+                try {
+                    const dateClause = resolveGaqlDateClause(dateRange, args.start_date, args.end_date);
+                    const report = await fetchShoppingPerformance(token, cid, info.mcc, dateClause, groupBy, topN);
+                    result = {
+                        account:    info.name,
+                        date_range: dateRange,
+                        ...(args.start_date ? { start_date: args.start_date } : {}),
+                        ...(args.end_date   ? { end_date:   args.end_date   } : {}),
+                        group_by:   groupBy,
+                        top_n:      topN,
+                        ...report,
+                    };
+
+                    // Reconcile against campaign-level spend so the caller can see
+                    // whether the product report accounts for the money.
+                    try {
+                        const camp  = await fetchProductServingCampaignSpend(token, cid, info.mcc, dateClause);
+                        const viewSpend = report.totals.spend;
+                        const diff  = Math.round((camp.spend - viewSpend) * 100) / 100;
+                        result.reconciliation = {
+                            product_serving_campaign_spend: Math.round(camp.spend * 100) / 100,
+                            shopping_view_spend:            viewSpend,
+                            difference:                     diff,
+                            difference_pct: camp.spend > 0 ? ((diff / camp.spend) * 100).toFixed(1) + "%" : "0.0%",
+                            campaigns: camp.campaigns,
+                            note: "Compare against get_campaign_performance for the same period: 'product_serving_campaign_spend' is the sum of SHOPPING + PERFORMANCE_MAX campaigns there. " +
+                                  "A positive difference is normal for PMax — asset groups without a product feed serve non-product ads that never appear in shopping_performance_view. " +
+                                  "Impressions and clicks are counted differently in this view (per product shown, not per ad) and are not expected to tie out.",
+                        };
+                    } catch (e) {
+                        result.reconciliation = { error: `Could not pull campaign spend to reconcile: ${e.message}` };
+                    }
+
+                    if (!report.rows.length) {
+                        result.note = "No product rows returned. The account may have no Shopping or Performance Max retail campaigns serving in this period, or no Merchant Center feed linked.";
+                    }
+                } catch (e) { result = { error: e.message }; }
+            }
+        }
+
+    } else if (name === "get_pmax_listing_groups") {
+        const search    = (args.account_name || "").toLowerCase();
+        const dateRange = args.date_range || "LAST_30_DAYS";
+        const topN      = clampTopN(args.top_n, 50);
+        const match     = Object.entries(GOOGLE_ACCOUNTS).find(([, i]) => i.name.toLowerCase().includes(search));
+        if (!match) {
+            result = { error: `No Google account found matching '${args.account_name}'` };
+        } else if (dateRange === "CUSTOM" && !(args.start_date && args.end_date)) {
+            result = { error: "date_range CUSTOM requires both start_date and end_date (YYYY-MM-DD)." };
+        } else {
+            const [cid, info] = match;
+            const { token, error: authErr } = await getGoogleAccessToken();
+            if (authErr) { result = { error: `Auth: ${authErr}` }; }
+            else {
+                try {
+                    const dateClause = resolveGaqlDateClause(dateRange, args.start_date, args.end_date);
+                    result = {
+                        account:    info.name,
+                        date_range: dateRange,
+                        ...(args.start_date ? { start_date: args.start_date } : {}),
+                        ...(args.end_date   ? { end_date:   args.end_date   } : {}),
+                        top_n:      topN,
+                        ...(await fetchPmaxListingGroups(token, cid, info.mcc, dateClause, topN)),
+                    };
                 } catch (e) { result = { error: e.message }; }
             }
         }
@@ -9009,6 +9489,8 @@ async function main() {
 module.exports = {
     handleToolCall,
     getPacingLabel, getFlightPacing, buildDailyBudgetRec, getDateInfo, getEffectiveBudget, pctChange,
+    // Exported for tests
+    clampTopN, shapeAgg, emptyAgg, addAgg, mergeAgg, listingCaseValueLabel, SHOPPING_GROUP_DIMENSIONS,
 };
 
 if (!process.env.MCP_TEST) main().catch(console.error);
