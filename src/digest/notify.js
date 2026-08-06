@@ -31,10 +31,24 @@ let transporter = null;
 function getTransporter(user, pass) {
   // Reused across runs. The digest is one message a day, but the cron keeps
   // this process alive for weeks, and rebuilding the pool per send is waste.
+  //
+  // Port is explicit rather than service: 'gmail', which hardcodes 465 (SMTPS).
+  // Railway timed out connecting on 465 — a connection timeout rather than an
+  // auth rejection, which points at blocked SMTP egress rather than bad
+  // credentials. 587 (STARTTLS) is the usual survivor when a host blocks 465.
+  // SMTP_PORT makes it switchable from Railway without a redeploy of code.
   if (!transporter) {
+    const port = Number(process.env.SMTP_PORT || 587);
     transporter = nodemailer.createTransport({
-      service: 'gmail',
+      host: process.env.SMTP_HOST || 'smtp.gmail.com',
+      port,
+      secure: port === 465, // 465 is implicit TLS; 587 upgrades via STARTTLS
       auth: { user, pass },
+      // Fail fast. Without these, a blocked port hangs until the platform
+      // default gives up, which stalls the whole digest run behind it.
+      connectionTimeout: 15000,
+      greetingTimeout: 15000,
+      socketTimeout: 20000,
     });
   }
   return transporter;
