@@ -21,37 +21,61 @@
  * report and decides what counts as a failed run.
  */
 
+const net = require('net');
+const dns = require('dns').promises;
 const nodemailer = require('nodemailer');
 
 /** Slack's section block caps out around 3000 characters. */
 const SLACK_LIMIT = 2900;
 
-let transporter = null;
-
-function getTransporter(user, pass) {
-  // Reused across runs. The digest is one message a day, but the cron keeps
-  // this process alive for weeks, and rebuilding the pool per send is waste.
-  //
-  // Port is explicit rather than service: 'gmail', which hardcodes 465 (SMTPS).
-  // Railway timed out connecting on 465 — a connection timeout rather than an
-  // auth rejection, which points at blocked SMTP egress rather than bad
-  // credentials. 587 (STARTTLS) is the usual survivor when a host blocks 465.
-  // SMTP_PORT makes it switchable from Railway without a redeploy of code.
-  if (!transporter) {
-    const port = Number(process.env.SMTP_PORT || 587);
-    transporter = nodemailer.createTransport({
-      host: process.env.SMTP_HOST || 'smtp.gmail.com',
-      port,
-      secure: port === 465, // 465 is implicit TLS; 587 upgrades via STARTTLS
-      auth: { user, pass },
-      // Fail fast. Without these, a blocked port hangs until the platform
-      // default gives up, which stalls the whole digest run behind it.
-      connectionTimeout: 15000,
-      greetingTimeout: 15000,
-      socketTimeout: 20000,
-    });
+/**
+ * Resolve to an IPv4 address.
+ *
+ * Nodemailer resolves hostnames itself rather than leaving it to net.connect:
+ * it queries A and AAAA separately, concatenates IPv4-then-IPv6, and dials the
+ * first — and it skips a family outright when os.networkInterfaces() shows no
+ * matching interface. On Railway that yields an IPv6-only list, so it dialled
+ * 2607:f8b0::…:587 and the container has no IPv6 route (ENETUNREACH).
+ *
+ * Passing an IP as `host` makes nodemailer skip its resolver entirely
+ * (shared/index.js — `net.isIP(options.host)` short circuit), so this pins the
+ * connection to IPv4. TLS still verifies against the real hostname via
+ * `tls.servername`, so certificate validation is unaffected.
+ *
+ * Falls back to the hostname if the A lookup fails — better to let nodemailer
+ * try than to fail the send outright on a DNS blip.
+ */
+async function resolveIPv4(hostname) {
+  if (net.isIP(hostname)) return hostname;
+  try {
+    const [address] = await dns.resolve4(hostname);
+    return address || hostname;
+  } catch {
+    return hostname;
   }
-  return transporter;
+}
+
+/**
+ * Built per send rather than cached. The digest is one message a day, so a
+ * connection pool buys nothing, and a cached transporter would pin a Gmail IP
+ * that rotates underneath it.
+ */
+async function createTransporter(user, pass) {
+  const host = process.env.SMTP_HOST || 'smtp.gmail.com';
+  const port = Number(process.env.SMTP_PORT || 587);
+
+  return nodemailer.createTransport({
+    host: await resolveIPv4(host),
+    port,
+    secure: port === 465, // 465 is implicit TLS; 587 upgrades via STARTTLS
+    auth: { user, pass },
+    tls: { servername: host }, // cert is checked against the name, not the IP
+    // Fail fast. Without these, an unreachable route hangs until the platform
+    // default gives up, stalling the whole digest run behind it.
+    connectionTimeout: 15000,
+    greetingTimeout: 15000,
+    socketTimeout: 20000,
+  });
 }
 
 async function sendEmail(text, subject, {
@@ -61,7 +85,8 @@ async function sendEmail(text, subject, {
   pass = process.env.GMAIL_APP_PASSWORD,
   to = process.env.DIGEST_EMAIL_TO || process.env.GMAIL_USER,
 } = {}) {
-  const info = await getTransporter(user, pass).sendMail({
+  const transporter = await createTransporter(user, pass);
+  const info = await transporter.sendMail({
     from: user,
     // Comma separated DIGEST_EMAIL_TO is fine; nodemailer accepts the string.
     to,
