@@ -9411,6 +9411,14 @@ async function main() {
                 }
                 await transport.handlePostMessage(req, res, body);
 
+            } else if (url.pathname === "/digest/run") {
+                // Manual digest trigger. Auth is its own DIGEST_TRIGGER_TOKEN,
+                // separate from MCP_AUTH_TOKEN, and fails closed when unset.
+                const { handleDigestRequest } = require("./src/digest/schedule");
+                await handleDigestRequest(req, res, url, {
+                    resolve: (name) => (args) => handleToolCall(name, args),
+                });
+
             } else if (url.pathname === "/mcp" || url.pathname.startsWith("/mcp/")) {
                 // Streamable HTTP transport (stateless) — this is what claude.ai
                 // custom connectors speak, so it's how Claude mobile reaches this
@@ -9461,6 +9469,21 @@ async function main() {
         httpServer.listen(parseInt(PORT), () => {
             console.error(`KayComm MCP running on port ${PORT} (SSE mode: /sse + /messages; Streamable HTTP: /mcp; auth ${AUTH_TOKEN ? "enabled" : "NOT CONFIGURED"})`);
         });
+
+        // ── Morning pacing digest ────────────────────────────────────────────
+        // HTTP mode only. In stdio mode this process is a short-lived local
+        // Claude Desktop child, so a 7am cron there would never fire (and if it
+        // did, it would post a duplicate). Opt out with DIGEST_ENABLED=0.
+        // resolve wires the digest straight into handleToolCall, skipping the
+        // HTTP round trip and the MCP auth token.
+        if (process.env.DIGEST_ENABLED !== "0") {
+            try {
+                const { registerDigest } = require("./src/digest/schedule");
+                registerDigest({ resolve: (name) => (args) => handleToolCall(name, args) });
+            } catch (err) {
+                console.error("[digest] failed to register, server continues:", err.message);
+            }
+        }
 
         // Railway sends SIGTERM on every redeploy. Without this, node dies
         // instantly and in-flight requests / open SSE streams are severed.
