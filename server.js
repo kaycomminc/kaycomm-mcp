@@ -2847,7 +2847,7 @@ async function createGoogleCampaignFull(token, customerId, mccId, config) {
     };
 }
 
-async function getAdGroupAds(token, customerId, mccId, campaignSearch, adGroupSearch) {
+async function getAdGroupAds(token, customerId, mccId, campaignSearch, adGroupSearch, adResourceName) {
     const rows = await googleSearch(token, customerId, mccId, `
         SELECT
             ad_group_ad.ad.resource_name,
@@ -2860,8 +2860,18 @@ async function getAdGroupAds(token, customerId, mccId, campaignSearch, adGroupSe
         WHERE ad_group_ad.status != 'REMOVED'
           AND ad_group_ad.ad.type = 'RESPONSIVE_SEARCH_AD'`);
     let filtered = rows;
-    if (campaignSearch) filtered = filtered.filter(r => r.campaign.name.toLowerCase().includes(campaignSearch.toLowerCase()));
-    if (adGroupSearch)  filtered = filtered.filter(r => r.adGroup.name.toLowerCase().includes(adGroupSearch.toLowerCase()));
+    if (adResourceName) {
+        filtered = filtered.filter(r => r.adGroupAd.ad.resourceName === adResourceName);
+    } else {
+        if (campaignSearch) {
+            const exact = filtered.filter(r => r.campaign.name.toLowerCase() === campaignSearch.toLowerCase());
+            filtered = exact.length ? exact : filtered.filter(r => r.campaign.name.toLowerCase().includes(campaignSearch.toLowerCase()));
+        }
+        if (adGroupSearch) {
+            const exact = filtered.filter(r => r.adGroup.name.toLowerCase() === adGroupSearch.toLowerCase());
+            filtered = exact.length ? exact : filtered.filter(r => r.adGroup.name.toLowerCase().includes(adGroupSearch.toLowerCase()));
+        }
+    }
     return filtered.map(r => ({
         resource_name: r.adGroupAd.ad.resourceName,
         campaign:      r.campaign.name,
@@ -4587,9 +4597,10 @@ function makeServer() {
             inputSchema: {
                 type: "object",
                 properties: {
-                    account_name:  { type: "string", description: "Client name (partial match ok)" },
-                    campaign_name: { type: "string", description: "Campaign name (partial match ok)" },
-                    ad_group_name: { type: "string", description: "Ad group name (partial match ok). Omit to search entire campaign." },
+                    account_name:     { type: "string", description: "Client name (partial match ok)" },
+                    campaign_name:    { type: "string", description: "Campaign name (partial match ok)" },
+                    ad_group_name:    { type: "string", description: "Ad group name (exact match preferred, falls back to substring). Omit to search entire campaign." },
+                    ad_resource_name: { type: "string", description: "Ad resource name (e.g. customers/123/ads/456). If provided, bypasses name matching entirely." },
                     headlines: {
                         type: "array",
                         description: "New headlines (3–15 required). Each up to 30 chars.",
@@ -4627,10 +4638,11 @@ function makeServer() {
             inputSchema: {
                 type: "object",
                 properties: {
-                    account_name:  { type: "string", description: "Client name (partial match ok)" },
-                    campaign_name: { type: "string", description: "Campaign name (partial match ok)" },
-                    ad_group_name: { type: "string", description: "Ad group name (partial match ok). Omit to search entire campaign." },
-                    final_url:     { type: "string", description: "New Final URL to set on the ad(s)" },
+                    account_name:     { type: "string", description: "Client name (partial match ok)" },
+                    campaign_name:    { type: "string", description: "Campaign name (partial match ok)" },
+                    ad_group_name:    { type: "string", description: "Ad group name (exact match preferred, falls back to substring). Omit to search entire campaign." },
+                    ad_resource_name: { type: "string", description: "Ad resource name (e.g. customers/123/ads/456). If provided, bypasses name matching entirely." },
+                    final_url:        { type: "string", description: "New Final URL to set on the ad(s)" },
                     confirm:       { type: "boolean", description: "Set true to apply. Omit for dry run / preview." },
                 },
                 required: ["account_name", "campaign_name"],
@@ -7301,6 +7313,7 @@ async function handleToolCall(name, args = {}) {
         const search     = (args.account_name || "").toLowerCase();
         const campSearch = (args.campaign_name || "").toLowerCase();
         const agSearch   = args.ad_group_name ? args.ad_group_name.toLowerCase() : null;
+        const adResName  = args.ad_resource_name || null;
         const confirm    = !!args.confirm;
         const headlines  = args.headlines  || null;
         const descs      = args.descriptions || null;
@@ -7314,7 +7327,7 @@ async function handleToolCall(name, args = {}) {
             if (authErr) { result = { error: `Auth: ${authErr}` }; }
             else {
                 try {
-                    const ads = await getAdGroupAds(token, cid, info.mcc, campSearch, agSearch);
+                    const ads = await getAdGroupAds(token, cid, info.mcc, campSearch, agSearch, adResName);
                     if (!ads.length) {
                         result = { error: `No responsive search ads found for campaign '${args.campaign_name}'${agSearch ? ` / ad group '${args.ad_group_name}'` : ""}` };
                     } else if (!headlines && !descs) {
@@ -7366,6 +7379,7 @@ async function handleToolCall(name, args = {}) {
         const search     = (args.account_name || "").toLowerCase();
         const campSearch = (args.campaign_name || "").toLowerCase();
         const agSearch   = args.ad_group_name ? args.ad_group_name.toLowerCase() : null;
+        const adResName  = args.ad_resource_name || null;
         const confirm    = !!args.confirm;
         const newUrl     = args.final_url || null;
 
@@ -7378,7 +7392,7 @@ async function handleToolCall(name, args = {}) {
             if (authErr) { result = { error: `Auth: ${authErr}` }; }
             else {
                 try {
-                    const ads = await getAdGroupAds(token, cid, info.mcc, campSearch, agSearch);
+                    const ads = await getAdGroupAds(token, cid, info.mcc, campSearch, agSearch, adResName);
                     if (!ads.length) {
                         result = { error: `No responsive search ads found for campaign '${args.campaign_name}'${agSearch ? ` / ad group '${args.ad_group_name}'` : ""}` };
                     } else if (!newUrl) {
