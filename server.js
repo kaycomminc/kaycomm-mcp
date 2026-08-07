@@ -2661,6 +2661,12 @@ function buildBiddingUpdateBody(strategy, options = {}) {
         }
         return { campaignFields: { biddingStrategyType: "TARGET_SPEND" }, updateMask: "bidding_strategy_type" };
     } else if (s === "MAXIMIZE_CONVERSIONS") {
+        if (options.target_cpa) {
+            return {
+                campaignFields: { biddingStrategyType: "MAXIMIZE_CONVERSIONS", maximizeConversions: { targetCpaMicros: String(Math.round(options.target_cpa * 1_000_000)) } },
+                updateMask: "bidding_strategy_type,maximize_conversions.target_cpa_micros",
+            };
+        }
         return { campaignFields: { biddingStrategyType: "MAXIMIZE_CONVERSIONS" }, updateMask: "bidding_strategy_type" };
     } else if (s === "TARGET_CPA") {
         if (!options.target_cpa) throw new Error("target_cpa (dollars) is required for TARGET_CPA strategy");
@@ -2882,14 +2888,12 @@ async function updateRSA(token, customerId, mccId, adResourceName, headlines, de
             },
             body: JSON.stringify({
                 mutateOperations: [{
-                    adGroupAdOperation: {
+                    adOperation: {
                         update: {
                             resourceName: adResourceName,
-                            ad: {
-                                responsiveSearchAd: { headlines: headlineObjs, descriptions: descObjs },
-                            },
+                            responsiveSearchAd: { headlines: headlineObjs, descriptions: descObjs },
                         },
-                        updateMask: "ad.responsive_search_ad.headlines,ad.responsive_search_ad.descriptions",
+                        updateMask: "responsive_search_ad.headlines,responsive_search_ad.descriptions",
                     },
                 }],
             }),
@@ -2913,12 +2917,12 @@ async function updateAdFinalUrl(token, customerId, mccId, adResourceName, finalU
             },
             body: JSON.stringify({
                 mutateOperations: [{
-                    adGroupAdOperation: {
+                    adOperation: {
                         update: {
                             resourceName: adResourceName,
-                            ad: { finalUrls: [finalUrl] },
+                            finalUrls: [finalUrl],
                         },
-                        updateMask: "ad.final_urls",
+                        updateMask: "final_urls",
                     },
                 }],
             }),
@@ -4436,7 +4440,7 @@ function makeServer() {
                     account_name:     { type: "string", description: "Client name (partial match ok)" },
                     campaign_name:    { type: "string", description: "Campaign name (partial match ok)" },
                     strategy:         { type: "string", enum: ["MANUAL_CPC","ENHANCED_CPC","MAXIMIZE_CLICKS","MAXIMIZE_CONVERSIONS","TARGET_CPA","TARGET_ROAS"], description: "Bidding strategy to apply" },
-                    target_cpa:       { type: "number", description: "Target CPA in dollars — required for TARGET_CPA strategy" },
+                    target_cpa:       { type: "number", description: "Target CPA in dollars — required for TARGET_CPA, optional for MAXIMIZE_CONVERSIONS (sets a tCPA target without changing strategy type)" },
                     target_roas:      { type: "number", description: "Target ROAS as a multiplier — required for TARGET_ROAS (e.g. 3.0 = 300%)" },
                     cpc_bid_ceiling:  { type: "number", description: "Optional max CPC ceiling in dollars — for MAXIMIZE_CLICKS only" },
                     confirm:          { type: "boolean", description: "Set true to apply. Omit for dry run." },
