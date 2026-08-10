@@ -6607,7 +6607,8 @@ async function handleToolCall(name, args = {}) {
         const errors   = [];
 
         if (platform === "google" || platform === "both") {
-            const { token, error: authErr } = await getGoogleAccessToken(cid);
+            const firstCid = Object.keys(GOOGLE_ACCOUNTS)[0];
+            const { token, error: authErr } = await getGoogleAccessToken(firstCid);
             if (authErr) { errors.push(`Google auth: ${authErr}`); }
             else {
                 for (const [cid, info] of Object.entries(GOOGLE_ACCOUNTS)) {
@@ -6659,12 +6660,13 @@ async function handleToolCall(name, args = {}) {
         const checks = {};
 
         // Google: token refresh + a trivial query against the first account
-        const { token, error: gErr } = await getGoogleAccessToken(cid);
+        const [firstCid, firstInfo] = Object.entries(GOOGLE_ACCOUNTS)[0];
+        const { token, error: gErr } = await getGoogleAccessToken(firstCid);
         if (gErr) {
             checks.google = { status: "❌ FAILING", error: gErr };
         } else {
             try {
-                const [cid, info] = Object.entries(GOOGLE_ACCOUNTS)[0];
+                const [cid, info] = [firstCid, firstInfo];
                 await googleSearch(token, cid, info.mcc, "SELECT customer.id FROM customer LIMIT 1");
                 checks.google = { status: "✅ OK", note: "Token refresh and API query both working." };
             } catch (e) {
