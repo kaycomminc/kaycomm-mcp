@@ -1510,9 +1510,14 @@ function resolveGaqlDateClause(dateRange, startDate, endDate) {
     if (dateRange === "YEAR_TO_DATE") {
         const { today, yesterday } = getDateInfo();
         const yearStart = `${today.slice(0, 4)}-01-01`;
-        // On Jan 1, yesterday is in the prior year — fall back to today so the range stays valid
         const end = yesterday >= yearStart ? yesterday : today;
         return `BETWEEN '${yearStart}' AND '${end}'`;
+    }
+    if (dateRange === "LAST_90_DAYS") {
+        const { yesterday } = getDateInfo();
+        const d = new Date(yesterday);
+        d.setDate(d.getDate() - 89);
+        return `BETWEEN '${d.toISOString().slice(0, 10)}' AND '${yesterday}'`;
     }
     if (dateRange === "CUSTOM" && startDate && endDate) {
         return `BETWEEN '${startDate}' AND '${endDate}'`;
@@ -3689,7 +3694,7 @@ async function fetchPmaxAssetGroups(token, customerId, mccId, dateClause) {
 // primary_status (+ reasons) and the policy approval status. That covers the
 // question this flag was really for — which assets are held back — so we
 // return those instead of a label that no longer exists.
-async function fetchPmaxAssetPerformance(token, customerId, mccId) {
+async function fetchPmaxAssetPerformance(token, customerId, mccId, limit = 500) {
     const rows = await googleSearch(token, customerId, mccId, `
         SELECT campaign.name, asset_group.name,
                asset_group_asset.field_type, asset_group_asset.status,
@@ -3699,7 +3704,8 @@ async function fetchPmaxAssetPerformance(token, customerId, mccId) {
                asset.type, asset.text_asset.text, asset.name
         FROM asset_group_asset
         WHERE asset_group_asset.status = 'ENABLED'
-          AND campaign.status = 'ENABLED'`);
+          AND campaign.status = 'ENABLED'
+        LIMIT ${limit}`);
     return rows.map(r => ({
         campaign:        r.campaign.name,
         asset_group:     r.assetGroup.name,
@@ -6541,61 +6547,57 @@ async function handleToolCall(name, args = {}) {
 
     } else if (name === "get_conversion_health") {
         const search = (args.account_name || "").toLowerCase();
-        const { token, error: authErr } = await getGoogleAccessToken(cid);
-        if (authErr) { result = { error: `Auth: ${authErr}` }; }
+        const targets = Object.entries(GOOGLE_ACCOUNTS)
+            .filter(([, i]) => !search || i.name.toLowerCase().includes(search));
+        if (!targets.length) { result = { error: `No Google account matching '${args.account_name}'` }; }
         else {
-            const targets = Object.entries(GOOGLE_ACCOUNTS)
-                .filter(([, i]) => !search || i.name.toLowerCase().includes(search));
-            if (!targets.length) { result = { error: `No Google account matching '${args.account_name}'` }; }
-            else {
-                const accounts = [];
-                for (const [cid, info] of targets) {
-                    try {
-                        const actions = await fetchConversionHealth(token, cid, info.mcc);
-                        const silent   = actions.filter(a => a.health === "GONE_SILENT");
-                        const inactive = actions.filter(a => a.health === "INACTIVE_30D");
-                        const allSilent = actions.length > 0 && actions.every(a => a.conversions_7d === 0);
-                        accounts.push({
-                            account: info.name,
-                            total_actions: actions.length,
-                            alert: allSilent ? "⚠️ NO conversion action fired in 7 days — tracking may be broken account-wide"
-                                 : silent.length ? `${silent.length} action(s) gone silent in the last 7 days`
-                                 : null,
-                            gone_silent: silent,
-                            inactive_30d: inactive,
-                            healthy: actions.filter(a => a.health === "OK"),
-                        });
-                    } catch (e) { accounts.push({ account: info.name, error: e.message }); }
-                }
-                result = { checked: accounts.length, accounts };
+            const accounts = [];
+            for (const [cid, info] of targets) {
+                try {
+                    const { token, error: authErr } = await getGoogleAccessToken(cid);
+                    if (authErr) { accounts.push({ account: info.name, error: `Auth: ${authErr}` }); continue; }
+                    const actions = await fetchConversionHealth(token, cid, info.mcc);
+                    const silent   = actions.filter(a => a.health === "GONE_SILENT");
+                    const inactive = actions.filter(a => a.health === "INACTIVE_30D");
+                    const allSilent = actions.length > 0 && actions.every(a => a.conversions_7d === 0);
+                    accounts.push({
+                        account: info.name,
+                        total_actions: actions.length,
+                        alert: allSilent ? "⚠️ NO conversion action fired in 7 days — tracking may be broken account-wide"
+                             : silent.length ? `${silent.length} action(s) gone silent in the last 7 days`
+                             : null,
+                        gone_silent: silent,
+                        inactive_30d: inactive,
+                        healthy: actions.filter(a => a.health === "OK"),
+                    });
+                } catch (e) { accounts.push({ account: info.name, error: e.message }); }
             }
+            result = { checked: accounts.length, accounts };
         }
 
     } else if (name === "get_ad_disapprovals") {
         const search = (args.account_name || "").toLowerCase();
-        const { token, error: authErr } = await getGoogleAccessToken(cid);
-        if (authErr) { result = { error: `Auth: ${authErr}` }; }
+        const targets = Object.entries(GOOGLE_ACCOUNTS)
+            .filter(([, i]) => !search || i.name.toLowerCase().includes(search));
+        if (!targets.length) { result = { error: `No Google account matching '${args.account_name}'` }; }
         else {
-            const targets = Object.entries(GOOGLE_ACCOUNTS)
-                .filter(([, i]) => !search || i.name.toLowerCase().includes(search));
-            if (!targets.length) { result = { error: `No Google account matching '${args.account_name}'` }; }
-            else {
-                const accounts = [];
-                let totalIssues = 0;
-                for (const [cid, info] of targets) {
-                    try {
-                        const issues = await fetchAdDisapprovals(token, cid, info.mcc);
-                        totalIssues += issues.length;
-                        if (issues.length) accounts.push({ account: info.name, issue_count: issues.length, ads: issues });
-                    } catch (e) { accounts.push({ account: info.name, error: e.message }); }
-                }
-                result = {
-                    checked: targets.length,
-                    total_flagged_ads: totalIssues,
-                    message: totalIssues === 0 ? "✅ All ads in enabled campaigns are fully approved." : `${totalIssues} ad(s) need attention.`,
-                    accounts,
-                };
+            const accounts = [];
+            let totalIssues = 0;
+            for (const [cid, info] of targets) {
+                try {
+                    const { token, error: authErr } = await getGoogleAccessToken(cid);
+                    if (authErr) { accounts.push({ account: info.name, error: `Auth: ${authErr}` }); continue; }
+                    const issues = await fetchAdDisapprovals(token, cid, info.mcc);
+                    totalIssues += issues.length;
+                    if (issues.length) accounts.push({ account: info.name, issue_count: issues.length, ads: issues });
+                } catch (e) { accounts.push({ account: info.name, error: e.message }); }
             }
+            result = {
+                checked: targets.length,
+                total_flagged_ads: totalIssues,
+                message: totalIssues === 0 ? "✅ All ads in enabled campaigns are fully approved." : `${totalIssues} ad(s) need attention.`,
+                accounts,
+            };
         }
 
     } else if (name === "check_anomalies") {
