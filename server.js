@@ -75,7 +75,7 @@ const BUILTIN_HEALTH_DEFAULTS = {
 // (grepped from info.* accesses across the file, incl. manage_accounts'
 // add/update field lists and getEffectiveBudget's budget_schedule).
 const KNOWN_ACCOUNT_KEYS = new Set([
-    "name", "budget", "mcc", "nc_budget", "ga4", "health",
+    "name", "budget", "mcc", "nc_budget", "ga4", "health", "refresh_token_env",
     "flight_start", "flight_end", "budget_schedule",
     "page_id", "instagram_account_id",
 ]);
@@ -100,8 +100,8 @@ function validateAccounts(data) {
             if (typeof info.budget !== "number") {
                 warn(id, `"budget" is not a number (got ${JSON.stringify(info.budget)})`);
             }
-            if (platform === "google" && !info.mcc) {
-                warn(id, `google entry missing "mcc"`);
+            if (platform === "google" && !info.mcc && !info.refresh_token_env) {
+                warn(id, `google entry missing "mcc" (standalone accounts need "refresh_token_env")`);
             }
             if (info.health !== undefined && info.health !== false && typeof info.health !== "object") {
                 warn(id, `"health" must be false or an object (got ${JSON.stringify(info.health)})`);
@@ -125,6 +125,9 @@ function loadAccounts() {
     const data = JSON.parse(fs.readFileSync(ACCOUNTS_FILE, "utf8"));
     validateAccounts(data);
     GOOGLE_ACCOUNTS        = data.google     || {};
+    for (const [cid, info] of Object.entries(GOOGLE_ACCOUNTS)) {
+        if (!info.mcc) info.mcc = cid;
+    }
     META_ACCOUNTS          = data.meta       || {};
     STACKADAPT_ADVERTISERS = data.stackadapt || {};
     HEALTH_DEFAULTS        = { ...BUILTIN_HEALTH_DEFAULTS, ...(data.health_defaults || {}) };
@@ -321,24 +324,31 @@ async function fetchWithRetry(url, opts, tries = 3) {
 }
 
 // ── Google Auth ───────────────────────────────────────────────────────────────
-let _googleToken = null;
-let _googleTokenExpiry = 0;
+const _googleTokenCache = {};
 
-async function getGoogleAccessToken() {
-    if (_googleToken && Date.now() < _googleTokenExpiry) return { token: _googleToken, error: null };
+function getRefreshTokenForAccount(customerId) {
+    const info = GOOGLE_ACCOUNTS[customerId];
+    if (info?.refresh_token_env) return process.env[info.refresh_token_env] || null;
+    return GOOGLE_REFRESH_TOKEN;
+}
+
+async function getGoogleAccessToken(customerId) {
+    const refreshToken = customerId ? getRefreshTokenForAccount(customerId) : GOOGLE_REFRESH_TOKEN;
+    const cacheKey = refreshToken || "__default__";
+    const cached = _googleTokenCache[cacheKey];
+    if (cached && Date.now() < cached.expiry) return { token: cached.token, error: null };
     const resp = await fetchWithRetry("https://oauth2.googleapis.com/token", {
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
         body: new URLSearchParams({
             client_id: GOOGLE_CLIENT_ID, client_secret: GOOGLE_CLIENT_SECRET,
-            refresh_token: GOOGLE_REFRESH_TOKEN, grant_type: "refresh_token",
+            refresh_token: refreshToken, grant_type: "refresh_token",
         }),
     });
     const data = await resp.json();
     if (!data.access_token) return { token: null, error: data.error_description || JSON.stringify(data) };
-    _googleToken = data.access_token;
-    _googleTokenExpiry = Date.now() + (data.expires_in - 60) * 1000;
-    return { token: _googleToken, error: null };
+    _googleTokenCache[cacheKey] = { token: data.access_token, expiry: Date.now() + (data.expires_in - 60) * 1000 };
+    return { token: data.access_token, error: null };
 }
 
 // ── Google Ads API ────────────────────────────────────────────────────────────
@@ -486,8 +496,14 @@ const emptyWindow = (start, end) => start > end;
 // All accounts are fetched in parallel; each row also carries a daily_budget
 // block comparing enabled campaigns' daily budgets to the per-day spend needed
 // to land on budget (the actionable lever for pacing fixes).
-async function buildGoogleRows(token, pace_dom, dim, today, monthStart, yesterday) {
+async function buildGoogleRows(defaultToken, pace_dom, dim, today, monthStart, yesterday) {
     return Promise.all(Object.entries(GOOGLE_ACCOUNTS).map(async ([cid, info]) => {
+        let token = defaultToken;
+        if (info.refresh_token_env) {
+            const { token: t, error } = await getGoogleAccessToken(cid);
+            if (error) return { account: info.name, error: `Auth failed: ${error}` };
+            token = t;
+        }
         const { budget, nc_budget } = getEffectiveBudget(info, today);
         const budgetsPromise = fetchGoogleDailyBudgets(token, cid, info.mcc).catch(() => null);
 
@@ -5471,17 +5487,16 @@ async function handleToolCall(name, args = {}) {
         }
 
         // Google
-        const { token } = await getGoogleAccessToken();
-        if (token) {
-            for (const [cid, info] of Object.entries(GOOGLE_ACCOUNTS)) {
-                if (info.name.toLowerCase().includes(search)) {
-                    const { budget } = getEffectiveBudget(info, today);
-                    const { spend, error } = await fetchGoogleMTD(token, cid, info.mcc, month_start, yesterday);
-                    if (error) results.push({ platform: "Google", account: info.name, error });
-                    else results.push({ platform: "Google", account: info.name,
-                        mtd_spend: Math.round(spend * 100) / 100, budget,
-                        ...getPacingLabel(spend, budget, pace_dom, dim) });
-                }
+        for (const [cid, info] of Object.entries(GOOGLE_ACCOUNTS)) {
+            if (info.name.toLowerCase().includes(search)) {
+                const { token } = await getGoogleAccessToken(cid);
+                if (!token) { results.push({ platform: "Google", account: info.name, error: "Auth failed" }); continue; }
+                const { budget } = getEffectiveBudget(info, today);
+                const { spend, error } = await fetchGoogleMTD(token, cid, info.mcc, month_start, yesterday);
+                if (error) results.push({ platform: "Google", account: info.name, error });
+                else results.push({ platform: "Google", account: info.name,
+                    mtd_spend: Math.round(spend * 100) / 100, budget,
+                    ...getPacingLabel(spend, budget, pace_dom, dim) });
             }
         }
 
@@ -5521,7 +5536,7 @@ async function handleToolCall(name, args = {}) {
             result = { error: `No Google account found matching '${args.account_name}'` };
         } else {
             const [cid, info] = match;
-            const { token, error } = await getGoogleAccessToken();
+            const { token, error } = await getGoogleAccessToken(cid);
             if (error) { result = { error: `Auth failed: ${error}` }; }
             else {
                 try {
@@ -5553,7 +5568,7 @@ async function handleToolCall(name, args = {}) {
             result = { error: `No Google account found matching '${args.account_name}'` };
         } else {
             const [cid, info] = match;
-            const { token, error } = await getGoogleAccessToken();
+            const { token, error } = await getGoogleAccessToken(cid);
             if (error) { result = { error: `Auth failed: ${error}` }; }
             else {
                 try {
@@ -5575,7 +5590,7 @@ async function handleToolCall(name, args = {}) {
             if (!match) { result.google_error = `No Google account matching '${args.account_name}'`; }
             else {
                 const [cid, info] = match;
-                const { token, error: authErr } = await getGoogleAccessToken();
+                const { token, error: authErr } = await getGoogleAccessToken(cid);
                 if (authErr) { result.google_error = authErr; }
                 else {
                     try {
@@ -5621,7 +5636,7 @@ async function handleToolCall(name, args = {}) {
             if (!match) { result = { error: `No Google account matching '${args.account_name}'` }; }
             else {
                 const [cid, info] = match;
-                const { token, error: authErr } = await getGoogleAccessToken();
+                const { token, error: authErr } = await getGoogleAccessToken(cid);
                 if (authErr) { result = { error: `Auth: ${authErr}` }; }
                 else {
                     try {
@@ -5666,7 +5681,7 @@ async function handleToolCall(name, args = {}) {
             if (!match) { result = { error: `No Google account matching '${args.account_name}'` }; }
             else {
                 const [cid, info] = match;
-                const { token, error: authErr } = await getGoogleAccessToken();
+                const { token, error: authErr } = await getGoogleAccessToken(cid);
                 if (authErr) { result = { error: `Auth: ${authErr}` }; }
                 else {
                     try {
@@ -5690,7 +5705,7 @@ async function handleToolCall(name, args = {}) {
             if (!match) { result = { error: `No Google account matching '${args.account_name}'` }; }
             else {
                 const [cid, info] = match;
-                const { token, error: authErr } = await getGoogleAccessToken();
+                const { token, error: authErr } = await getGoogleAccessToken(cid);
                 if (authErr) { result = { error: `Auth: ${authErr}` }; }
                 else {
                     try {
@@ -5780,7 +5795,7 @@ async function handleToolCall(name, args = {}) {
             if (!match) { result = { error: `No Google account matching '${args.account_name}'` }; }
             else {
                 const [cid, info] = match;
-                const { token, error: authErr } = await getGoogleAccessToken();
+                const { token, error: authErr } = await getGoogleAccessToken(cid);
                 if (authErr) { result = { error: `Auth: ${authErr}` }; }
                 else {
                     try {
@@ -5829,7 +5844,7 @@ async function handleToolCall(name, args = {}) {
         if (!match) { result = { error: `No Google account matching '${args.account_name}'` }; }
         else {
             const [cid, info] = match;
-            const { token, error: authErr } = await getGoogleAccessToken();
+            const { token, error: authErr } = await getGoogleAccessToken(cid);
             if (authErr) { result = { error: `Auth: ${authErr}` }; }
             else {
                 try {
@@ -5873,7 +5888,7 @@ async function handleToolCall(name, args = {}) {
         else if (!match) { result = { error: `No Google account matching '${args.account_name}'` }; }
         else {
             const [cid, info] = match;
-            const { token, error: authErr } = await getGoogleAccessToken();
+            const { token, error: authErr } = await getGoogleAccessToken(cid);
             if (authErr) { result = { error: `Auth: ${authErr}` }; }
             else {
                 try {
@@ -5923,7 +5938,7 @@ async function handleToolCall(name, args = {}) {
             if (!match) { result = { error: `No Google account matching '${args.account_name}'` }; }
             else {
                 const [cid, info] = match;
-                const { token, error: authErr } = await getGoogleAccessToken();
+                const { token, error: authErr } = await getGoogleAccessToken(cid);
                 if (authErr) { result = { error: `Auth: ${authErr}` }; }
                 else {
                     try {
@@ -5978,7 +5993,7 @@ async function handleToolCall(name, args = {}) {
                     accounts_with_ga4: withGA4.length ? withGA4 : ["None configured yet — provide a GA4 Property ID to add one."],
                 };
             } else {
-                const { token, error: authErr } = await getGoogleAccessToken();
+                const { token, error: authErr } = await getGoogleAccessToken(cid);
                 if (authErr) { result = { error: `Auth: ${authErr}` }; }
                 else {
                     try {
@@ -6013,7 +6028,7 @@ async function handleToolCall(name, args = {}) {
                 result.google_error = `No Google account matching '${args.account_name}'`;
             } else {
                 const [cid, info] = match;
-                const { token, error: authErr } = await getGoogleAccessToken();
+                const { token, error: authErr } = await getGoogleAccessToken(cid);
                 if (authErr) { result.google_error = `Auth: ${authErr}`; }
                 else {
                     try {
@@ -6056,7 +6071,7 @@ async function handleToolCall(name, args = {}) {
             result = { error: `No Google account found matching '${args.account_name}'` };
         } else {
             const [cid, info] = match;
-            const { token, error: authErr } = await getGoogleAccessToken();
+            const { token, error: authErr } = await getGoogleAccessToken(cid);
             if (authErr) { result = { error: `Auth: ${authErr}` }; }
             else {
                 try {
@@ -6082,7 +6097,7 @@ async function handleToolCall(name, args = {}) {
             result = { error: `No Google account found matching '${args.account_name}'` };
         } else {
             const [cid, info] = match;
-            const { token, error: authErr } = await getGoogleAccessToken();
+            const { token, error: authErr } = await getGoogleAccessToken(cid);
             if (authErr) { result = { error: `Auth: ${authErr}` }; }
             else {
                 try {
@@ -6126,7 +6141,7 @@ async function handleToolCall(name, args = {}) {
                 if (!match) { result.google_error = `No Google account matching '${args.account_name}'`; }
                 else {
                     const [cid, info] = match;
-                    const { token, error: authErr } = await getGoogleAccessToken();
+                    const { token, error: authErr } = await getGoogleAccessToken(cid);
                     if (authErr) { result.google_error = authErr; }
                     else {
                         const [cur, pri] = await Promise.all([
@@ -6181,7 +6196,7 @@ async function handleToolCall(name, args = {}) {
                 if (!match) { result.google_error = `No Google account matching '${args.account_name}'`; }
                 else {
                     const [cid, info] = match;
-                    const { token, error: authErr } = await getGoogleAccessToken();
+                    const { token, error: authErr } = await getGoogleAccessToken(cid);
                     if (authErr) { result.google_error = authErr; }
                     else {
                         result.google = { account: info.name, ...(await fetchGoogleMonthlyTrend(token, cid, info.mcc, year)) };
@@ -6445,7 +6460,7 @@ async function handleToolCall(name, args = {}) {
             result = { error: `No Google account found matching '${args.account_name}'` };
         } else {
             const [cid, info] = acctMatch;
-            const { token, error: authErr } = await getGoogleAccessToken();
+            const { token, error: authErr } = await getGoogleAccessToken(cid);
             if (authErr) { result = { error: `Auth failed: ${authErr}` }; }
             else {
                 try {
@@ -6526,7 +6541,7 @@ async function handleToolCall(name, args = {}) {
 
     } else if (name === "get_conversion_health") {
         const search = (args.account_name || "").toLowerCase();
-        const { token, error: authErr } = await getGoogleAccessToken();
+        const { token, error: authErr } = await getGoogleAccessToken(cid);
         if (authErr) { result = { error: `Auth: ${authErr}` }; }
         else {
             const targets = Object.entries(GOOGLE_ACCOUNTS)
@@ -6558,7 +6573,7 @@ async function handleToolCall(name, args = {}) {
 
     } else if (name === "get_ad_disapprovals") {
         const search = (args.account_name || "").toLowerCase();
-        const { token, error: authErr } = await getGoogleAccessToken();
+        const { token, error: authErr } = await getGoogleAccessToken(cid);
         if (authErr) { result = { error: `Auth: ${authErr}` }; }
         else {
             const targets = Object.entries(GOOGLE_ACCOUNTS)
@@ -6590,7 +6605,7 @@ async function handleToolCall(name, args = {}) {
         const errors   = [];
 
         if (platform === "google" || platform === "both") {
-            const { token, error: authErr } = await getGoogleAccessToken();
+            const { token, error: authErr } = await getGoogleAccessToken(cid);
             if (authErr) { errors.push(`Google auth: ${authErr}`); }
             else {
                 for (const [cid, info] of Object.entries(GOOGLE_ACCOUNTS)) {
@@ -6642,7 +6657,7 @@ async function handleToolCall(name, args = {}) {
         const checks = {};
 
         // Google: token refresh + a trivial query against the first account
-        const { token, error: gErr } = await getGoogleAccessToken();
+        const { token, error: gErr } = await getGoogleAccessToken(cid);
         if (gErr) {
             checks.google = { status: "❌ FAILING", error: gErr };
         } else {
@@ -6791,7 +6806,7 @@ async function handleToolCall(name, args = {}) {
         result = {};
 
         if (platform === "google" || platform === "both") {
-            const { token, error: authErr } = await getGoogleAccessToken();
+            const { token, error: authErr } = await getGoogleAccessToken(cid);
             if (authErr) { result.google_error = `Auth: ${authErr}`; }
             else {
                 try {
@@ -6920,7 +6935,7 @@ async function handleToolCall(name, args = {}) {
                 result = { error: `No Google account matching '${args.account_name}'` };
             } else {
                 const [cid, info] = match;
-                const { token, error: authErr } = await getGoogleAccessToken();
+                const { token, error: authErr } = await getGoogleAccessToken(cid);
                 if (authErr) { result = { error: `Auth: ${authErr}` }; }
                 else {
                     try {
@@ -6987,7 +7002,7 @@ async function handleToolCall(name, args = {}) {
                 result = { error: `No Google account matching '${args.account_name}'` };
             } else {
                 const [cid, info] = match;
-                const { token, error: authErr } = await getGoogleAccessToken();
+                const { token, error: authErr } = await getGoogleAccessToken(cid);
                 if (authErr) { result = { error: `Auth: ${authErr}` }; }
                 else {
                     if (!confirm) {
@@ -7030,7 +7045,7 @@ async function handleToolCall(name, args = {}) {
         result = { google: [], meta: [] };
 
         if (platform === "google" || platform === "both") {
-            const { token, error: authErr } = await getGoogleAccessToken();
+            const { token, error: authErr } = await getGoogleAccessToken(cid);
             if (authErr) { result.google_error = `Auth: ${authErr}`; }
             else {
                 for (const [cid, info] of Object.entries(GOOGLE_ACCOUNTS)) {
@@ -7102,7 +7117,7 @@ async function handleToolCall(name, args = {}) {
             result = { error: `No Google account matching '${args.account_name}'` };
         } else {
             const [cid, info] = match;
-            const { token, error: authErr } = await getGoogleAccessToken();
+            const { token, error: authErr } = await getGoogleAccessToken(cid);
             if (authErr) { result = { error: `Auth: ${authErr}` }; }
             else {
                 try {
@@ -7146,7 +7161,7 @@ async function handleToolCall(name, args = {}) {
                 result = { error: `No Google account matching '${args.account_name}'` };
             } else {
                 const [cid, info] = match;
-                const { token, error: authErr } = await getGoogleAccessToken();
+                const { token, error: authErr } = await getGoogleAccessToken(cid);
                 if (authErr) { result = { error: `Auth: ${authErr}` }; }
                 else {
                     const config = {
@@ -7208,7 +7223,7 @@ async function handleToolCall(name, args = {}) {
             result = { error: `No Google account matching '${args.account_name}'` };
         } else {
             const [cid, info] = match;
-            const { token, error: authErr } = await getGoogleAccessToken();
+            const { token, error: authErr } = await getGoogleAccessToken(cid);
             if (authErr) { result = { error: `Auth: ${authErr}` }; }
             else {
                 try {
@@ -7244,7 +7259,7 @@ async function handleToolCall(name, args = {}) {
                 result = { error: `No Google account matching '${args.account_name}'` };
             } else {
                 const [cid, info] = match;
-                const { token, error: authErr } = await getGoogleAccessToken();
+                const { token, error: authErr } = await getGoogleAccessToken(cid);
                 if (authErr) { result = { error: `Auth: ${authErr}` }; }
                 else {
                     const config = {
@@ -7323,7 +7338,7 @@ async function handleToolCall(name, args = {}) {
             result = { error: `No Google account matching '${args.account_name}'` };
         } else {
             const [cid, info] = match;
-            const { token, error: authErr } = await getGoogleAccessToken();
+            const { token, error: authErr } = await getGoogleAccessToken(cid);
             if (authErr) { result = { error: `Auth: ${authErr}` }; }
             else {
                 try {
@@ -7388,7 +7403,7 @@ async function handleToolCall(name, args = {}) {
             result = { error: `No Google account matching '${args.account_name}'` };
         } else {
             const [cid, info] = match;
-            const { token, error: authErr } = await getGoogleAccessToken();
+            const { token, error: authErr } = await getGoogleAccessToken(cid);
             if (authErr) { result = { error: `Auth: ${authErr}` }; }
             else {
                 try {
@@ -7446,7 +7461,7 @@ async function handleToolCall(name, args = {}) {
                 result = { error: `No Google account matching '${args.account_name}'` };
             } else {
                 const [cid, info] = match;
-                const { token, error: authErr } = await getGoogleAccessToken();
+                const { token, error: authErr } = await getGoogleAccessToken(cid);
                 if (authErr) { result = { error: `Auth: ${authErr}` }; }
                 else {
                     try {
@@ -7925,7 +7940,7 @@ async function handleToolCall(name, args = {}) {
             result = { error: `No Google account found matching '${args.account_name}'` };
         } else {
             const [cid, info] = match;
-            const { token, error: authErr } = await getGoogleAccessToken();
+            const { token, error: authErr } = await getGoogleAccessToken(cid);
             if (authErr) { result = { error: `Auth: ${authErr}` }; }
             else {
                 try {
@@ -7956,7 +7971,7 @@ async function handleToolCall(name, args = {}) {
             result = { error: `No Google account found matching '${args.account_name}'` };
         } else {
             const [cid, info] = match;
-            const { token, error: authErr } = await getGoogleAccessToken();
+            const { token, error: authErr } = await getGoogleAccessToken(cid);
             if (authErr) { result = { error: `Auth: ${authErr}` }; }
             else {
                 try {
@@ -7979,7 +7994,7 @@ async function handleToolCall(name, args = {}) {
             result = { error: `No Google account found matching '${args.account_name}'` };
         } else {
             const [cid, info] = match;
-            const { token, error: authErr } = await getGoogleAccessToken();
+            const { token, error: authErr } = await getGoogleAccessToken(cid);
             if (authErr) { result = { error: `Auth: ${authErr}` }; }
             else {
                 try {
@@ -8023,7 +8038,7 @@ async function handleToolCall(name, args = {}) {
 
         // ── Google checks ────────────────────────────────────────────────
         if (platformFilter === "google" || platformFilter === "both") {
-            const { token, error: authErr } = await getGoogleAccessToken();
+            const { token, error: authErr } = await getGoogleAccessToken(cid);
             if (authErr) {
                 errors.push(`Google auth failed: ${authErr}`);
             } else {
@@ -8507,7 +8522,7 @@ async function handleToolCall(name, args = {}) {
             result = { error: `No Google account found matching '${args.account_name}'` };
         } else {
             const [cid, info] = match;
-            const { token, error: authErr } = await getGoogleAccessToken();
+            const { token, error: authErr } = await getGoogleAccessToken(cid);
             if (authErr) { result = { error: `Auth: ${authErr}` }; }
             else {
                 try {
@@ -8552,7 +8567,7 @@ async function handleToolCall(name, args = {}) {
             result = { error: "date_range CUSTOM requires both start_date and end_date (YYYY-MM-DD)." };
         } else {
             const [cid, info] = match;
-            const { token, error: authErr } = await getGoogleAccessToken();
+            const { token, error: authErr } = await getGoogleAccessToken(cid);
             if (authErr) { result = { error: `Auth: ${authErr}` }; }
             else {
                 try {
@@ -8606,7 +8621,7 @@ async function handleToolCall(name, args = {}) {
             result = { error: "date_range CUSTOM requires both start_date and end_date (YYYY-MM-DD)." };
         } else {
             const [cid, info] = match;
-            const { token, error: authErr } = await getGoogleAccessToken();
+            const { token, error: authErr } = await getGoogleAccessToken(cid);
             if (authErr) { result = { error: `Auth: ${authErr}` }; }
             else {
                 try {
@@ -8634,7 +8649,7 @@ async function handleToolCall(name, args = {}) {
             result = { error: `Unknown segment '${segment}'. Valid: geo, geo_city, device, hour, day_of_week, date.` };
         } else {
             const [cid, info] = match;
-            const { token, error: authErr } = await getGoogleAccessToken();
+            const { token, error: authErr } = await getGoogleAccessToken(cid);
             if (authErr) { result = { error: `Auth: ${authErr}` }; }
             else {
                 try {
@@ -8657,7 +8672,7 @@ async function handleToolCall(name, args = {}) {
             result = { error: `No Google account found matching '${args.account_name}'` };
         } else {
             const [cid, info] = match;
-            const { token, error: authErr } = await getGoogleAccessToken();
+            const { token, error: authErr } = await getGoogleAccessToken(cid);
             if (authErr) { result = { error: `Auth: ${authErr}` }; }
             else {
                 try {

@@ -157,6 +157,12 @@
       "budget": 10000,
       "mcc": "7631184147",
       "health": false
+    },
+    "7539940999": {
+      "name": "Digital Practice Growth",
+      "budget": 0,
+      "refresh_token_env": "GOOGLE_REFRESH_TOKEN_2",
+      "health": false
     }
   },
   "meta": {
