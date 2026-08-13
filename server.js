@@ -1244,8 +1244,47 @@ async function fetchGA4Report(token, propertyId, dateRange, breakdownBy = "chann
 }
 
 // ── Campaign performance ──────────────────────────────────────────────────────
-async function fetchGoogleCampaignPerf(token, customerId, mccId, dateRange, startDate, endDate) {
+async function fetchGoogleCampaignPerf(token, customerId, mccId, dateRange, startDate, endDate, segmentBy) {
     const dateClause = resolveGaqlDateClause(dateRange, startDate, endDate);
+    const byConvAction = segmentBy === "conversion_action";
+
+    if (byConvAction) {
+        const rows = await googleSearch(token, customerId, mccId, `
+            SELECT campaign.name, campaign.status, campaign.advertising_channel_type,
+                   segments.conversion_action, segments.conversion_action_name,
+                   segments.conversion_action_category,
+                   metrics.conversions, metrics.conversions_value
+            FROM campaign
+            WHERE segments.date ${dateClause}
+              AND metrics.conversions > 0
+            ORDER BY metrics.conversions DESC`);
+        const byCampaign = {};
+        for (const row of rows) {
+            const name = row.campaign.name;
+            if (!byCampaign[name]) {
+                byCampaign[name] = {
+                    campaign: name,
+                    status:   row.campaign.status,
+                    type:     row.campaign.advertisingChannelType,
+                    conversion_actions: [],
+                };
+            }
+            const convs   = parseFloat(row.metrics.conversions || 0);
+            const convVal = parseFloat(row.metrics.conversionsValue || 0);
+            if (convs === 0 && convVal === 0) continue;
+            byCampaign[name].conversion_actions.push({
+                conversion_action: row.segments?.conversionActionName || "Unknown",
+                category:          row.segments?.conversionActionCategory || null,
+                conversions:       convs,
+                conv_value:        Math.round(convVal * 100) / 100,
+            });
+        }
+        for (const c of Object.values(byCampaign)) {
+            c.conversion_actions.sort((a, b) => b.conversions - a.conversions);
+        }
+        return Object.values(byCampaign);
+    }
+
     const rows = await googleSearch(token, customerId, mccId, `
         SELECT campaign.name, campaign.status, campaign.advertising_channel_type,
                metrics.cost_micros, metrics.clicks, metrics.impressions,
@@ -2049,6 +2088,38 @@ async function listKeywordCriteria(token, customerId, mccId, campaignSearch, adG
         .filter(k => !adGroupSearch || k.ad_group.toLowerCase().includes(adGroupSearch));
 }
 
+async function findKeywordInventory(token, customerId, mccId) {
+    const rows = await googleSearch(token, customerId, mccId, `
+        SELECT ad_group_criterion.criterion_id,
+               ad_group_criterion.keyword.text,
+               ad_group_criterion.keyword.match_type,
+               ad_group_criterion.status,
+               ad_group_criterion.negative,
+               ad_group.id,
+               ad_group.name,
+               ad_group.status,
+               campaign.id,
+               campaign.name,
+               campaign.status,
+               campaign.advertising_channel_type
+        FROM ad_group_criterion
+        WHERE ad_group_criterion.type = 'KEYWORD'
+          AND ad_group_criterion.negative = FALSE`);
+    return rows.map(row => ({
+        keyword:          row.adGroupCriterion.keyword.text,
+        match_type:       row.adGroupCriterion.keyword.matchType,
+        status:           row.adGroupCriterion.status,
+        criterion_id:     row.adGroupCriterion.criterionId,
+        campaign:         row.campaign.name,
+        campaign_id:      row.campaign.id,
+        campaign_status:  row.campaign.status,
+        campaign_type:    row.campaign.advertisingChannelType,
+        ad_group:         row.adGroup.name,
+        ad_group_id:      row.adGroup.id,
+        ad_group_status:  row.adGroup.status,
+    }));
+}
+
 async function updateGoogleKeywordStatus(token, customerId, mccId, resourceNames, status) {
     const resp = await fetchFn(
         `https://googleads.googleapis.com/${GOOGLE_API_VERSION}/customers/${customerId}/googleAds:mutate`,
@@ -2578,6 +2649,151 @@ async function fetchConversionHealth(token, customerId, mccId) {
             health,
         };
     });
+}
+
+async function fetchCallTrackingDiagnostics(token, customerId, mccId) {
+    // 1. Call assets linked to campaigns (call_asset via campaign_asset)
+    const callAssets = await googleSearch(token, customerId, mccId, `
+        SELECT campaign.name, campaign.status,
+               asset.call_asset.phone_number, asset.call_asset.country_code,
+               asset.call_asset.call_conversion_action,
+               asset.call_asset.call_conversion_reporting_state,
+               campaign_asset.status, campaign_asset.field_type
+        FROM campaign_asset
+        WHERE campaign_asset.field_type = 'CALL'
+          AND campaign.status != 'REMOVED'`).catch(() => []);
+
+    // 2. Customer-level call assets (account-level)
+    const customerCallAssets = await googleSearch(token, customerId, mccId, `
+        SELECT asset.call_asset.phone_number, asset.call_asset.country_code,
+               asset.call_asset.call_conversion_action,
+               asset.call_asset.call_conversion_reporting_state,
+               customer_asset.status, customer_asset.field_type
+        FROM customer_asset
+        WHERE customer_asset.field_type = 'CALL'`).catch(() => []);
+
+    // 3. Conversion actions — full detail including phone_call_duration_seconds
+    const convActions = await googleSearch(token, customerId, mccId, `
+        SELECT conversion_action.name, conversion_action.id, conversion_action.type,
+               conversion_action.category, conversion_action.status,
+               conversion_action.primary_for_goal,
+               conversion_action.phone_call_duration_seconds,
+               conversion_action.counting_type
+        FROM conversion_action
+        WHERE conversion_action.status = 'ENABLED'`);
+
+    // 4. Volume for call-type conversion actions (30d / 7d)
+    const callTypes = new Set(["AD_CALL", "WEBSITE_CALL", "CLICK_TO_CALL"]);
+    const volumeQuery = range => googleSearch(token, customerId, mccId, `
+        SELECT conversion_action.name, metrics.all_conversions
+        FROM conversion_action
+        WHERE segments.date DURING ${range}`).catch(() => []);
+    const [d30, d7] = await Promise.all([volumeQuery("LAST_30_DAYS"), volumeQuery("LAST_7_DAYS")]);
+    const vol = rows => Object.fromEntries(rows.map(r => [r.conversionAction.name, parseFloat(r.metrics?.allConversions || 0)]));
+    const v30 = vol(d30), v7 = vol(d7);
+
+    // 5. Enabled campaigns (to flag ones without call assets)
+    const campaigns = await googleSearch(token, customerId, mccId, `
+        SELECT campaign.name, campaign.id, campaign.advertising_channel_type
+        FROM campaign
+        WHERE campaign.status = 'ENABLED'`);
+
+    // Build call asset map: campaign name → asset details
+    const campaignCallAssets = {};
+    for (const r of callAssets) {
+        const cn = r.campaign.name;
+        if (!campaignCallAssets[cn]) campaignCallAssets[cn] = [];
+        campaignCallAssets[cn].push({
+            phone_number: `+${r.asset?.callAsset?.countryCode || ""} ${r.asset?.callAsset?.phoneNumber || ""}`.trim(),
+            status: r.campaignAsset?.status,
+            conversion_reporting: r.asset?.callAsset?.callConversionReportingState,
+        });
+    }
+
+    // Account-level call assets
+    const accountCallAssets = customerCallAssets.map(r => ({
+        phone_number: `+${r.asset?.callAsset?.countryCode || ""} ${r.asset?.callAsset?.phoneNumber || ""}`.trim(),
+        status: r.customerAsset?.status,
+        conversion_reporting: r.asset?.callAsset?.callConversionReportingState,
+    }));
+
+    // Campaign coverage
+    const campaignCoverage = campaigns.map(r => ({
+        campaign: r.campaign.name,
+        type: r.campaign.advertisingChannelType,
+        has_call_asset: !!(campaignCallAssets[r.campaign.name]?.length || accountCallAssets.length),
+        call_assets: campaignCallAssets[r.campaign.name] || [],
+        inherits_account_level: !campaignCallAssets[r.campaign.name]?.length && accountCallAssets.length > 0,
+    }));
+
+    // Call-related conversion actions with detail
+    const callConvActions = convActions
+        .filter(r => callTypes.has(r.conversionAction.type))
+        .map(r => {
+            const name = r.conversionAction.name;
+            return {
+                conversion_action: name,
+                id: r.conversionAction.id,
+                type: r.conversionAction.type,
+                category: r.conversionAction.category,
+                primary: !!r.conversionAction.primaryForGoal,
+                min_call_duration_seconds: parseInt(r.conversionAction.phoneCallDurationSeconds || 0),
+                counting_type: r.conversionAction.countingType,
+                conversions_30d: v30[name] || 0,
+                conversions_7d: v7[name] || 0,
+            };
+        });
+
+    // Detect duplicates: same type + both primary
+    const duplicates = [];
+    const byType = {};
+    for (const a of callConvActions) {
+        const key = a.type;
+        if (!byType[key]) byType[key] = [];
+        byType[key].push(a);
+    }
+    for (const [type, actions] of Object.entries(byType)) {
+        const primaries = actions.filter(a => a.primary);
+        if (primaries.length > 1) {
+            duplicates.push({
+                type,
+                count: primaries.length,
+                actions: primaries.map(a => a.conversion_action),
+                warning: `${primaries.length} primary ${type} actions — risk of double-counting if both fire`,
+            });
+        }
+    }
+
+    // Campaigns with no call coverage at all
+    const noCoverage = campaignCoverage.filter(c => !c.has_call_asset);
+
+    // Website call actions — flag if present but inactive
+    const websiteCallActions = callConvActions.filter(a => a.type === "WEBSITE_CALL");
+
+    // Build alerts
+    const alerts = [];
+    if (noCoverage.length) alerts.push(`${noCoverage.length} enabled campaign(s) have no call asset — AD_CALL conversions won't fire for them`);
+    if (duplicates.length) alerts.push(...duplicates.map(d => d.warning));
+    for (const wc of websiteCallActions) {
+        if (wc.conversions_30d === 0) alerts.push(`"${wc.conversion_action}" (WEBSITE_CALL) has 0 conversions in 30d — verify the phone snippet is deployed and the number matches`);
+        if (wc.min_call_duration_seconds >= 60) alerts.push(`"${wc.conversion_action}" minimum call duration is ${wc.min_call_duration_seconds}s — short calls won't count`);
+    }
+    for (const ac of callConvActions.filter(a => a.type === "AD_CALL")) {
+        if (ac.conversions_30d === 0 && noCoverage.length === campaignCoverage.length) {
+            alerts.push(`"${ac.conversion_action}" (AD_CALL) has 0 conversions — no campaigns have call assets attached`);
+        } else if (ac.conversions_30d === 0) {
+            alerts.push(`"${ac.conversion_action}" (AD_CALL) has 0 conversions in 30d but call assets exist — check if the asset is enabled`);
+        }
+    }
+
+    return {
+        account_level_call_assets: accountCallAssets,
+        campaign_coverage: campaignCoverage,
+        call_conversion_actions: callConvActions,
+        duplicates,
+        campaigns_without_call_asset: noCoverage.map(c => c.campaign),
+        alerts,
+    };
 }
 
 async function fetchAdDisapprovals(token, customerId, mccId) {
@@ -3971,6 +4187,11 @@ function makeServer() {
                     },
                     start_date: { type: "string", description: "Start date YYYY-MM-DD (only with CUSTOM)" },
                     end_date:   { type: "string", description: "End date YYYY-MM-DD (only with CUSTOM)" },
+                    segment_by: {
+                        type: "string",
+                        description: "Optional segmentation. 'conversion_action' breaks out conversions and conv_value by individual conversion action per campaign (Google only).",
+                        enum: ["conversion_action"],
+                    },
                 },
                 required: ["account_name"],
             },
@@ -4232,6 +4453,23 @@ function makeServer() {
             },
         },
         {
+            name: "find_keywords",
+            description: "Search the full keyword inventory for a Google Ads account — including keywords in paused/removed campaigns and keywords that never served. Unlike get_keyword_performance (which only returns keywords with metrics), this queries ad_group_criterion directly and returns every keyword that exists or existed.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    account_name:    { type: "string", description: "Client name (partial match ok)" },
+                    keyword_text:    { type: "string", description: "Substring to search for (case insensitive). Omit to return all keywords." },
+                    campaign_name:   { type: "string", description: "Filter to campaigns matching this substring (partial match ok)" },
+                    ad_group_name:   { type: "string", description: "Filter to ad groups matching this substring (partial match ok)" },
+                    include_removed: { type: "boolean", description: "Include removed keywords, ad groups, and campaigns (default true)" },
+                    match_type:      { type: "string", enum: ["EXACT", "PHRASE", "BROAD"], description: "Only return this match type" },
+                    status:          { type: "string", enum: ["ENABLED", "PAUSED", "REMOVED"], description: "Only return keywords with this criterion status" },
+                },
+                required: ["account_name"],
+            },
+        },
+        {
             name: "update_budget",
             description: "Update the daily budget for a Google Ads campaign or Meta campaign/ad set. Dry run by default — set confirm=true to apply. Google budgets are daily amounts; Meta budgets are also daily in dollars.",
             inputSchema: {
@@ -4260,6 +4498,20 @@ function makeServer() {
         {
             name: "get_ad_disapprovals",
             description: "Find disapproved or limited ads across Google Ads accounts — pulls policy approval status and policy topics for every ad in enabled campaigns. Run across all accounts or one.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    account_name: { type: "string", description: "Client name (partial match ok). Omit to check all accounts." },
+                },
+                required: [],
+            },
+        },
+        {
+            name: "get_call_tracking",
+            description: "Diagnose call tracking setup for a Google Ads account — checks whether call assets are attached to campaigns (campaign-level and account-level), " +
+                "lists all call-related conversion actions (AD_CALL, WEBSITE_CALL) with minimum call duration and 30d/7d volume, " +
+                "flags duplicates (multiple primary actions of the same type), and identifies campaigns with no call asset coverage. " +
+                "Use when call conversions are zero or suspiciously low.",
             inputSchema: {
                 type: "object",
                 properties: {
@@ -4760,6 +5012,22 @@ function makeServer() {
                         description: "Filter to a specific resource type. AD_GROUP_CRITERION = keywords, CAMPAIGN_CRITERION = campaign negatives.",
                         enum: ["CAMPAIGN", "AD_GROUP", "AD", "AD_GROUP_CRITERION", "CAMPAIGN_CRITERION", "CAMPAIGN_BUDGET"],
                     },
+                },
+                required: ["account_name"],
+            },
+        },
+        {
+            name: "get_archived_changes",
+            description: "Search the archived change event log (Postgres). Unlike get_change_history (live API, max 30 days), this reads from the persisted archive with no time limit. " +
+                "Use for investigating what changed months ago — removed keywords, old budget changes, campaign deletions. " +
+                "Requires DATABASE_URL to be configured.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    account_name:  { type: "string", description: "Client name (partial match ok)" },
+                    days:          { type: "number", description: "How far back to look (default: 90, no upper cap)" },
+                    resource_type: { type: "string", description: "Filter to a resource type (e.g. AD_GROUP_CRITERION, CAMPAIGN, AD_GROUP, CAMPAIGN_BUDGET)" },
+                    search:        { type: "string", description: "Substring match against change_resource_name and changed_fields (case insensitive)" },
                 },
                 required: ["account_name"],
             },
@@ -5930,6 +6198,50 @@ async function handleToolCall(name, args = {}) {
             }
         }
 
+    } else if (name === "find_keywords") {
+        const search         = (args.account_name || "").toLowerCase();
+        const kwSearch       = args.keyword_text ? args.keyword_text.toLowerCase().trim() : null;
+        const campSearch     = args.campaign_name ? args.campaign_name.toLowerCase() : null;
+        const agSearch       = args.ad_group_name ? args.ad_group_name.toLowerCase() : null;
+        const includeRemoved = args.include_removed !== false;
+        const matchType      = args.match_type ? args.match_type.toUpperCase() : null;
+        const statusFilter   = args.status ? args.status.toUpperCase() : null;
+
+        const match = Object.entries(GOOGLE_ACCOUNTS).find(([, i]) => i.name.toLowerCase().includes(search));
+        if (!match) { result = { error: `No Google account matching '${args.account_name}'` }; }
+        else {
+            const [cid, info] = match;
+            const { token, error: authErr } = await getGoogleAccessToken(cid);
+            if (authErr) { result = { error: `Auth: ${authErr}` }; }
+            else {
+                try {
+                    let keywords = await findKeywordInventory(token, cid, info.mcc);
+                    if (!includeRemoved) {
+                        keywords = keywords.filter(k =>
+                            k.status !== "REMOVED" &&
+                            k.ad_group_status !== "REMOVED" &&
+                            k.campaign_status !== "REMOVED"
+                        );
+                    }
+                    if (kwSearch)     keywords = keywords.filter(k => k.keyword.toLowerCase().includes(kwSearch));
+                    if (campSearch)   keywords = keywords.filter(k => k.campaign.toLowerCase().includes(campSearch));
+                    if (agSearch)     keywords = keywords.filter(k => k.ad_group.toLowerCase().includes(agSearch));
+                    if (matchType)    keywords = keywords.filter(k => k.match_type === matchType);
+                    if (statusFilter) keywords = keywords.filter(k => k.status === statusFilter);
+
+                    result = {
+                        account: info.name,
+                        query:   args.keyword_text || "(all keywords)",
+                        total:   keywords.length,
+                        note:    keywords.length === 0
+                            ? "Account fully scanned — no keywords match the given criteria. This is a definitive empty result, not a data gap."
+                            : undefined,
+                        keywords,
+                    };
+                } catch (e) { result = { error: e.message }; }
+            }
+        }
+
     } else if (name === "update_budget") {
         const search     = (args.account_name || "").toLowerCase();
         const campSearch = (args.campaign_name || "").toLowerCase();
@@ -6017,6 +6329,7 @@ async function handleToolCall(name, args = {}) {
         const dateRange = args.date_range || "THIS_MONTH";
         const startDate = args.start_date;
         const endDate   = args.end_date;
+        const segmentBy = args.segment_by || null;
         const metaPresetMap = {
             THIS_MONTH: "this_month", LAST_MONTH: "last_month",
             LAST_7_DAYS: "last_7d", LAST_14_DAYS: "last_14d",
@@ -6038,7 +6351,7 @@ async function handleToolCall(name, args = {}) {
                 if (authErr) { result.google_error = `Auth: ${authErr}`; }
                 else {
                     try {
-                        result.google = { account: info.name, campaigns: await fetchGoogleCampaignPerf(token, cid, info.mcc, dateRange, startDate, endDate) };
+                        result.google = { account: info.name, campaigns: await fetchGoogleCampaignPerf(token, cid, info.mcc, dateRange, startDate, endDate, segmentBy) };
                     } catch (e) { result.google_error = e.message; }
                 }
             }
@@ -6598,6 +6911,24 @@ async function handleToolCall(name, args = {}) {
                 message: totalIssues === 0 ? "✅ All ads in enabled campaigns are fully approved." : `${totalIssues} ad(s) need attention.`,
                 accounts,
             };
+        }
+
+    } else if (name === "get_call_tracking") {
+        const search = (args.account_name || "").toLowerCase();
+        const targets = Object.entries(GOOGLE_ACCOUNTS)
+            .filter(([, i]) => !search || i.name.toLowerCase().includes(search));
+        if (!targets.length) { result = { error: `No Google account matching '${args.account_name}'` }; }
+        else {
+            const accounts = [];
+            for (const [cid, info] of targets) {
+                try {
+                    const { token, error: authErr } = await getGoogleAccessToken(cid);
+                    if (authErr) { accounts.push({ account: info.name, error: `Auth: ${authErr}` }); continue; }
+                    const diag = await fetchCallTrackingDiagnostics(token, cid, info.mcc);
+                    accounts.push({ account: info.name, ...diag });
+                } catch (e) { accounts.push({ account: info.name, error: e.message }); }
+            }
+            result = { checked: accounts.length, accounts };
         }
 
     } else if (name === "check_anomalies") {
@@ -7961,6 +8292,74 @@ async function handleToolCall(name, args = {}) {
                         total_changes: events.length,
                         summary,
                         changes:       events,
+                    };
+                } catch (e) { result = { error: e.message }; }
+            }
+        }
+
+    } else if (name === "get_archived_changes") {
+        if (!process.env.DATABASE_URL) {
+            result = { error: "DATABASE_URL not configured — the change event archive requires Postgres." };
+        } else {
+            const search       = (args.account_name || "").toLowerCase();
+            const days         = args.days || 90;
+            const resourceType = args.resource_type || null;
+            const searchText   = args.search ? args.search.toLowerCase() : null;
+
+            const match = Object.entries(GOOGLE_ACCOUNTS).find(([, i]) => i.name.toLowerCase().includes(search));
+            if (!match) {
+                result = { error: `No Google account matching '${args.account_name}'` };
+            } else {
+                const [cid, info] = match;
+                try {
+                    const { getPool, ensureSchema } = require("./src/archive/db");
+                    await ensureSchema();
+                    const db = getPool();
+                    const params = [cid, `${Math.floor(Math.abs(days))} days`];
+                    let where = `account_id = $1 AND change_date_time >= NOW() - $2::interval`;
+                    if (resourceType) {
+                        params.push(resourceType);
+                        where += ` AND resource_type = $${params.length}`;
+                    }
+                    if (searchText) {
+                        params.push(`%${searchText}%`);
+                        where += ` AND (LOWER(change_resource_name) LIKE $${params.length} OR LOWER(changed_fields) LIKE $${params.length})`;
+                    }
+                    const { rows } = await db.query(
+                        `SELECT change_date_time, resource_type, change_resource_name,
+                                resource_change_operation, changed_fields, user_email,
+                                campaign_name, ad_group_name, old_value, new_value
+                         FROM change_events
+                         WHERE ${where}
+                         ORDER BY change_date_time DESC
+                         LIMIT 500`,
+                        params
+                    );
+                    const summary = {};
+                    for (const r of rows) {
+                        const key = `${r.resource_type}:${r.resource_change_operation}`;
+                        summary[key] = (summary[key] || 0) + 1;
+                    }
+                    result = {
+                        account:       info.name,
+                        source:        "archive (Postgres)",
+                        days_back:     days,
+                        resource_type: resourceType || "all",
+                        search:        searchText || "none",
+                        total_changes: rows.length,
+                        summary,
+                        changes: rows.map(r => ({
+                            timestamp:      r.change_date_time,
+                            resource_type:  r.resource_type,
+                            resource_name:  r.change_resource_name,
+                            operation:      r.resource_change_operation,
+                            changed_fields: r.changed_fields,
+                            user_email:     r.user_email,
+                            campaign:       r.campaign_name,
+                            ad_group:       r.ad_group_name,
+                            old_value:      r.old_value,
+                            new_value:      r.new_value,
+                        })),
                     };
                 } catch (e) { result = { error: e.message }; }
             }
@@ -9522,6 +9921,28 @@ async function main() {
             }
         }
 
+        // ── Change event archiver ────────────────────────────────────────────
+        // Daily sweep of change_event data into Postgres before the 30-day API
+        // window closes. Opt out with ARCHIVE_ENABLED=0 or by not setting DATABASE_URL.
+        if (process.env.ARCHIVE_ENABLED !== "0" && process.env.DATABASE_URL) {
+            try {
+                const cron = require("node-cron");
+                const { collectAll } = require("./src/archive/change_collector");
+                cron.schedule("0 6 * * *", async () => {
+                    const started = Date.now();
+                    try {
+                        const results = await collectAll();
+                        console.log(`[archive] completed in ${Date.now() - started}ms`, JSON.stringify(results));
+                    } catch (err) {
+                        console.error("[archive] run failed:", err);
+                    }
+                }, { timezone: "America/Chicago" });
+                console.log("[archive] scheduled daily at 6:00 AM CT");
+            } catch (err) {
+                console.error("[archive] failed to register, server continues:", err.message);
+            }
+        }
+
         // Railway sends SIGTERM on every redeploy. Without this, node dies
         // instantly and in-flight requests / open SSE streams are severed.
         let shuttingDown = false;
@@ -9529,6 +9950,7 @@ async function main() {
             if (shuttingDown) return;
             shuttingDown = true;
             console.error(`Received ${sig} — draining connections, then exiting`);
+            try { require("./src/archive/db").shutdown(); } catch (_) {}
             httpServer.close(() => process.exit(0));
             // Railway allows ~10s before SIGKILL; don't hang past that.
             setTimeout(() => {
