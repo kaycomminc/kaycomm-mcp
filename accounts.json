@@ -23,28 +23,11 @@
     },
     "1766078295": {
       "name": "Denver Parade of Homes",
-      "budget": 490,
+      "budget": 6300,
       "mcc": "7631184147",
       "flight_start": "2026-07-23",
       "flight_end": "2026-08-26",
-      "budget_schedule": [
-        {
-          "from": "2026-07-27",
-          "budget": 1470
-        },
-        {
-          "from": "2026-08-03",
-          "budget": 2765
-        },
-        {
-          "from": "2026-08-10",
-          "budget": 4375
-        },
-        {
-          "from": "2026-08-17",
-          "budget": 6300
-        }
-      ]
+      "budget_schedule": []
     },
     "2275371078": {
       "name": "Childrens Therapy Services of Colorado",
@@ -64,7 +47,7 @@
     },
     "2908157845": {
       "name": "Boulevard Carroll",
-      "budget": 3500,
+      "budget": 4000,
       "mcc": "7631184147",
       "nc_budget": 1000,
       "health": {
@@ -162,7 +145,8 @@
       "name": "Digital Practice Growth",
       "budget": 0,
       "refresh_token_env": "GOOGLE_REFRESH_TOKEN_2",
-      "health": false
+      "health": false,
+      "mcc": "7539940999"
     }
   },
   "meta": {
@@ -199,32 +183,16 @@
       "name": "FAMU Online",
       "budget": 2900,
       "flight_start": "2026-07-01",
-      "flight_end": "2026-09-30"
+      "flight_end": "2026-09-30",
+      "page_id": "626075927259136"
     },
     "act_1371124644901073": {
       "name": "Denver Parade of Homes",
-      "budget": 910,
+      "budget": 11700,
       "page_id": "121015354580784",
       "flight_start": "2026-07-23",
       "flight_end": "2026-08-26",
-      "budget_schedule": [
-        {
-          "from": "2026-07-27",
-          "budget": 2730
-        },
-        {
-          "from": "2026-08-03",
-          "budget": 5135
-        },
-        {
-          "from": "2026-08-10",
-          "budget": 8125
-        },
-        {
-          "from": "2026-08-17",
-          "budget": 11700
-        }
-      ]
+      "budget_schedule": []
     }
   },
   "stackadapt": {
