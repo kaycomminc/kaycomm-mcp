@@ -4,13 +4,19 @@
  * Channels are chosen by whichever env vars are set, so adding or dropping one
  * is configuration rather than code:
  *
- *   GMAIL_USER + GMAIL_APP_PASSWORD    → email (primary)
+ *   RESEND_API_KEY                     → email over HTTPS (primary)
+ *   GMAIL_USER + GMAIL_APP_PASSWORD    → email over SMTP (see caveat below)
  *   SLACK_WEBHOOK_URL                  → Slack incoming webhook
  *
- * Email goes out over Gmail SMTP as the mailbox owner rather than through a
- * sending service. kaycomminc.com is on Google Workspace and its SPF record
- * already includes _spf.google.com, so mail sent this way authenticates with
- * no DNS changes and no domain verification step.
+ * Resend is the primary email path because it posts to port 443. Railway
+ * blocks outbound SMTP: 465 and 587 both time out from the container over a
+ * working IPv4 route, which is the usual anti-spam egress policy on cloud
+ * hosts. The SMTP path is kept because it works fine anywhere that doesn't
+ * block it (a local run, a VPS, a different platform) and costs nothing to
+ * retain — but it will not deliver from Railway.
+ *
+ * If both are configured, Resend wins and SMTP is skipped, so leaving the
+ * GMAIL_* variables in place does no harm.
  *
  * If none are configured the digest logs to stdout instead of throwing, so a
  * misconfigured channel never silently kills the job. If several are
@@ -78,6 +84,39 @@ async function createTransporter(user, pass) {
   });
 }
 
+/**
+ * Email over HTTPS. Works anywhere outbound 443 works, which is everywhere.
+ *
+ * DIGEST_EMAIL_FROM must be an address Resend will send as: either
+ * onboarding@resend.dev (allowed with no setup, but only to the address that
+ * owns the Resend account) or an address at a domain verified in Resend.
+ */
+async function sendEmailHttp(text, subject, {
+  apiKey = process.env.RESEND_API_KEY,
+  to = process.env.DIGEST_EMAIL_TO || process.env.GMAIL_USER,
+  from = process.env.DIGEST_EMAIL_FROM || 'onboarding@resend.dev',
+} = {}) {
+  const res = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      from,
+      to: String(to).split(',').map((a) => a.trim()).filter(Boolean),
+      subject,
+      text,
+    }),
+  });
+
+  if (!res.ok) {
+    throw new Error(`Resend ${res.status}: ${await res.text()}`);
+  }
+  const body = await res.json().catch(() => ({}));
+  return { id: body.id ?? null };
+}
+
 async function sendEmail(text, subject, {
   user = process.env.GMAIL_USER,
   // App password, not the account password. Google only issues these to
@@ -132,8 +171,12 @@ async function postToSlack(text, { webhook = process.env.SLACK_WEBHOOK_URL } = {
 async function deliver(text, { subject = 'Morning pacing digest' } = {}) {
   const channels = [];
 
-  if (process.env.GMAIL_USER && process.env.GMAIL_APP_PASSWORD) {
-    channels.push({ name: 'email', send: () => sendEmail(text, subject) });
+  // Resend first: if it is configured, the SMTP path is skipped rather than
+  // duplicated, so a leftover GMAIL_* pair can't send you a second copy.
+  if (process.env.RESEND_API_KEY) {
+    channels.push({ name: 'email', send: () => sendEmailHttp(text, subject) });
+  } else if (process.env.GMAIL_USER && process.env.GMAIL_APP_PASSWORD) {
+    channels.push({ name: 'email-smtp', send: () => sendEmail(text, subject) });
   }
   if (process.env.SLACK_WEBHOOK_URL) {
     channels.push({ name: 'slack', send: () => postToSlack(text) });
@@ -142,7 +185,7 @@ async function deliver(text, { subject = 'Morning pacing digest' } = {}) {
   if (!channels.length) {
     console.log(
       '[digest] No delivery channel configured ' +
-        '(set GMAIL_USER + GMAIL_APP_PASSWORD, or SLACK_WEBHOOK_URL). Output:\n' +
+        '(set RESEND_API_KEY, or GMAIL_USER + GMAIL_APP_PASSWORD, or SLACK_WEBHOOK_URL). Output:\n' +
         text
     );
     return { delivered: [], failed: [], skipped: true };
@@ -165,4 +208,4 @@ async function deliver(text, { subject = 'Morning pacing digest' } = {}) {
   return { delivered, failed, skipped: false };
 }
 
-module.exports = { deliver, sendEmail, postToSlack };
+module.exports = { deliver, sendEmailHttp, sendEmail, postToSlack };

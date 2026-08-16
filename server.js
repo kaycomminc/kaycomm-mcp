@@ -846,6 +846,26 @@ async function metaGetAll(path, extraParams = {}) {
 
 function metaActId(id) { return id.startsWith("act_") ? id : `act_${id}`; }
 
+async function getMetaPixels(accountId) {
+    const rows = await metaGetAll(`${accountId}/adspixels`, { fields: "id,name", limit: 50 });
+    return rows.map(p => ({ id: p.id, name: p.name }));
+}
+
+async function getMetaCreativeDetails(creativeIds) {
+    const results = [];
+    for (const cid of creativeIds) {
+        const data = await metaGet(cid, { fields: "id,name,object_story_id,object_story_spec,call_to_action_type" });
+        results.push({
+            id: data.id,
+            name: data.name,
+            object_story_id: data.object_story_id || null,
+            call_to_action_type: data.call_to_action_type || null,
+            object_story_spec: data.object_story_spec || null,
+        });
+    }
+    return results;
+}
+
 async function getMetaCampaigns(accountId) {
     const rows = await metaGetAll(`${accountId}/campaigns`, {
         fields: "id,name,status,daily_budget,lifetime_budget,objective",
@@ -862,21 +882,38 @@ async function getMetaCampaigns(accountId) {
 
 async function getMetaAdsets(accountId) {
     const rows = await metaGetAll(`${accountId}/adsets`, {
-        fields: "id,name,status,daily_budget,lifetime_budget,campaign_id,campaign{name}",
+        fields: "id,name,status,daily_budget,lifetime_budget,campaign_id,campaign{name},targeting",
         limit: 200,
     });
-    return rows.map(s => ({
-        id: s.id, name: s.name, status: s.status,
-        campaign: s.campaign?.name || s.campaign_id,
-        daily_budget:    s.daily_budget    ? parseFloat(s.daily_budget) / 100    : null,
-        lifetime_budget: s.lifetime_budget ? parseFloat(s.lifetime_budget) / 100 : null,
-        level: "adset",
-    }));
+    return rows.map(s => {
+        const t = s.targeting || {};
+        const interests = (t.flexible_spec || []).flatMap(fs => (fs.interests || []).map(i => ({ id: i.id, name: i.name })));
+        const behaviors = (t.flexible_spec || []).flatMap(fs => (fs.behaviors || []).map(b => ({ id: b.id, name: b.name })));
+        return {
+            id: s.id, name: s.name, status: s.status,
+            campaign: s.campaign?.name || s.campaign_id,
+            daily_budget:    s.daily_budget    ? parseFloat(s.daily_budget) / 100    : null,
+            lifetime_budget: s.lifetime_budget ? parseFloat(s.lifetime_budget) / 100 : null,
+            targeting: {
+                age_min: t.age_min || null,
+                age_max: t.age_max || null,
+                geo_locations: t.geo_locations || null,
+                interests: interests.length ? interests : null,
+                behaviors: behaviors.length ? behaviors : null,
+                publisher_platforms: t.publisher_platforms || null,
+                facebook_positions: t.facebook_positions || null,
+                instagram_positions: t.instagram_positions || null,
+                audience_network_positions: t.audience_network_positions || null,
+                messenger_positions: t.messenger_positions || null,
+            },
+            level: "adset",
+        };
+    });
 }
 
 async function getMetaAds(accountId, filterName) {
     const params = {
-        fields: "id,name,status,effective_status,creative{id,name,thumbnail_url},adset{id,name}",
+        fields: "id,name,status,effective_status,creative{id,name,thumbnail_url,object_story_id},adset{id,name}",
         limit: 200,
     };
     if (filterName) {
@@ -888,6 +925,7 @@ async function getMetaAds(accountId, filterName) {
         adset: a.adset?.name || null,
         creative_id: a.creative?.id || null,
         creative_name: a.creative?.name || null,
+        object_story_id: a.creative?.object_story_id || null,
         level: "ad",
     }));
 }
@@ -1000,6 +1038,14 @@ async function buildMetaTargetingSpec(targeting) {
         if (targeting.instagram_positions) spec.instagram_positions = targeting.instagram_positions;
     }
 
+    // Pass through any additional targeting fields not handled above
+    const handled = new Set(["geo", "geo_radius", "geo_raw", "countries", "age_min", "age_max",
+        "interests", "behaviors", "custom_audiences", "excluded_audiences",
+        "placements", "publisher_platforms", "facebook_positions", "instagram_positions"]);
+    for (const [k, v] of Object.entries(targeting)) {
+        if (!handled.has(k) && v != null) spec[k] = v;
+    }
+
     return { spec, warnings };
 }
 
@@ -1012,7 +1058,7 @@ async function createMetaCampaignFull(accountId, pageId, config, instagramAccoun
             name: config.campaign_name,
             objective: config.objective,
             status: "PAUSED",
-            special_ad_categories: [],
+            special_ad_categories: config.special_ad_categories || [],
             bid_strategy: config.campaign_bid_strategy || "LOWEST_COST_WITHOUT_CAP",
         };
         if (config.cbo) {
@@ -1054,6 +1100,19 @@ async function createMetaCampaignFull(accountId, pageId, config, instagramAccoun
         if (adSetDef.daily_min_spend_target) adSetBody.daily_min_spend_target = Math.round(adSetDef.daily_min_spend_target * 100);
         if (adSetDef.daily_spend_cap) adSetBody.daily_spend_cap = Math.round(adSetDef.daily_spend_cap * 100);
         if (adSetDef.is_dynamic_creative) adSetBody.is_dynamic_creative = true;
+        if (adSetDef.url_tags) adSetBody.url_tags = adSetDef.url_tags;
+        if (adSetDef.promoted_object) {
+            adSetBody.promoted_object = adSetDef.promoted_object;
+        } else if (adSetBody.optimization_goal === "OFFSITE_CONVERSIONS") {
+            const pixels = await getMetaPixels(accountId);
+            if (pixels.length === 1) {
+                adSetBody.promoted_object = { pixel_id: pixels[0].id, custom_event_type: "LEAD" };
+                results.auto_pixel = { id: pixels[0].id, name: pixels[0].name };
+            } else if (pixels.length > 1) {
+                results.available_pixels = pixels;
+                throw new Error(`Multiple pixels found — pass promoted_object: {pixel_id: "...", custom_event_type: "Lead"}. Available: ${pixels.map(p => `${p.name} (${p.id})`).join(", ")}`);
+            }
+        }
 
         let adSetRes;
         try {
@@ -1070,6 +1129,18 @@ async function createMetaCampaignFull(accountId, pageId, config, instagramAccoun
         for (const adDef of (adSetDef.ads || [])) {
             let storySpec;
             if (adDef.video_id) {
+                let videoThumbHash = adDef.image_hash || null;
+                if (!videoThumbHash) {
+                    try {
+                        const thumbRes = await metaGet(adDef.video_id, { fields: "thumbnails" });
+                        const thumbUrl = thumbRes.thumbnails?.data?.[0]?.uri;
+                        if (thumbUrl) {
+                            const thumbImgRes = await metaPost(`${accountId}/adimages`, { url: thumbUrl });
+                            const imgData = thumbImgRes.images ? Object.values(thumbImgRes.images)[0] : thumbImgRes;
+                            videoThumbHash = imgData.hash;
+                        }
+                    } catch (_) { /* proceed without thumbnail — API may still accept */ }
+                }
                 storySpec = {
                     page_id: pageId,
                     video_data: {
@@ -1081,6 +1152,24 @@ async function createMetaCampaignFull(accountId, pageId, config, instagramAccoun
                             type: adDef.cta || "LEARN_MORE",
                             value: { link: adDef.url },
                         },
+                        ...(videoThumbHash ? { image_hash: videoThumbHash } : {}),
+                    },
+                };
+            } else if (adDef.carousel_cards?.length) {
+                const childAttachments = adDef.carousel_cards.map(card => ({
+                    image_hash: card.image_hash,
+                    link: card.url || adDef.url,
+                    name: card.headline || adDef.headline,
+                    description: card.description || adDef.description || "",
+                    call_to_action: { type: card.cta || adDef.cta || "LEARN_MORE", value: { link: card.url || adDef.url } },
+                }));
+                storySpec = {
+                    page_id: pageId,
+                    link_data: {
+                        message: adDef.primary_text,
+                        link: adDef.url,
+                        child_attachments: childAttachments,
+                        multi_share_end_card: false,
                     },
                 };
             } else {
@@ -1102,24 +1191,31 @@ async function createMetaCampaignFull(accountId, pageId, config, instagramAccoun
 
             if (instagramAccountId) storySpec.instagram_actor_id = instagramAccountId;
 
-            let creativeRes;
-            try {
-                const creativeBody = adDef.object_story_id
-                    ? { name: `${adDef.name} Creative`, object_story_id: adDef.object_story_id }
-                    : { name: `${adDef.name} Creative`, object_story_spec: storySpec };
-                results.debug.push({ step: "creative", name: adDef.name, body: creativeBody });
-                creativeRes = await metaPost(`${accountId}/adcreatives`, creativeBody);
-            } catch (e) {
-                e.message = `Creative "${adDef.name}" creation failed: ${e.message}`;
-                if (e.metaBody) e.message += ` | Request body: ${JSON.stringify(e.metaBody)}`;
-                throw e;
+            let finalCreativeId;
+            if (adDef.creative_id) {
+                finalCreativeId = adDef.creative_id;
+                results.debug.push({ step: "creative_reuse", name: adDef.name, creative_id: adDef.creative_id });
+            } else {
+                let creativeRes;
+                try {
+                    const creativeBody = adDef.object_story_id
+                        ? { name: `${adDef.name} Creative`, object_story_id: adDef.object_story_id }
+                        : { name: `${adDef.name} Creative`, object_story_spec: storySpec };
+                    results.debug.push({ step: "creative", name: adDef.name, body: creativeBody });
+                    creativeRes = await metaPost(`${accountId}/adcreatives`, creativeBody);
+                } catch (e) {
+                    e.message = `Creative "${adDef.name}" creation failed: ${e.message}`;
+                    if (e.metaBody) e.message += ` | Request body: ${JSON.stringify(e.metaBody)}`;
+                    throw e;
+                }
+                finalCreativeId = creativeRes.id;
             }
 
             try {
-                const adBody = { name: adDef.name, adset_id: adSetRes.id, creative: { creative_id: creativeRes.id }, status: "PAUSED" };
+                const adBody = { name: adDef.name, adset_id: adSetRes.id, creative: { creative_id: finalCreativeId }, status: "PAUSED" };
                 results.debug.push({ step: "ad", name: adDef.name, body: adBody });
                 const adRes = await metaPost(`${accountId}/ads`, adBody);
-                adSetResult.ads.push({ name: adDef.name, ad_id: adRes.id, creative_id: creativeRes.id });
+                adSetResult.ads.push({ name: adDef.name, ad_id: adRes.id, creative_id: finalCreativeId });
             } catch (e) {
                 e.message = `Ad "${adDef.name}" creation failed: ${e.message}`;
                 if (e.metaBody) e.message += ` | Request body: ${JSON.stringify(e.metaBody)}`;
@@ -4272,15 +4368,15 @@ function makeServer() {
             name: "manage_meta",
             description: "View and manage Meta Ads campaigns, ad sets, and ads — list, pause, resume, archive, update budgets, or duplicate. " +
                 "Dry run by default. Set confirm=true to apply changes. " +
-                "Actions: list_campaigns, list_adsets, list_ads, pause, resume, archive, set_daily_budget, duplicate.",
+                "Actions: list_campaigns, list_adsets, list_ads, get_creative_details, pause, resume, archive, set_daily_budget, duplicate.",
             inputSchema: {
                 type: "object",
                 properties: {
                     account_name: { type: "string", description: "Meta account name (partial match ok)" },
                     action: {
                         type: "string",
-                        description: "list_campaigns | list_adsets | list_ads | pause | resume | archive | set_daily_budget | duplicate",
-                        enum: ["list_campaigns", "list_adsets", "list_ads", "pause", "resume", "archive", "set_daily_budget", "duplicate"],
+                        description: "list_campaigns | list_adsets | list_ads | get_creative_details | pause | resume | archive | set_daily_budget | duplicate",
+                        enum: ["list_campaigns", "list_adsets", "list_ads", "get_creative_details", "pause", "resume", "archive", "set_daily_budget", "duplicate"],
                     },
                     target: { type: "string", description: "Campaign, ad set, or ad name to target (partial match ok). Required for pause/resume/archive/set_daily_budget/duplicate." },
                     level: {
@@ -4295,6 +4391,7 @@ function makeServer() {
                     daily_budget:    { type: "number", description: "duplicate (campaign level) only: daily budget in dollars for the copy. Omit to inherit from source." },
                     lifetime_budget: { type: "number", description: "duplicate (campaign level) only: lifetime budget in dollars for the copy. Omit to inherit from source." },
                     budget: { type: "number", description: "New daily budget in dollars. Required for set_daily_budget." },
+                    creative_ids: { type: "array", items: { type: "string" }, description: "Array of creative IDs to fetch details for. Required for get_creative_details." },
                     confirm: { type: "boolean", description: "Set true to apply changes. Omit for dry-run preview." },
                 },
                 required: ["account_name", "action"],
@@ -5295,6 +5392,7 @@ function makeServer() {
                         enum: ["LOWEST_COST_WITHOUT_CAP", "COST_CAP", "LOWEST_COST_WITH_BID_CAP", "LOWEST_COST_WITH_MIN_ROAS"],
                         description: "Campaign-level bid strategy for CBO. Default: LOWEST_COST_WITHOUT_CAP. COST_CAP/BID_CAP require bid_amount on ad sets.",
                     },
+                    special_ad_categories: { type: "array", items: { type: "string", enum: ["EMPLOYMENT", "HOUSING", "CREDIT", "ISSUES_ELECTIONS_POLITICS"] }, description: "Special ad categories (e.g. ['EMPLOYMENT']). Restricts targeting options per Meta policy." },
                     cbo: { type: "boolean", description: "Campaign Budget Optimization (default: true). When true, budget is at campaign level. When false, set budgets per ad set." },
                     ad_sets: {
                         type: "array",
@@ -5336,7 +5434,7 @@ function makeServer() {
                                         geo:          { type: "string", description: "Location name to target (e.g. 'Denver, CO', 'Miami, FL')" },
                                         geo_radius:   { type: "number", description: "Radius in miles around geo location (default: 25)" },
                                         countries:    { type: "array", items: { type: "string" }, description: "Country codes for country-level targeting (e.g. ['US', 'CA', 'GB']). Use instead of geo for broad reach." },
-                                        geo_raw:      { type: "array", description: "Raw geo_locations spec (cities/regions/countries) — use instead of geo for complex targeting", items: { type: "object" } },
+                                        geo_raw:      { description: "Raw geo_locations spec — pass an object like {regions: [{key: '3852'}]} or {countries: ['US']}. Set directly as targeting.geo_locations." },
                                         age_min:      { type: "number", description: "Minimum age (default: 18)" },
                                         age_max:      { type: "number", description: "Maximum age (default: 65)" },
                                         interests:    { type: "array", items: { type: "string" }, description: "Interest names — resolved to IDs via search" },
@@ -5349,6 +5447,7 @@ function makeServer() {
                                         instagram_positions: { type: "array", items: { type: "string" }, description: "For manual placements: ['stream', 'story', 'reels', 'explore']" },
                                     },
                                 },
+                                promoted_object: { type: "object", description: "Required for OFFSITE_CONVERSIONS. Example: {pixel_id: '123', custom_event_type: 'Lead'}" },
                                 start_time: { type: "string", description: "ISO 8601 start time (optional)" },
                                 end_time:   { type: "string", description: "ISO 8601 end time (optional)" },
                                 ads: {
@@ -5363,13 +5462,14 @@ function makeServer() {
                                             description:  { type: "string", description: "Short description / link description" },
                                             cta: {
                                                 type: "string",
-                                                enum: ["LEARN_MORE", "SHOP_NOW", "SIGN_UP", "BUY_TICKETS", "BOOK_NOW", "CONTACT_US", "GET_OFFER", "NO_BUTTON"],
+                                                enum: ["LEARN_MORE", "SHOP_NOW", "SIGN_UP", "APPLY_NOW", "BUY_TICKETS", "BOOK_NOW", "CONTACT_US", "GET_OFFER", "NO_BUTTON"],
                                                 description: "Call-to-action button (default: LEARN_MORE)",
                                             },
                                             url:        { type: "string", description: "Destination URL" },
                                             image_hash: { type: "string", description: "Image hash from Media Library (use list_meta_media to find)" },
                                             video_id:   { type: "string", description: "Video ID from Media Library (use list_meta_media to find)" },
                                             object_story_id: { type: "string", description: "Existing Page post ID (PAGE_ID_POST_ID) to promote as an ad. When set, primary_text/headline/url are not needed." },
+                                            creative_id: { type: "string", description: "Existing creative ID to reuse. When set, no new creative is created — the ad references this creative directly." },
                                         },
                                         required: ["name"],
                                     },
@@ -5380,7 +5480,7 @@ function makeServer() {
                     },
                     confirm: { type: "boolean", description: "Set true to create. Omit for dry-run preview." },
                 },
-                required: ["account_name", "campaign_name", "objective", "daily_budget", "ad_sets"],
+                required: ["account_name", "campaign_name", "objective", "ad_sets"],
             },
         },
         {
@@ -6565,13 +6665,13 @@ async function handleToolCall(name, args = {}) {
                             // Try as ad set ID first, then campaign ID
                             try {
                                 const adsetAds = await metaGetAll(`${target}/ads`, {
-                                    fields: "id,name,status,effective_status,creative{id,name,thumbnail_url},adset{id,name}",
+                                    fields: "id,name,status,effective_status,creative{id,name,thumbnail_url,object_story_id},adset{id,name}",
                                     limit: 200,
                                 });
                                 ads = adsetAds.map(a => ({
                                     id: a.id, name: a.name, status: a.status, effective_status: a.effective_status,
                                     adset: a.adset?.name || null, creative_id: a.creative?.id || null,
-                                    creative_name: a.creative?.name || null, level: "ad",
+                                    creative_name: a.creative?.name || null, object_story_id: a.creative?.object_story_id || null, level: "ad",
                                 }));
                             } catch (_) {
                                 ads = await getMetaAds(accountId, null);
@@ -6584,13 +6684,13 @@ async function handleToolCall(name, args = {}) {
                             ads = [];
                             for (const s of matching) {
                                 const adsetAds = await metaGetAll(`${s.id}/ads`, {
-                                    fields: "id,name,status,effective_status,creative{id,name,thumbnail_url},adset{id,name}",
+                                    fields: "id,name,status,effective_status,creative{id,name,thumbnail_url,object_story_id},adset{id,name}",
                                     limit: 200,
                                 });
                                 ads.push(...adsetAds.map(a => ({
                                     id: a.id, name: a.name, status: a.status, effective_status: a.effective_status,
                                     adset: a.adset?.name || null, creative_id: a.creative?.id || null,
-                                    creative_name: a.creative?.name || null, level: "ad",
+                                    creative_name: a.creative?.name || null, object_story_id: a.creative?.object_story_id || null, level: "ad",
                                 })));
                             }
                         } else {
@@ -6602,7 +6702,7 @@ async function handleToolCall(name, args = {}) {
                                 const matching = adsets.filter(s => s.name.toLowerCase().includes(targetLower));
                                 for (const s of matching) {
                                     const adsetAds = await metaGetAll(`${s.id}/ads`, {
-                                        fields: "id,name,status,effective_status,creative{id,name,thumbnail_url},adset{id,name}",
+                                        fields: "id,name,status,effective_status,creative{id,name,thumbnail_url,object_story_id},adset{id,name}",
                                         limit: 200,
                                     });
                                     ads.push(...adsetAds.map(a => ({
@@ -6615,6 +6715,14 @@ async function handleToolCall(name, args = {}) {
                         }
                     }
                     result = { account: acctInfo.name, filter: target, ads };
+
+                } else if (action === "get_creative_details") {
+                    if (!args.creative_ids || !Array.isArray(args.creative_ids) || args.creative_ids.length === 0) {
+                        result = { error: "creative_ids (array of creative ID strings) is required" };
+                    } else {
+                        const details = await getMetaCreativeDetails(args.creative_ids);
+                        result = { account: acctInfo.name, creatives: details };
+                    }
 
                 } else if (action === "duplicate") {
                     const dupLevel  = args.level || "campaign";
@@ -7088,7 +7196,7 @@ async function handleToolCall(name, args = {}) {
                 } else {
                     const entry = { name: args.name, budget: args.budget };
                     if (platform === "google") entry.mcc = args.mcc || id;
-                    for (const f of ["ga4", "nc_budget", "flight_start", "flight_end", "budget_schedule", "health"]) {
+                    for (const f of ["ga4", "nc_budget", "flight_start", "flight_end", "budget_schedule", "health", "page_id"]) {
                         if (args[f] != null) entry[f] = args[f];
                     }
                     if (!confirm) {
@@ -7105,11 +7213,11 @@ async function handleToolCall(name, args = {}) {
                     result = { error: `${id} not found in ${platform} accounts.`, available: Object.entries(store).map(([k, a]) => `${k} (${a.name})`) };
                 } else {
                     const changes = {};
-                    for (const f of ["name", "budget", "mcc", "ga4", "nc_budget", "flight_start", "flight_end", "budget_schedule", "health"]) {
+                    for (const f of ["name", "budget", "mcc", "ga4", "nc_budget", "flight_start", "flight_end", "budget_schedule", "health", "page_id"]) {
                         if (args[f] != null) changes[f] = args[f];
                     }
                     if (!Object.keys(changes).length) {
-                        result = { error: "No fields to update. Provide name, budget, mcc, ga4, nc_budget, flight_start, flight_end, budget_schedule, or health." };
+                        result = { error: "No fields to update. Provide name, budget, mcc, ga4, nc_budget, flight_start, flight_end, budget_schedule, health, or page_id." };
                     } else if (!confirm) {
                         result = { dry_run: true, message: "DRY RUN — set confirm=true to save", platform, id, current: store[id], changes };
                     } else {
@@ -8148,8 +8256,8 @@ async function handleToolCall(name, args = {}) {
         const confirm = !!args.confirm;
         const cbo     = args.cbo !== false;
 
-        if (!args.campaign_name || !args.objective || !args.daily_budget || !args.ad_sets?.length) {
-            result = { error: "campaign_name, objective, daily_budget, and at least one ad_set are required." };
+        if (!args.campaign_name || !args.objective || (!args.daily_budget && !args.lifetime_budget) || !args.ad_sets?.length) {
+            result = { error: "campaign_name, objective, daily_budget or lifetime_budget, and at least one ad_set are required." };
         } else if (args.daily_budget < 1) {
             result = { error: "daily_budget must be at least $1.00 (Meta minimum)." };
         } else {
@@ -8159,7 +8267,8 @@ async function handleToolCall(name, args = {}) {
             } else {
                 const [accountId, acctInfo] = acctMatch;
                 const pageId = acctInfo.page_id;
-                if (!pageId) {
+                const allAdsUseCreativeId = (args.ad_sets || []).every(s => (s.ads || []).every(a => a.creative_id));
+                if (!pageId && !allAdsUseCreativeId) {
                     result = { error: `No page_id configured for '${acctInfo.name}'. Add page_id to this account's entry in accounts.json.` };
                 } else {
                     try {

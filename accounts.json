@@ -193,6 +193,13 @@
       "flight_start": "2026-07-23",
       "flight_end": "2026-08-26",
       "budget_schedule": []
+    },
+    "act_2983430398459267": {
+      "name": "Florida State Guard",
+      "budget": 19720,
+      "page_id": "112608548505996",
+      "flight_start": "2026-08-18",
+      "flight_end": "2027-01-01"
     }
   },
   "stackadapt": {
