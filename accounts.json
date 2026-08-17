@@ -147,6 +147,13 @@
       "refresh_token_env": "GOOGLE_REFRESH_TOKEN_2",
       "health": false,
       "mcc": "7539940999"
+    },
+    "4344985288": {
+      "name": "Florida State Guard",
+      "budget": 11500,
+      "flight_start": "2026-08-18",
+      "flight_end": "2027-01-01",
+      "mcc": "8621281595"
     }
   },
   "meta": {

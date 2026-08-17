@@ -724,6 +724,11 @@ async function metaDuplicateCampaign(campaignId, newName, status, opts = {}) {
     const updateBody = { name: newName };
     if (opts.start_time) updateBody.start_time = opts.start_time;
     if (opts.stop_time) updateBody.stop_time = opts.stop_time;
+    const dupBudgets = {};
+    if (opts.daily_budget != null) dupBudgets.daily_budget = opts.daily_budget;
+    if (opts.lifetime_budget != null) dupBudgets.lifetime_budget = opts.lifetime_budget;
+    const dupBudgetErrors = validateBudgets(dupBudgets);
+    if (dupBudgetErrors) throw new Error("Budget validation failed: " + dupBudgetErrors.join(" | "));
     if (opts.daily_budget != null) updateBody.daily_budget = Math.round(opts.daily_budget * 100);
     if (opts.lifetime_budget != null) updateBody.lifetime_budget = Math.round(opts.lifetime_budget * 100);
     await metaPost(newCampaignId, updateBody);
@@ -845,6 +850,39 @@ async function metaGetAll(path, extraParams = {}) {
 }
 
 function metaActId(id) { return id.startsWith("act_") ? id : `act_${id}`; }
+
+const BUDGET_LIMITS = {
+    lifetime_budget: 5000,
+    spend_cap: 5000,
+    lifetime_min_spend_target: 5000,
+    lifetime_spend_cap: 5000,
+    daily_budget: 500,
+    daily_min_spend_target: 500,
+    daily_spend_cap: 500,
+    bid_amount: 100,
+};
+
+function validateBudgets(fields) {
+    const errors = [];
+    for (const [field, value] of Object.entries(fields)) {
+        if (value == null) continue;
+        const limit = BUDGET_LIMITS[field];
+        if (limit && value > limit) {
+            errors.push(`${field} = $${value.toLocaleString()} exceeds safety limit of $${limit.toLocaleString()}. All values must be in DOLLARS (converted to cents automatically). Aborting to prevent overspend.`);
+        }
+    }
+    return errors.length ? errors : null;
+}
+
+function budgetConfirmationSummary(fields) {
+    const lines = [];
+    for (const [field, value] of Object.entries(fields)) {
+        if (value != null && BUDGET_LIMITS[field]) {
+            lines.push(`  ${field}: $${Number(value).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`);
+        }
+    }
+    return lines;
+}
 
 async function getMetaPixels(accountId) {
     const rows = await metaGetAll(`${accountId}/adspixels`, { fields: "id,name", limit: 50 });
@@ -1051,6 +1089,22 @@ async function buildMetaTargetingSpec(targeting) {
 
 async function createMetaCampaignFull(accountId, pageId, config, instagramAccountId) {
     const results = { campaign: null, ad_sets: [], debug: [] };
+
+    // Validate all budgets upfront
+    const campaignBudgets = {};
+    if (config.lifetime_budget) campaignBudgets.lifetime_budget = config.lifetime_budget;
+    if (config.daily_budget) campaignBudgets.daily_budget = config.daily_budget;
+    const campBudgetErrors = validateBudgets(campaignBudgets);
+    if (campBudgetErrors) throw new Error("Campaign budget validation failed: " + campBudgetErrors.join(" | "));
+    for (const adSet of (config.ad_sets || [])) {
+        const adSetBudgets = {};
+        if (adSet.daily_budget) adSetBudgets.daily_budget = adSet.daily_budget;
+        if (adSet.bid_amount) adSetBudgets.bid_amount = adSet.bid_amount;
+        if (adSet.daily_spend_cap) adSetBudgets.daily_spend_cap = adSet.daily_spend_cap;
+        if (adSet.daily_min_spend_target) adSetBudgets.daily_min_spend_target = adSet.daily_min_spend_target;
+        const adSetBudgetErrors = validateBudgets(adSetBudgets);
+        if (adSetBudgetErrors) throw new Error(`Ad set "${adSet.name}" budget validation failed: ` + adSetBudgetErrors.join(" | "));
+    }
 
     try {
         // Step 1: Create campaign
@@ -5789,6 +5843,7 @@ function makeServer() {
                             "Budget values are in dollars and automatically converted to cents.",
                     },
                     confirm: { type: "boolean", description: "Set true to apply. Omit for dry-run preview." },
+                    budget_confirmed: { type: "boolean", description: "Required when updating any budget field alongside confirm=true. Double-confirmation to prevent accidental budget changes." },
                 },
                 required: ["account_name", "object_id", "level", "updates"],
             },
@@ -6349,8 +6404,11 @@ async function handleToolCall(name, args = {}) {
         const daily      = args.daily_budget;
         const confirm    = !!args.confirm;
 
+        const dailyBudgetErrors = daily ? validateBudgets({ daily_budget: daily }) : null;
         if (!daily || daily <= 0) {
             result = { error: "daily_budget must be a positive number." };
+        } else if (dailyBudgetErrors) {
+            result = { error: dailyBudgetErrors.join(" | ") };
         } else if (platform === "google") {
             const match = Object.entries(GOOGLE_ACCOUNTS).find(([, i]) => i.name.toLowerCase().includes(search));
             if (!match) { result = { error: `No Google account matching '${args.account_name}'` }; }
@@ -6861,7 +6919,9 @@ async function handleToolCall(name, args = {}) {
                                     if (action === "archive") body = { status: "ARCHIVED" };
                                     if (action === "set_daily_budget") {
                                         if (!args.budget) throw new Error("budget is required for set_daily_budget");
-                                        body = { daily_budget: Math.round(args.budget * 100) }; // Meta uses cents
+                                        const bdgErr = validateBudgets({ daily_budget: args.budget });
+                                        if (bdgErr) throw new Error(bdgErr.join(" | "));
+                                        body = { daily_budget: Math.round(args.budget * 100) };
                                     }
                                     const res = await metaPost(item.id, body);
                                     outcomes.push({ id: item.id, name: item.name, success: !!res.success });
@@ -9824,22 +9884,37 @@ async function handleToolCall(name, args = {}) {
             const confirm = !!args.confirm;
             const updates = args.updates || {};
             const body = { ...updates };
-            const budgetFields = ["daily_budget", "lifetime_budget", "spend_cap", "bid_amount", "daily_min_spend_target", "daily_spend_cap", "lifetime_min_spend_target", "lifetime_spend_cap"];
+            const budgetFields = Object.keys(BUDGET_LIMITS);
+            const budgetValues = {};
             for (const f of budgetFields) {
-                if (body[f] !== undefined) body[f] = Math.round(body[f] * 100);
+                if (body[f] !== undefined) budgetValues[f] = body[f];
             }
-            if (body.bid_strategy === "BID_CAP") body.bid_strategy = "LOWEST_COST_WITH_BID_CAP";
-            if (body.roas_control) {
-                body.bid_constraints = JSON.stringify({ roas_average_floor: Math.round(body.roas_control * 10000) });
-                delete body.roas_control;
-            }
-            if (!confirm) {
-                result = { dry_run: true, message: "DRY RUN — set confirm=true to apply", account: info.name, object_id: args.object_id, level: args.level, updates: body };
+            const budgetErrors = validateBudgets(budgetValues);
+            if (budgetErrors) {
+                result = { error: budgetErrors.join(" | ") };
             } else {
-                try {
-                    await metaPost(args.object_id, body);
-                    result = { success: true, account: info.name, object_id: args.object_id, level: args.level, updated_fields: Object.keys(updates) };
-                } catch (e) { result = { error: e.message }; }
+                const budgetLines = budgetConfirmationSummary(budgetValues);
+                for (const f of budgetFields) {
+                    if (body[f] !== undefined) body[f] = Math.round(body[f] * 100);
+                }
+                if (body.bid_strategy === "BID_CAP") body.bid_strategy = "LOWEST_COST_WITH_BID_CAP";
+                if (body.roas_control) {
+                    body.bid_constraints = JSON.stringify({ roas_average_floor: Math.round(body.roas_control * 10000) });
+                    delete body.roas_control;
+                }
+                if (!confirm) {
+                    const dryRun = { dry_run: true, message: "DRY RUN — set confirm=true to apply", account: info.name, object_id: args.object_id, level: args.level, updates: body };
+                    if (budgetLines.length) dryRun.budget_confirmation = "BUDGET CHANGES (in dollars):\n" + budgetLines.join("\n");
+                    result = dryRun;
+                } else if (budgetLines.length && !args.budget_confirmed) {
+                    result = { error: "BUDGET CHANGE REQUIRES CONFIRMATION. Set budget_confirmed=true in addition to confirm=true. Budget changes:\n" + budgetLines.join("\n") };
+                } else {
+                    try {
+                        await metaPost(args.object_id, body);
+                        result = { success: true, account: info.name, object_id: args.object_id, level: args.level, updated_fields: Object.keys(updates) };
+                        if (budgetLines.length) result.budget_applied = budgetLines.join(", ");
+                    } catch (e) { result = { error: e.message }; }
+                }
             }
         }
 
