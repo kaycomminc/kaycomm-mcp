@@ -33,6 +33,9 @@ const META_API_VERSION  = "v25.0";
 const STACKADAPT_API_KEY = process.env.STACKADAPT_API_KEY;
 const STACKADAPT_URL     = "https://api.stackadapt.com/graphql";
 
+const LINKEDIN_ACCESS_TOKEN = process.env.LINKEDIN_ACCESS_TOKEN;
+const LINKEDIN_API_VERSION  = "202608";
+
 // When bumping GOOGLE_API_VERSION or META_API_VERSION above, update `released`
 // here by hand to the new version's release date — health_check uses these to
 // warn before the provider sunsets the pinned version out from under us.
@@ -55,6 +58,7 @@ const ACCOUNTS_FILE = path.join(__dirname, "accounts.json");
 let GOOGLE_ACCOUNTS = {};
 let META_ACCOUNTS = {};
 let STACKADAPT_ADVERTISERS = {};
+let LINKEDIN_ACCOUNTS = {};
 let HEALTH_DEFAULTS = {};
 
 const BUILTIN_HEALTH_DEFAULTS = {
@@ -130,11 +134,12 @@ function loadAccounts() {
     }
     META_ACCOUNTS          = data.meta       || {};
     STACKADAPT_ADVERTISERS = data.stackadapt || {};
+    LINKEDIN_ACCOUNTS      = data.linkedin  || {};
     HEALTH_DEFAULTS        = { ...BUILTIN_HEALTH_DEFAULTS, ...(data.health_defaults || {}) };
 }
 
 function saveAccounts() {
-    const data = { health_defaults: HEALTH_DEFAULTS, google: GOOGLE_ACCOUNTS, meta: META_ACCOUNTS, stackadapt: STACKADAPT_ADVERTISERS };
+    const data = { health_defaults: HEALTH_DEFAULTS, google: GOOGLE_ACCOUNTS, meta: META_ACCOUNTS, stackadapt: STACKADAPT_ADVERTISERS, linkedin: LINKEDIN_ACCOUNTS };
     fs.writeFileSync(ACCOUNTS_FILE, JSON.stringify(data, null, 2) + "\n");
 }
 
@@ -1968,6 +1973,44 @@ async function fetchPmaxSearchTermInsights(token, customerId, mccId, dateRange, 
     return result;
 }
 
+// ── Geo target resolution ────────────────────────────────────────────────────
+const geoTargetCache = new Map();
+
+async function resolveGeoTarget(token, mccId, locationString) {
+    if (locationString.startsWith("geoTargetConstants/")) return locationString;
+
+    const cacheKey = locationString.toLowerCase().trim();
+    if (geoTargetCache.has(cacheKey)) return geoTargetCache.get(cacheKey);
+
+    const resp = await fetchFn(
+        `https://googleads.googleapis.com/${GOOGLE_API_VERSION}/geoTargetConstants:suggest`,
+        {
+            method: "POST",
+            headers: {
+                "Authorization":     `Bearer ${token}`,
+                "developer-token":   GOOGLE_DEVELOPER_TOKEN,
+                "login-customer-id": mccId,
+                "Content-Type":      "application/json",
+            },
+            body: JSON.stringify({
+                locale: "en",
+                countryCode: "US",
+                locationNames: { names: [locationString] },
+            }),
+        }
+    );
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(`Geo lookup failed: ${googleAdsError(data)}`);
+
+    const suggestions = data.geoTargetConstantSuggestions || [];
+    if (!suggestions.length) throw new Error(`No geo target found for "${locationString}"`);
+
+    const best = suggestions[0].geoTargetConstant;
+    const resourceName = best.resourceName;
+    geoTargetCache.set(cacheKey, resourceName);
+    return resourceName;
+}
+
 // ── Keyword planning ──────────────────────────────────────────────────────────
 function parseKwMetric(r, metricsKey = "keywordIdeaMetrics") {
     const m = r[metricsKey] || r.keywordMetrics || {};
@@ -1981,11 +2024,19 @@ function parseKwMetric(r, metricsKey = "keywordIdeaMetrics") {
     };
 }
 
-async function callKeywordPlannerIdeas(token, customerId, mccId, seedKeywords, url) {
+async function callKeywordPlannerIdeas(token, customerId, mccId, seedKeywords, url, geoTargetConstant) {
     let seed = {};
     if (url && seedKeywords.length) seed = { keywordAndUrlSeed: { keywords: seedKeywords, url } };
     else if (url)                    seed = { urlSeed: { url } };
     else                             seed = { keywordSeed: { keywords: seedKeywords } };
+
+    const body = {
+        ...seed,
+        language:            "languageConstants/1000",
+        keywordPlanNetwork:  "GOOGLE_SEARCH",
+        includeAdultKeywords: false,
+    };
+    if (geoTargetConstant) body.geoTargetConstants = [geoTargetConstant];
 
     const resp = await fetchFn(
         `https://googleads.googleapis.com/${GOOGLE_API_VERSION}/customers/${customerId}:generateKeywordIdeas`,
@@ -1997,12 +2048,7 @@ async function callKeywordPlannerIdeas(token, customerId, mccId, seedKeywords, u
                 "login-customer-id": mccId,
                 "Content-Type":      "application/json",
             },
-            body: JSON.stringify({
-                ...seed,
-                language:            "languageConstants/1000",
-                keywordPlanNetwork:  "GOOGLE_SEARCH",
-                includeAdultKeywords: false,
-            }),
+            body: JSON.stringify(body),
         }
     );
     const data = await resp.json();
@@ -2010,7 +2056,14 @@ async function callKeywordPlannerIdeas(token, customerId, mccId, seedKeywords, u
     return (data.results || []).map(r => parseKwMetric(r));
 }
 
-async function fetchKeywordHistoricalMetrics(token, customerId, mccId, keywords, showTrend) {
+async function fetchKeywordHistoricalMetrics(token, customerId, mccId, keywords, showTrend, geoTargetConstant) {
+    const body = {
+        keywords,
+        language:           "languageConstants/1000",
+        keywordPlanNetwork: "GOOGLE_SEARCH",
+    };
+    if (geoTargetConstant) body.geoTargetConstants = [geoTargetConstant];
+
     const resp = await fetchFn(
         `https://googleads.googleapis.com/${GOOGLE_API_VERSION}/customers/${customerId}:generateKeywordHistoricalMetrics`,
         {
@@ -2021,11 +2074,7 @@ async function fetchKeywordHistoricalMetrics(token, customerId, mccId, keywords,
                 "login-customer-id": mccId,
                 "Content-Type":      "application/json",
             },
-            body: JSON.stringify({
-                keywords,
-                language:           "languageConstants/1000",
-                keywordPlanNetwork: "GOOGLE_SEARCH",
-            }),
+            body: JSON.stringify(body),
         }
     );
     const data = await resp.json();
@@ -2752,6 +2801,99 @@ async function buildStackAdaptRows(pace_dom, dim, today, monthStart, yesterday) 
                 : await fetchStackAdaptSpend(advId, monthStart, yesterday);
             return { account: info.name, mtd_spend: Math.round(spend * 100) / 100,
                 budget, ...getPacingLabel(spend, budget, pace_dom, dim) };
+        } catch (e) { return { account: info.name, error: e.message }; }
+    }));
+}
+
+// ── LinkedIn ─────────────────────────────────────────────────────────────────
+async function liGet(apiPath) {
+    if (!LINKEDIN_ACCESS_TOKEN) throw new Error("LINKEDIN_ACCESS_TOKEN env var not set.");
+    const url = apiPath.startsWith("http") ? apiPath : `https://api.linkedin.com/rest${apiPath}`;
+    const resp = await fetchFn(url, {
+        headers: {
+            "Authorization": `Bearer ${LINKEDIN_ACCESS_TOKEN}`,
+            "LinkedIn-Version": LINKEDIN_API_VERSION,
+            "X-Restli-Protocol-Version": "2.0.0",
+        },
+    });
+    if (!resp.ok) {
+        const text = await resp.text();
+        throw new Error(`LinkedIn API ${resp.status}: ${text.slice(0, 300)}`);
+    }
+    return resp.json();
+}
+
+async function fetchLinkedInMTD(accountId, from, to) {
+    const [fy, fm, fd] = from.split("-").map(Number);
+    const [ty, tm, td] = to.split("-").map(Number);
+    try {
+        const data = await liGet(
+            `/adAnalytics?q=analytics&pivot=ACCOUNT&timeGranularity=ALL` +
+            `&dateRange=(start:(year:${fy},month:${fm},day:${fd}),end:(year:${ty},month:${tm},day:${td}))` +
+            `&accounts=List(urn%3Ali%3AsponsoredAccount%3A${accountId})` +
+            `&fields=costInLocalCurrency`
+        );
+        const elems = data.elements || [];
+        const spend = elems.reduce((s, e) => {
+            const raw = e.costInLocalCurrency;
+            return s + (typeof raw === "string" ? parseFloat(raw) : (raw || 0));
+        }, 0);
+        return { spend };
+    } catch (e) {
+        return { spend: 0, error: e.message };
+    }
+}
+
+async function fetchLinkedInDailyBudgets(accountId) {
+    try {
+        const data = await liGet(
+            `/adAccounts/${accountId}/adCampaigns?q=search` +
+            `&search=(status:(values:List(ACTIVE)))` +
+            `&fields=id,name,dailyBudget,totalBudget,status`
+        );
+        const campaigns = (data.elements || []);
+        let dailyTotal = 0;
+        let hasLifetime = false;
+        for (const c of campaigns) {
+            if (c.dailyBudget?.amount) dailyTotal += parseFloat(c.dailyBudget.amount) / 100;
+            if (c.totalBudget?.amount) hasLifetime = true;
+        }
+        const result = { daily_total: Math.round(dailyTotal * 100) / 100, campaigns: campaigns.length };
+        if (hasLifetime && dailyTotal === 0) result.note = "Some budgets are lifetime, not daily — current_daily_budget undercounts.";
+        return result;
+    } catch (e) {
+        return { daily_total: 0, campaigns: 0, error: e.message };
+    }
+}
+
+async function buildLinkedInRows(pace_dom, dim, today, monthStart, yesterday) {
+    return Promise.all(Object.entries(LINKEDIN_ACCOUNTS).map(async ([acctId, info]) => {
+        const { budget } = getEffectiveBudget(info, today);
+        try {
+            if (info.flight_start && info.flight_end) {
+                const until = yesterday < info.flight_end ? yesterday : info.flight_end;
+                const { spend, error } = emptyWindow(info.flight_start, until) ? { spend: 0 }
+                    : await fetchLinkedInMTD(acctId, info.flight_start, until);
+                const row = { account: info.name, flight_spend: Math.round(spend * 100) / 100,
+                    ...getFlightPacing(spend, budget, info.flight_start, info.flight_end, yesterday) };
+                if (error) row.api_error = error;
+                const db = await fetchLinkedInDailyBudgets(acctId);
+                const fp = getFlightPacing(spend, budget, info.flight_start, info.flight_end, yesterday);
+                row.daily_budget = { current_daily_budget: db.daily_total, needed_per_day: fp.needed_per_day, days_remaining: fp.days_remaining };
+                if (db.daily_total === 0 && db.campaigns > 0) row.daily_budget.recommendation = `NO_DAILY_BUDGETS — no enabled daily budgets found; set ~$${fp.needed_per_day.toFixed(2)}/day to spend the remaining $${row.remaining?.toFixed(2) || budget}.`;
+                else if (db.daily_total > fp.needed_per_day * 1.1) row.daily_budget.recommendation = `LOWER daily budgets $${db.daily_total.toFixed(2)} → ~$${fp.needed_per_day.toFixed(2)}/day to avoid overspend.`;
+                else if (db.daily_total < fp.needed_per_day * 0.9) row.daily_budget.recommendation = `RAISE daily budgets $${db.daily_total.toFixed(2)} → ~$${fp.needed_per_day.toFixed(2)}/day to hit budget.`;
+                else row.daily_budget.recommendation = "ON_TRACK — current daily budgets land within ±10% of budget.";
+                if (db.note) row.daily_budget.note = db.note;
+                if (db.error) row.daily_budget.error = db.error;
+                return row;
+            }
+            const { spend, error } = emptyWindow(monthStart, yesterday) ? { spend: 0 }
+                : await fetchLinkedInMTD(acctId, monthStart, yesterday);
+            const row = { account: info.name, mtd_spend: Math.round(spend * 100) / 100,
+                budget, ...getPacingLabel(spend, budget, pace_dom, dim) };
+            if (error) row.api_error = error;
+            return row;
         } catch (e) { return { account: info.name, error: e.message }; }
     }));
 }
@@ -4238,13 +4380,13 @@ function makeServer() {
         },
         {
             name: "get_full_pacing",
-            description: "Pull Google Ads AND Meta (and StackAdapt) MTD spend and pacing for all accounts in one report. " +
+            description: "Pull Google Ads AND Meta (and StackAdapt and LinkedIn) MTD spend and pacing for all accounts in one report. " +
                 "Google and Meta rows include a daily_budget block: current daily budgets vs needed per day, with a RAISE/LOWER/ON_TRACK recommendation.",
             inputSchema: { type: "object", properties: {}, required: [] },
         },
         {
             name: "get_account_detail",
-            description: "Get MTD spend detail across Google, Meta, and StackAdapt for a specific client by name.",
+            description: "Get MTD spend detail across Google, Meta, StackAdapt, and LinkedIn for a specific client by name.",
             inputSchema: {
                 type: "object",
                 properties: {
@@ -4478,6 +4620,7 @@ function makeServer() {
                     min_volume:      { type: "number", description: "Filter out keywords with fewer avg monthly searches than this (e.g. 100)" },
                     competition:     { type: "string", enum: ["LOW", "MEDIUM", "HIGH"], description: "Filter to only show this competition level. Omit for all." },
                     max_cpc:         { type: "number", description: "Filter out keywords with high-end CPC estimate above this dollar amount." },
+                    geo_target:      { type: "string", description: "Optional geo target for local/regional data. Pass a US city+state (e.g. 'Mesa, AZ') or a raw resource name (e.g. 'geoTargetConstants/1014044'). Omit for national-level data." },
                 },
                 required: ["account_name"],
             },
@@ -4493,6 +4636,7 @@ function makeServer() {
                     account_name:  { type: "string", description: "Client account to run the query under (partial match ok)" },
                     keywords:      { type: "array", items: { type: "string" }, description: "Exact keywords to get metrics for (up to 20)" },
                     show_trend:    { type: "boolean", description: "Include month-by-month search volume for the past 12 months (default false)" },
+                    geo_target:    { type: "string", description: "Optional geo target for local/regional data. Pass a US city+state (e.g. 'Mesa, AZ') or a raw resource name (e.g. 'geoTargetConstants/1014044'). Omit for national-level data." },
                 },
                 required: ["account_name", "keywords"],
             },
@@ -4689,7 +4833,7 @@ function makeServer() {
         },
         {
             name: "manage_accounts",
-            description: "List, add, update, or remove tracked client accounts (Google Ads, Meta, StackAdapt) without code changes. " +
+            description: "List, add, update, or remove tracked client accounts (Google Ads, Meta, StackAdapt, LinkedIn) without code changes. " +
                 "Also manages per-account health-check thresholds via the health field (run_health_check monitors every account by default; set health=false to exclude one). " +
                 "Writes to accounts.json. Dry run by default — set confirm=true to save. " +
                 "After saving, commit accounts.json to git so Railway picks up the change.",
@@ -4697,7 +4841,7 @@ function makeServer() {
                 type: "object",
                 properties: {
                     action:   { type: "string", enum: ["list", "add", "update", "remove"], description: "What to do (default: list)" },
-                    platform: { type: "string", enum: ["google", "meta", "stackadapt"], description: "Which platform the account belongs to. Required for add/update/remove." },
+                    platform: { type: "string", enum: ["google", "meta", "stackadapt", "linkedin"], description: "Which platform the account belongs to. Required for add/update/remove." },
                     id:       { type: "string", description: "Account ID — Google customer ID (10 digits), Meta act_XXX, or StackAdapt advertiser ID. Required for add/update/remove." },
                     name:     { type: "string", description: "Client display name (required for add)" },
                     budget:   { type: "number", description: "Monthly budget in dollars (required for add; flights use total flight budget)" },
@@ -5891,13 +6035,15 @@ async function handleToolCall(name, args = {}) {
 
     } else if (name === "get_full_pacing") {
         const { token, error } = await getGoogleAccessToken();
-        const [googleRows, metaRows, stackadaptRows] = await Promise.all([
+        const [googleRows, metaRows, stackadaptRows, linkedinRows] = await Promise.all([
             error ? [{ error: `Auth failed: ${error}` }] : buildGoogleRows(token, pace_dom, dim, today, month_start, yesterday),
             buildMetaRows(pace_dom, dim, today, month_start, yesterday),
             Object.keys(STACKADAPT_ADVERTISERS).length ? buildStackAdaptRows(pace_dom, dim, today, month_start, yesterday) : null,
+            Object.keys(LINKEDIN_ACCOUNTS).length ? buildLinkedInRows(pace_dom, dim, today, month_start, yesterday) : null,
         ]);
         result = { date: today, spend_through: yesterday, day: dom, days_in_month: dim, google: googleRows, meta: metaRows };
         if (stackadaptRows) result.stackadapt = stackadaptRows;
+        if (linkedinRows) result.linkedin = linkedinRows;
 
     } else if (name === "get_account_detail") {
         const search = (args.account_name || "").toLowerCase();
@@ -5949,6 +6095,28 @@ async function handleToolCall(name, args = {}) {
                         ...getPacingLabel(spend, budget, pace_dom, dim) });
                 }
             } catch (e) { results.push({ platform: "StackAdapt", account: info.name, error: e.message }); }
+        }
+
+        // LinkedIn
+        for (const [acctId, info] of Object.entries(LINKEDIN_ACCOUNTS)) {
+            if (!info.name.toLowerCase().includes(search)) continue;
+            const { budget } = getEffectiveBudget(info, today);
+            try {
+                if (info.flight_start && info.flight_end) {
+                    const until = yesterday < info.flight_end ? yesterday : info.flight_end;
+                    const { spend } = emptyWindow(info.flight_start, until) ? { spend: 0 }
+                        : await fetchLinkedInMTD(acctId, info.flight_start, until);
+                    results.push({ platform: "LinkedIn", account: info.name,
+                        flight_spend: Math.round(spend * 100) / 100,
+                        ...getFlightPacing(spend, budget, info.flight_start, info.flight_end, yesterday) });
+                } else {
+                    const { spend } = emptyWindow(month_start, yesterday) ? { spend: 0 }
+                        : await fetchLinkedInMTD(acctId, month_start, yesterday);
+                    results.push({ platform: "LinkedIn", account: info.name,
+                        mtd_spend: Math.round(spend * 100) / 100, budget,
+                        ...getPacingLabel(spend, budget, pace_dom, dim) });
+                }
+            } catch (e) { results.push({ platform: "LinkedIn", account: info.name, error: e.message }); }
         }
 
         result = results.length
@@ -6057,6 +6225,7 @@ async function handleToolCall(name, args = {}) {
         const minVol   = args.min_volume   || 0;
         const maxCpc   = args.max_cpc      || null;
         const compFilt = args.competition  || null;
+        const geoInput = args.geo_target   || null;
 
         if (!seeds.length && !url) {
             result = { error: "Provide at least one seed_keyword or a url." };
@@ -6069,7 +6238,14 @@ async function handleToolCall(name, args = {}) {
                 if (authErr) { result = { error: `Auth: ${authErr}` }; }
                 else {
                     try {
-                        let ideas = await callKeywordPlannerIdeas(token, cid, info.mcc, seeds, url);
+                        let geoConstant = null;
+                        let geoScope = "national";
+                        if (geoInput) {
+                            geoConstant = await resolveGeoTarget(token, info.mcc, geoInput);
+                            geoScope = geoInput.startsWith("geoTargetConstants/") ? geoConstant : geoInput;
+                        }
+
+                        let ideas = await callKeywordPlannerIdeas(token, cid, info.mcc, seeds, url, geoConstant);
 
                         // Apply filters
                         if (minVol)   ideas = ideas.filter(k => k.avg_monthly_searches >= minVol);
@@ -6089,6 +6265,7 @@ async function handleToolCall(name, args = {}) {
 
                         result = {
                             account: info.name,
+                            geo_scope: geoScope,
                             source: url ? (seeds.length ? `seeds + ${url}` : url) : `seeds: ${seeds.join(", ")}`,
                             filters_applied: { min_volume: minVol || null, competition: compFilt, max_cpc: maxCpc },
                             total_ideas: ideas.length,
@@ -6103,6 +6280,7 @@ async function handleToolCall(name, args = {}) {
         const search    = (args.account_name || "").toLowerCase();
         const keywords  = (args.keywords || []).slice(0, 20);
         const showTrend = !!args.show_trend;
+        const geoInput  = args.geo_target || null;
 
         if (!keywords.length) { result = { error: "Provide at least one keyword." }; }
         else {
@@ -6114,9 +6292,16 @@ async function handleToolCall(name, args = {}) {
                 if (authErr) { result = { error: `Auth: ${authErr}` }; }
                 else {
                     try {
-                        const metrics = await fetchKeywordHistoricalMetrics(token, cid, info.mcc, keywords, showTrend);
+                        let geoConstant = null;
+                        let geoScope = "national";
+                        if (geoInput) {
+                            geoConstant = await resolveGeoTarget(token, info.mcc, geoInput);
+                            geoScope = geoInput.startsWith("geoTargetConstants/") ? geoConstant : geoInput;
+                        }
+
+                        const metrics = await fetchKeywordHistoricalMetrics(token, cid, info.mcc, keywords, showTrend, geoConstant);
                         metrics.sort((a, b) => b.avg_monthly_searches - a.avg_monthly_searches);
-                        result = { account: info.name, keyword_count: metrics.length, keywords: metrics };
+                        result = { account: info.name, geo_scope: geoScope, keyword_count: metrics.length, keywords: metrics };
                     } catch (e) { result = { error: e.message }; }
                 }
             }
@@ -7206,10 +7391,23 @@ async function handleToolCall(name, args = {}) {
             checks.stackadapt = { status: "⚠️ NOT CONFIGURED", note: "STACKADAPT_API_KEY env var not set." };
         }
 
+        // LinkedIn: test a lightweight API call
+        if (LINKEDIN_ACCESS_TOKEN) {
+            try {
+                await liGet(`/adAccounts/${Object.keys(LINKEDIN_ACCOUNTS)[0] || "0"}?fields=id`);
+                checks.linkedin = { status: "✅ OK", note: "Token accepted." };
+            } catch (e) {
+                checks.linkedin = { status: "❌ FAILING", error: e.message };
+            }
+        } else {
+            checks.linkedin = { status: "⚠️ NOT CONFIGURED", note: "LINKEDIN_ACCESS_TOKEN env var not set." };
+        }
+
         checks.accounts_tracked = {
             google: Object.keys(GOOGLE_ACCOUNTS).length,
             meta: Object.keys(META_ACCOUNTS).length,
             stackadapt: Object.keys(STACKADAPT_ADVERTISERS).length,
+            linkedin: Object.keys(LINKEDIN_ACCOUNTS).length,
         };
 
         // Pinned API version age — providers sunset old versions on a clock,
@@ -7231,7 +7429,7 @@ async function handleToolCall(name, args = {}) {
         const action   = args.action || "list";
         const platform = args.platform;
         const confirm  = !!args.confirm;
-        const stores   = { google: GOOGLE_ACCOUNTS, meta: META_ACCOUNTS, stackadapt: STACKADAPT_ADVERTISERS };
+        const stores   = { google: GOOGLE_ACCOUNTS, meta: META_ACCOUNTS, stackadapt: STACKADAPT_ADVERTISERS, linkedin: LINKEDIN_ACCOUNTS };
 
         if (action === "list") {
             result = {
@@ -7239,9 +7437,10 @@ async function handleToolCall(name, args = {}) {
                 google:     Object.entries(GOOGLE_ACCOUNTS).map(([id, a]) => ({ id, ...a })),
                 meta:       Object.entries(META_ACCOUNTS).map(([id, a]) => ({ id, ...a })),
                 stackadapt: Object.entries(STACKADAPT_ADVERTISERS).map(([id, a]) => ({ id, ...a })),
+                linkedin:   Object.entries(LINKEDIN_ACCOUNTS).map(([id, a]) => ({ id, ...a })),
             };
         } else if (!platform || !stores[platform]) {
-            result = { error: "platform (google | meta | stackadapt) is required for add/update/remove." };
+            result = { error: "platform (google | meta | stackadapt | linkedin) is required for add/update/remove." };
         } else if (!args.id) {
             result = { error: "id is required for add/update/remove." };
         } else {

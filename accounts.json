@@ -153,7 +153,10 @@
       "budget": 11500,
       "flight_start": "2026-08-18",
       "flight_end": "2027-01-01",
-      "mcc": "8621281595"
+      "mcc": "8621281595",
+      "health": {
+        "conversion_type": "lead"
+      }
     }
   },
   "meta": {
@@ -206,16 +209,15 @@
       "budget": 19720,
       "page_id": "112608548505996",
       "flight_start": "2026-08-18",
-      "flight_end": "2027-01-01"
+      "flight_end": "2027-01-01",
+      "health": {
+        "frequency_cap": 3
+      }
     }
   },
   "stackadapt": {
     "51727": {
       "name": "TOC (StackAdapt)",
-      "budget": 0
-    },
-    "69461": {
-      "name": "Florida State Guard (StackAdapt)",
       "budget": 0
     },
     "97806": {
@@ -225,6 +227,17 @@
     "108228": {
       "name": "Metro Electrical Services (StackAdapt)",
       "budget": 0
+    }
+  },
+  "linkedin": {
+    "513144628": {
+      "name": "Florida State Guard",
+      "budget": 2750,
+      "flight_start": "2026-08-18",
+      "flight_end": "2027-01-01",
+      "health": {
+        "conversion_type": "lead"
+      }
     }
   }
 }
