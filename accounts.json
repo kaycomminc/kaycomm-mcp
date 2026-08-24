@@ -26,7 +26,7 @@
       "budget": 6300,
       "mcc": "7631184147",
       "flight_start": "2026-07-23",
-      "flight_end": "2026-08-26",
+      "flight_end": "2026-08-23",
       "budget_schedule": []
     },
     "2275371078": {
@@ -37,13 +37,6 @@
         "conversion_type": "lead",
         "pacing_tolerance_pct": 10
       }
-    },
-    "2696762909": {
-      "name": "Warrior Advocates",
-      "budget": 300,
-      "mcc": "8621281595",
-      "ga4": "14591178781",
-      "health": false
     },
     "2908157845": {
       "name": "Boulevard Carroll",
@@ -143,7 +136,7 @@
     },
     "7539940999": {
       "name": "Digital Practice Growth",
-      "budget": 0,
+      "budget": 1250,
       "refresh_token_env": "GOOGLE_REFRESH_TOKEN_2",
       "health": false,
       "mcc": "7539940999"
@@ -167,11 +160,6 @@
         "frequency_cap": 3
       }
     },
-    "act_6128243883951018": {
-      "name": "Warrior Advocates",
-      "budget": 300,
-      "health": false
-    },
     "act_866700669704203": {
       "name": "Spartan Exteriors",
       "budget": 1000
@@ -182,12 +170,6 @@
       "health": {
         "frequency_cap": 3
       }
-    },
-    "act_1527255801416040": {
-      "name": "Florida DOH Monroe County",
-      "budget": 1445,
-      "flight_start": "2026-05-25",
-      "flight_end": "2026-06-05"
     },
     "act_1172134603935325": {
       "name": "FAMU Online",
@@ -201,7 +183,7 @@
       "budget": 11700,
       "page_id": "121015354580784",
       "flight_start": "2026-07-23",
-      "flight_end": "2026-08-26",
+      "flight_end": "2026-08-23",
       "budget_schedule": []
     },
     "act_2983430398459267": {
