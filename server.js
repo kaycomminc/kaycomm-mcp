@@ -6007,6 +6007,59 @@ function makeServer() {
                 required: ["account_name", "action"],
             },
         },
+        // ── Google Ads API Agent Integration Tools ──────────────────────────
+        {
+            name: "validate_gaql",
+            description: "Dry-run a GAQL query against the Google Ads API without returning results. " +
+                "Uses the API's validate_only flag to catch syntax errors, invalid field combinations, " +
+                "and incompatible resource types before executing a real query. " +
+                "Returns {valid: true} on success, or a structured error explaining what's wrong.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    account_name: { type: "string", description: "Client name (partial match ok) — needed for schema context since available fields vary by account features" },
+                    query: { type: "string", description: "The GAQL query to validate (e.g. 'SELECT campaign.name, metrics.clicks FROM campaign WHERE segments.date DURING LAST_7_DAYS')" },
+                },
+                required: ["account_name", "query"],
+            },
+        },
+        {
+            name: "inspect_google_ads_resource",
+            description: "Discover fields, segments, and metrics available on a Google Ads API resource. " +
+                "Returns the resource's attribute fields, selectable metrics, selectable segments, and enum values. " +
+                "Useful for building GAQL queries — check what fields exist before writing a query. " +
+                "Common resources: campaign, ad_group, ad_group_ad, keyword_view, search_term_view, " +
+                "ad_group_criterion, campaign_budget, bidding_strategy, customer, geographic_view, " +
+                "gender_view, age_range_view, landing_page_view, change_event.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    resource: {
+                        type: "string",
+                        description: "Google Ads API resource name in snake_case (e.g. 'campaign', 'ad_group', 'keyword_view', 'search_term_view')",
+                    },
+                    account_name: { type: "string", description: "Client name (partial match ok) — needed for API access" },
+                },
+                required: ["resource", "account_name"],
+            },
+        },
+        {
+            name: "run_gaql",
+            description: "Execute an arbitrary GAQL (Google Ads Query Language) query and return raw results. " +
+                "Use this for ad-hoc data pulls that aren't covered by the specialized tools. " +
+                "The query is validated first (dry-run), then executed. Results are returned as-is from the API. " +
+                "Capped at 1000 rows by default. Use validate_gaql first if you're unsure about the query syntax, " +
+                "or inspect_google_ads_resource to discover available fields.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    account_name: { type: "string", description: "Client name (partial match ok)" },
+                    query: { type: "string", description: "The GAQL query to execute" },
+                    limit: { type: "number", description: "Max rows to return (default: 1000)" },
+                },
+                required: ["account_name", "query"],
+            },
+        },
     ],
     }));
 
@@ -10162,6 +10215,158 @@ async function handleToolCall(name, args = {}) {
                         result = { error: `Unknown action '${args.action}'. Valid: list_forms, get_leads.` };
                     }
                 } catch (e) { result = { error: e.message }; }
+            }
+        }
+
+    // ── Google Ads API Agent Integration Tools ────────────────────────────
+    } else if (name === "validate_gaql") {
+        const search = (args.account_name || "").toLowerCase();
+        const match = Object.entries(GOOGLE_ACCOUNTS).find(([, info]) => info.name.toLowerCase().includes(search));
+        if (!match) {
+            result = { error: `No Google account found matching '${args.account_name}'. Available: ${Object.values(GOOGLE_ACCOUNTS).map(a => a.name).join(", ")}` };
+        } else if (!args.query || !args.query.trim()) {
+            result = { error: "query is required." };
+        } else {
+            const [cid, info] = match;
+            const { token, error } = await getGoogleAccessToken(cid);
+            if (error) { result = { error: `Auth failed: ${error}` }; }
+            else {
+                try {
+                    const resp = await fetchWithRetry(
+                        `https://googleads.googleapis.com/${GOOGLE_API_VERSION}/customers/${cid}/googleAds:search`,
+                        {
+                            method: "POST",
+                            headers: {
+                                "Authorization":       `Bearer ${token}`,
+                                "developer-token":     GOOGLE_DEVELOPER_TOKEN,
+                                "login-customer-id":   info.mcc,
+                                "Content-Type":        "application/json",
+                            },
+                            body: JSON.stringify({ query: args.query.trim(), validateOnly: true }),
+                        }
+                    );
+                    const data = await resp.json();
+                    if (!resp.ok) {
+                        result = { valid: false, account: info.name, query: args.query.trim(), error: googleAdsError(data) };
+                    } else {
+                        result = { valid: true, account: info.name, query: args.query.trim() };
+                    }
+                } catch (e) {
+                    result = { valid: false, account: info.name, error: e.message };
+                }
+            }
+        }
+
+    } else if (name === "inspect_google_ads_resource") {
+        const resource = (args.resource || "").trim().toLowerCase();
+        if (!resource) {
+            result = { error: "resource is required (e.g. 'campaign', 'ad_group', 'keyword_view')." };
+        } else {
+            const search = (args.account_name || "").toLowerCase();
+            const match = Object.entries(GOOGLE_ACCOUNTS).find(([, info]) => info.name.toLowerCase().includes(search));
+            if (!match) {
+                result = { error: `No Google account found matching '${args.account_name}'. Available: ${Object.values(GOOGLE_ACCOUNTS).map(a => a.name).join(", ")}` };
+            } else {
+                const [cid, info] = match;
+                const { token, error } = await getGoogleAccessToken(cid);
+                if (error) { result = { error: `Auth failed: ${error}` }; }
+                else {
+                    try {
+                        const resp = await fetchWithRetry(
+                            `https://googleads.googleapis.com/${GOOGLE_API_VERSION}/googleAdsFields:search`,
+                            {
+                                method: "POST",
+                                headers: {
+                                    "Authorization":       `Bearer ${token}`,
+                                    "developer-token":     GOOGLE_DEVELOPER_TOKEN,
+                                    "login-customer-id":   info.mcc,
+                                    "Content-Type":        "application/json",
+                                },
+                                body: JSON.stringify({ query: `SELECT name, category, data_type, selectable, filterable, sortable, selectable_with, enum_values, is_repeated WHERE name LIKE '${resource}.%' OR name = '${resource}'` }),
+                            }
+                        );
+                        const data = await resp.json();
+                        if (!resp.ok) {
+                            result = { error: googleAdsError(data) };
+                        } else {
+                            const fields = (data.results || []).map(r => ({
+                                name: r.googleAdsField?.name,
+                                category: r.googleAdsField?.category,
+                                data_type: r.googleAdsField?.dataType,
+                                selectable: r.googleAdsField?.selectable,
+                                filterable: r.googleAdsField?.filterable,
+                                sortable: r.googleAdsField?.sortable,
+                                is_repeated: r.googleAdsField?.isRepeated,
+                                enum_values: r.googleAdsField?.enumValues?.length ? r.googleAdsField.enumValues : undefined,
+                                selectable_with: r.googleAdsField?.selectableWith?.length ? r.googleAdsField.selectableWith : undefined,
+                            }));
+                            const attributes = fields.filter(f => f.category === "ATTRIBUTE");
+                            const metrics = fields.filter(f => f.category === "METRIC");
+                            const segments = fields.filter(f => f.category === "SEGMENT");
+                            const resourceMeta = fields.find(f => f.category === "RESOURCE");
+                            result = {
+                                resource,
+                                account: info.name,
+                                total_fields: fields.length,
+                                ...(resourceMeta ? { resource_info: resourceMeta } : {}),
+                                attributes: attributes.map(f => ({ name: f.name, type: f.data_type, filterable: f.filterable, sortable: f.sortable, enum_values: f.enum_values })),
+                                metrics: metrics.map(f => ({ name: f.name, type: f.data_type })),
+                                segments: segments.map(f => ({ name: f.name, type: f.data_type, enum_values: f.enum_values })),
+                            };
+                        }
+                    } catch (e) {
+                        result = { error: e.message };
+                    }
+                }
+            }
+        }
+
+    } else if (name === "run_gaql") {
+        const search = (args.account_name || "").toLowerCase();
+        const match = Object.entries(GOOGLE_ACCOUNTS).find(([, info]) => info.name.toLowerCase().includes(search));
+        if (!match) {
+            result = { error: `No Google account found matching '${args.account_name}'. Available: ${Object.values(GOOGLE_ACCOUNTS).map(a => a.name).join(", ")}` };
+        } else if (!args.query || !args.query.trim()) {
+            result = { error: "query is required." };
+        } else {
+            const [cid, info] = match;
+            const { token, error } = await getGoogleAccessToken(cid);
+            if (error) { result = { error: `Auth failed: ${error}` }; }
+            else {
+                const query = args.query.trim();
+                const limit = Math.min(args.limit || 1000, 10000);
+                try {
+                    // Validate first
+                    const valResp = await fetchWithRetry(
+                        `https://googleads.googleapis.com/${GOOGLE_API_VERSION}/customers/${cid}/googleAds:search`,
+                        {
+                            method: "POST",
+                            headers: {
+                                "Authorization":       `Bearer ${token}`,
+                                "developer-token":     GOOGLE_DEVELOPER_TOKEN,
+                                "login-customer-id":   info.mcc,
+                                "Content-Type":        "application/json",
+                            },
+                            body: JSON.stringify({ query, validateOnly: true }),
+                        }
+                    );
+                    const valData = await valResp.json();
+                    if (!valResp.ok) {
+                        result = { error: `Query validation failed: ${googleAdsError(valData)}`, query };
+                    } else {
+                        const rows = await googleSearch(token, cid, info.mcc, query);
+                        const truncated = rows.length > limit;
+                        result = {
+                            account: info.name,
+                            query,
+                            total_rows: rows.length,
+                            ...(truncated ? { truncated_to: limit, note: `Showing first ${limit} of ${rows.length} rows.` } : {}),
+                            rows: rows.slice(0, limit),
+                        };
+                    }
+                } catch (e) {
+                    result = { error: e.message };
+                }
             }
         }
 
