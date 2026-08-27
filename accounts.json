@@ -56,6 +56,13 @@
         "conversion_type": "sale"
       }
     },
+    "3340507097": {
+      "name": "FAMU Online",
+      "budget": 1250,
+      "mcc": "3340507097",
+      "flight_start": "2026-09-01",
+      "flight_end": "2026-10-31"
+    },
     "4206275101": {
       "name": "La Loma",
       "budget": 1125,
