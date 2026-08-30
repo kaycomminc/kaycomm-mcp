@@ -21,14 +21,6 @@
         "conversion_type": "sale"
       }
     },
-    "1766078295": {
-      "name": "Denver Parade of Homes",
-      "budget": 6300,
-      "mcc": "7631184147",
-      "flight_start": "2026-07-23",
-      "flight_end": "2026-08-23",
-      "budget_schedule": []
-    },
     "2275371078": {
       "name": "Childrens Therapy Services of Colorado",
       "budget": 1000,
@@ -59,14 +51,14 @@
     "3340507097": {
       "name": "FAMU Online",
       "budget": 1250,
-      "mcc": "3340507097",
+      "mcc": "8621281595",
       "flight_start": "2026-09-01",
       "flight_end": "2026-10-31"
     },
     "4206275101": {
       "name": "La Loma",
       "budget": 1125,
-      "mcc": "4206275101"
+      "mcc": "7631184147"
     },
     "9547060400": {
       "name": "Eye Associates of NF",
@@ -190,14 +182,6 @@
       "flight_end": "2026-09-30",
       "page_id": "626075927259136"
     },
-    "act_1371124644901073": {
-      "name": "Denver Parade of Homes",
-      "budget": 11700,
-      "page_id": "121015354580784",
-      "flight_start": "2026-07-23",
-      "flight_end": "2026-08-23",
-      "budget_schedule": []
-    },
     "act_2983430398459267": {
       "name": "Florida State Guard",
       "budget": 19720,
@@ -209,20 +193,7 @@
       }
     }
   },
-  "stackadapt": {
-    "51727": {
-      "name": "TOC (StackAdapt)",
-      "budget": 0
-    },
-    "97806": {
-      "name": "Southern Quality Propane (StackAdapt)",
-      "budget": 0
-    },
-    "108228": {
-      "name": "Metro Electrical Services (StackAdapt)",
-      "budget": 0
-    }
-  },
+  "stackadapt": {},
   "linkedin": {
     "513144628": {
       "name": "Florida State Guard",
