@@ -3758,6 +3758,7 @@ async function fetchBiddingStrategies(token, customerId, mccId, campaignSearch) 
                campaign.maximize_conversions.target_cpa_micros,
                campaign.target_cpa.target_cpa_micros,
                campaign.target_roas.target_roas,
+               campaign.maximize_conversion_value.target_roas,
                campaign.manual_cpc.enhanced_cpc_enabled
         FROM campaign
         WHERE campaign.status != 'REMOVED'
@@ -3783,6 +3784,8 @@ async function fetchBiddingStrategies(token, customerId, mccId, campaignSearch) 
         }
         if (c.targetRoas?.targetRoas) {
             out.target_roas = c.targetRoas.targetRoas;
+        } else if (c.maximizeConversionValue?.targetRoas) {
+            out.target_roas = c.maximizeConversionValue.targetRoas;
         }
         if (c.manualCpc != null) {
             out.enhanced_cpc = !!c.manualCpc.enhancedCpcEnabled;
