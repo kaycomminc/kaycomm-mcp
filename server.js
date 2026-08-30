@@ -856,6 +856,21 @@ async function metaGetAll(path, extraParams = {}) {
 
 function metaActId(id) { return id.startsWith("act_") ? id : `act_${id}`; }
 
+// Resolve a get_meta_ad_performance date_range preset to concrete since/until dates.
+function metaAdPerfDateRange(dateRange, customStart, customEnd) {
+    if (dateRange === "CUSTOM") return { startDate: customStart, endDate: customEnd };
+    const { today, yesterday, month_start } = getDateInfo();
+    const [y, m] = today.split("-").map(Number);
+    const fmt = dt => dt.toISOString().split("T")[0];
+    switch (dateRange) {
+        case "LAST_7_DAYS":  return { startDate: daysAgo(7, today),  endDate: yesterday };
+        case "LAST_MONTH":   return { startDate: fmt(new Date(Date.UTC(y, m - 2, 1))), endDate: fmt(new Date(Date.UTC(y, m - 1, 0))) };
+        case "THIS_MONTH":   return { startDate: month_start, endDate: today };
+        case "LAST_30_DAYS":
+        default:             return { startDate: daysAgo(30, today), endDate: yesterday };
+    }
+}
+
 const BUDGET_LIMITS = {
     lifetime_budget: 5000,
     spend_cap: 5000,
@@ -2009,6 +2024,44 @@ async function resolveGeoTarget(token, mccId, locationString) {
     const resourceName = best.resourceName;
     geoTargetCache.set(cacheKey, resourceName);
     return resourceName;
+}
+
+// ── Geo targeting (campaign criteria) ─────────────────────────────────────────
+
+async function getCampaignGeoTargets(token, customerId, mccId, campaignResourceName) {
+    const rows = await googleSearch(token, customerId, mccId, `
+        SELECT campaign_criterion.resource_name,
+               campaign_criterion.location.geo_target_constant,
+               campaign_criterion.negative
+        FROM campaign_criterion
+        WHERE campaign_criterion.type = 'LOCATION'
+          AND campaign.resource_name = '${campaignResourceName}'`);
+    const geoIds = rows
+        .filter(r => !r.campaignCriterion.negative)
+        .map(r => r.campaignCriterion.location.geoTargetConstant);
+    if (!geoIds.length) return [];
+    const nameRows = await googleSearch(token, customerId, mccId, `
+        SELECT geo_target_constant.resource_name,
+               geo_target_constant.name,
+               geo_target_constant.canonical_name,
+               geo_target_constant.target_type
+        FROM geo_target_constant
+        WHERE geo_target_constant.resource_name IN (${geoIds.map(id => `'${id}'`).join(", ")})`);
+    const nameMap = {};
+    for (const r of nameRows) {
+        nameMap[r.geoTargetConstant.resourceName] = {
+            name: r.geoTargetConstant.name,
+            canonical_name: r.geoTargetConstant.canonicalName,
+            target_type: r.geoTargetConstant.targetType,
+        };
+    }
+    return rows
+        .filter(r => !r.campaignCriterion.negative)
+        .map(r => ({
+            criterion_resource_name: r.campaignCriterion.resourceName,
+            geo_target_constant: r.campaignCriterion.location.geoTargetConstant,
+            ...(nameMap[r.campaignCriterion.location.geoTargetConstant] || {}),
+        }));
 }
 
 // ── Keyword planning ──────────────────────────────────────────────────────────
@@ -3209,6 +3262,14 @@ function buildBiddingUpdateBody(strategy, options = {}) {
             campaignFields: { biddingStrategyType: "TARGET_ROAS", targetRoas: { targetRoas: options.target_roas } },
             updateMask: "bidding_strategy_type,target_roas.target_roas",
         };
+    } else if (s === "MAXIMIZE_CONVERSION_VALUE") {
+        if (options.target_roas) {
+            return {
+                campaignFields: { biddingStrategyType: "MAXIMIZE_CONVERSION_VALUE", maximizeConversionValue: { targetRoas: options.target_roas } },
+                updateMask: "bidding_strategy_type,maximize_conversion_value.target_roas",
+            };
+        }
+        return { campaignFields: { biddingStrategyType: "MAXIMIZE_CONVERSION_VALUE" }, updateMask: "bidding_strategy_type" };
     } else {
         throw new Error(`Unknown strategy: ${strategy}. Valid: MANUAL_CPC, MAXIMIZE_CLICKS, MAXIMIZE_CONVERSIONS, TARGET_CPA, TARGET_ROAS`);
     }
@@ -3656,6 +3717,164 @@ async function createPmaxCampaignFull(token, customerId, mccId, config) {
         campaign_resource: results.find(r => r.campaignResult)?.campaignResult?.resourceName,
         budget_resource:   results.find(r => r.campaignBudgetResult)?.campaignBudgetResult?.resourceName,
         asset_group_resource: results.find(r => r.assetGroupResult)?.assetGroupResult?.resourceName,
+        total_ops:         mutateOperations.length,
+        results_count:     results.length,
+    };
+}
+
+async function createVideoCampaignFull(token, customerId, mccId, config) {
+    // config: {
+    //   campaign_name, daily_budget, bidding_strategy (MANUAL_CPV|MAXIMIZE_CONVERSIONS|TARGET_CPM),
+    //   final_url, geo_targets: [int],
+    //   ad_groups: [{ name, youtube_video (asset resource name OR YouTube video ID/URL), headline, call_to_action }]
+    // }
+    const mutateOperations = [];
+    const budgetTemp   = `customers/${customerId}/campaignBudgets/-1`;
+    const campaignTemp = `customers/${customerId}/campaigns/-2`;
+
+    // 0. Normalize youtube_videos array and resolve video references
+    // Each entry can be a string (URL/ID/resource) or object { url, final_url, ad_name }
+    let assetTempId = -100;
+    for (const ag of (config.ad_groups || [])) {
+        if (!ag.youtube_videos) ag.youtube_videos = ag.youtube_video ? [ag.youtube_video] : [];
+        const resolved = [];
+        for (const entry of ag.youtube_videos) {
+            const isObj = typeof entry === "object" && entry !== null;
+            const vid = isObj ? (entry.url || entry.video || "") : entry;
+            const meta = isObj ? entry : {};
+            let ref;
+            if (vid.startsWith("customers/")) {
+                ref = vid;
+            } else {
+                const idMatch = vid.match(/(?:youtu\.be\/|youtube\.com\/(?:watch\?v=|embed\/|shorts\/))([A-Za-z0-9_-]{11})/);
+                const videoId = idMatch ? idMatch[1] : vid.replace(/^https?:\/\//, "").trim();
+                ref = `customers/${customerId}/assets/${assetTempId--}`;
+                mutateOperations.push({
+                    assetOperation: {
+                        create: { resourceName: ref, youtubeVideoAsset: { youtubeVideoId: videoId } },
+                    },
+                });
+            }
+            resolved.push({ ref, final_url: meta.final_url || null, ad_name: meta.ad_name || null });
+        }
+        ag._resolved_videos = resolved;
+    }
+
+    // 1. Budget
+    mutateOperations.push({
+        campaignBudgetOperation: {
+            create: {
+                resourceName:    budgetTemp,
+                name:            `${config.campaign_name} Budget`,
+                amountMicros:    String(Math.round(config.daily_budget * 1_000_000)),
+                deliveryMethod:  "STANDARD",
+                explicitlyShared: false,
+            },
+        },
+    });
+
+    // 2. Campaign
+    const strategy = (config.bidding_strategy || "TARGET_CPM").toUpperCase();
+    let biddingFields;
+    if (strategy === "TARGET_CPM" || strategy === "MANUAL_CPV" || strategy === "TARGET_CPV")
+        biddingFields = { targetCpm: {} };
+    else if (strategy === "MAXIMIZE_CONVERSIONS") biddingFields = { maximizeConversions: {} };
+    else throw new Error(`Unsupported bidding strategy for Video: ${strategy}. Valid: TARGET_CPM, MAXIMIZE_CONVERSIONS`);
+
+    mutateOperations.push({
+        campaignOperation: {
+            create: {
+                resourceName:           campaignTemp,
+                name:                   config.campaign_name,
+                status:                 "PAUSED",
+                advertisingChannelType: "VIDEO",
+                campaignBudget:         budgetTemp,
+                containsEuPoliticalAdvertising: "DOES_NOT_CONTAIN_EU_POLITICAL_ADVERTISING",
+                ...biddingFields,
+            },
+        },
+    });
+
+    // 3. Ad groups + in-stream video ads
+    let tempCounter = -3;
+    for (const ag of (config.ad_groups || [])) {
+        const agTemp = `customers/${customerId}/adGroups/${tempCounter--}`;
+        mutateOperations.push({
+            adGroupOperation: {
+                create: {
+                    resourceName: agTemp,
+                    name:         ag.name,
+                    campaign:     campaignTemp,
+                    status:       "ENABLED",
+                    type:         "VIDEO_TRUE_VIEW_IN_STREAM",
+                },
+            },
+        });
+
+        for (let vi = 0; vi < ag._resolved_videos.length; vi++) {
+            const rv = ag._resolved_videos[vi];
+            mutateOperations.push({
+                adGroupAdOperation: {
+                    create: {
+                        adGroup: agTemp,
+                        status:  "ENABLED",
+                        ad: {
+                            name:      rv.ad_name || (ag._resolved_videos.length > 1
+                                ? `${ag.name} - Video ${vi + 1}`
+                                : (ag.ad_name || `${ag.name} - Video Ad`)),
+                            finalUrls: [rv.final_url || config.final_url],
+                            videoAd: {
+                                video: { asset: rv.ref },
+                                inStream: {
+                                    actionButtonLabel: ag.call_to_action || "Learn More",
+                                    actionHeadline:    ag.headline || config.campaign_name,
+                                },
+                            },
+                        },
+                    },
+                },
+            });
+        }
+    }
+
+    // 4. Language targeting (English)
+    mutateOperations.push({
+        campaignCriterionOperation: {
+            create: { campaign: campaignTemp, language: { languageConstant: "languageConstants/1000" } },
+        },
+    });
+
+    // 5. Geo targeting
+    for (const geoId of (config.geo_targets || [])) {
+        mutateOperations.push({
+            campaignCriterionOperation: {
+                create: { campaign: campaignTemp, location: { geoTargetConstant: `geoTargetConstants/${geoId}` } },
+            },
+        });
+    }
+
+    const resp = await fetchFn(
+        `https://googleads.googleapis.com/${GOOGLE_API_VERSION}/customers/${customerId}/googleAds:mutate`,
+        {
+            method: "POST",
+            headers: {
+                "Authorization":     `Bearer ${token}`,
+                "developer-token":   GOOGLE_DEVELOPER_TOKEN,
+                "login-customer-id": mccId,
+                "Content-Type":      "application/json",
+            },
+            body: JSON.stringify({ mutateOperations }),
+        }
+    );
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(googleAdsError(data));
+
+    const results = data.mutateOperationResponses || [];
+    return {
+        campaign_resource: results.find(r => r.campaignResult)?.campaignResult?.resourceName,
+        budget_resource:   results.find(r => r.campaignBudgetResult)?.campaignBudgetResult?.resourceName,
+        ad_groups:         results.filter(r => r.adGroupResult).map(r => r.adGroupResult.resourceName),
+        ads:               results.filter(r => r.adGroupAdResult).map(r => r.adGroupAdResult.resourceName),
         total_ops:         mutateOperations.length,
         results_count:     results.length,
     };
@@ -5015,15 +5234,15 @@ function makeServer() {
         },
         {
             name: "set_bidding_strategy",
-            description: "Change the bidding strategy on a Google Ads campaign. Supports MANUAL_CPC, ENHANCED_CPC, MAXIMIZE_CLICKS, MAXIMIZE_CONVERSIONS, TARGET_CPA, TARGET_ROAS. Dry run by default — set confirm=true to apply.",
+            description: "Change the bidding strategy on a Google Ads campaign. Supports MANUAL_CPC, ENHANCED_CPC, MAXIMIZE_CLICKS, MAXIMIZE_CONVERSIONS, MAXIMIZE_CONVERSION_VALUE, TARGET_CPA, TARGET_ROAS. Dry run by default — set confirm=true to apply.",
             inputSchema: {
                 type: "object",
                 properties: {
                     account_name:     { type: "string", description: "Client name (partial match ok)" },
                     campaign_name:    { type: "string", description: "Campaign name (partial match ok)" },
-                    strategy:         { type: "string", enum: ["MANUAL_CPC","ENHANCED_CPC","MAXIMIZE_CLICKS","MAXIMIZE_CONVERSIONS","TARGET_CPA","TARGET_ROAS"], description: "Bidding strategy to apply" },
+                    strategy:         { type: "string", enum: ["MANUAL_CPC","ENHANCED_CPC","MAXIMIZE_CLICKS","MAXIMIZE_CONVERSIONS","MAXIMIZE_CONVERSION_VALUE","TARGET_CPA","TARGET_ROAS"], description: "Bidding strategy to apply" },
                     target_cpa:       { type: "number", description: "Target CPA in dollars — required for TARGET_CPA, optional for MAXIMIZE_CONVERSIONS (sets a tCPA target without changing strategy type)" },
-                    target_roas:      { type: "number", description: "Target ROAS as a multiplier — required for TARGET_ROAS (e.g. 3.0 = 300%)" },
+                    target_roas:      { type: "number", description: "Target ROAS as a multiplier — required for TARGET_ROAS, optional for MAXIMIZE_CONVERSION_VALUE (adds a tROAS target without switching strategy)" },
                     cpc_bid_ceiling:  { type: "number", description: "Optional max CPC ceiling in dollars — for MAXIMIZE_CLICKS only" },
                     confirm:          { type: "boolean", description: "Set true to apply. Omit for dry run." },
                 },
@@ -5162,6 +5381,59 @@ function makeServer() {
             },
         },
         {
+            name: "create_video_campaign",
+            description: "Create a YouTube / Video campaign with skippable in-stream ads. " +
+                "Campaign is created in PAUSED status for review. " +
+                "Use list_account_assets with asset_types=['YOUTUBE_VIDEO'] to find existing video assets first. " +
+                "Dry run by default — set confirm=true to build it.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    account_name:     { type: "string", description: "Client name (partial match ok)" },
+                    campaign_name:    { type: "string", description: "Name for the new campaign" },
+                    daily_budget:     { type: "number", description: "Daily budget in dollars" },
+                    bidding_strategy: { type: "string", enum: ["TARGET_CPV", "MAXIMIZE_CONVERSIONS", "TARGET_CPM"], description: "Bidding strategy (default: TARGET_CPV). Use TARGET_CPV for views, MAXIMIZE_CONVERSIONS for action-oriented, TARGET_CPM for reach." },
+                    final_url:        { type: "string", description: "Landing page URL for the video ads" },
+                    geo_targets: {
+                        type: "array",
+                        description: "Geo target location IDs (required). Common: 2840=US, 2826=UK, 2124=Canada.",
+                        items: { type: "integer" },
+                    },
+                    ad_groups: {
+                        type: "array",
+                        description: "Ad groups to create, each with a YouTube video ad",
+                        items: {
+                            type: "object",
+                            properties: {
+                                name:            { type: "string", description: "Ad group name" },
+                                youtube_video:   { type: "string", description: "Single YouTube video URL, video ID, or asset resource name (use youtube_videos for multiple)" },
+                                youtube_videos:  {
+                                    type: "array",
+                                    description: "Multiple videos — one ad per entry. Each entry is a string (URL/ID) or object {url, final_url, ad_name} for per-ad landing pages.",
+                                    items: {
+                                        oneOf: [
+                                            { type: "string" },
+                                            { type: "object", properties: {
+                                                url:       { type: "string", description: "YouTube video URL, ID, or asset resource name" },
+                                                final_url: { type: "string", description: "Landing page for this specific ad (overrides campaign final_url)" },
+                                                ad_name:   { type: "string", description: "Name for this ad" },
+                                            }, required: ["url"] },
+                                        ],
+                                    },
+                                },
+                                headline:        { type: "string", description: "CTA headline shown with the ad (max 15 chars, defaults to campaign name)" },
+                                call_to_action:  { type: "string", description: "CTA button text, e.g. 'Learn More', 'Shop Now', 'Sign Up' (max 10 chars, default: 'Learn More')" },
+                                ad_name:         { type: "string", description: "Name for the ad (defaults to '<ad group name> - Video Ad')" },
+                            },
+                            required: ["name", "youtube_video"],
+                        },
+                    },
+                    confirm: { type: "boolean", description: "Set true to actually create. Omit for dry run." },
+                },
+                required: ["account_name", "campaign_name", "daily_budget", "final_url", "geo_targets", "ad_groups"],
+            },
+        },
+        {
             name: "update_ad_copy",
             description: "View or update responsive search ad (RSA) headlines and descriptions in a Google Ads ad group. " +
                 "Omit headlines/descriptions to preview current copy. Provide new copy to replace it. " +
@@ -5216,6 +5488,33 @@ function makeServer() {
                     ad_resource_name: { type: "string", description: "Ad resource name (e.g. customers/123/ads/456). If provided, bypasses name matching entirely." },
                     final_url:        { type: "string", description: "New Final URL to set on the ad(s)" },
                     confirm:       { type: "boolean", description: "Set true to apply. Omit for dry run / preview." },
+                },
+                required: ["account_name", "campaign_name"],
+            },
+        },
+        {
+            name: "update_geo_targeting",
+            description: "View or update the geo (location) targeting on a Google Ads campaign. " +
+                "Omit add/remove to preview current targets. " +
+                "Pass add and/or remove arrays to change targeting. " +
+                "Accepts geo target constant IDs (e.g. 2840 for US) or location names (e.g. 'Mesa, AZ'). " +
+                "Dry run by default — set confirm=true to apply.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    account_name:  { type: "string", description: "Client name (partial match ok)" },
+                    campaign_name: { type: "string", description: "Campaign name (partial match ok)" },
+                    add: {
+                        type: "array",
+                        items: { type: "string" },
+                        description: "Geo targets to add — IDs (e.g. '2840') or names (e.g. 'Mesa, AZ', 'Arizona')",
+                    },
+                    remove: {
+                        type: "array",
+                        items: { type: "string" },
+                        description: "Geo targets to remove — IDs (e.g. '2840'), names, or criterion resource names from the current list",
+                    },
+                    confirm: { type: "boolean", description: "Set true to apply. Omit for dry run / preview." },
                 },
                 required: ["account_name", "campaign_name"],
             },
@@ -5969,6 +6268,33 @@ function makeServer() {
                     },
                 },
                 required: ["account_name", "breakdown"],
+            },
+        },
+        {
+            name: "get_meta_ad_performance",
+            description: "Get ad-level performance metrics from Meta (Facebook/Instagram) — spend, clicks, CTR, CPC, CPM, reach, " +
+                "link clicks, landing page views, purchases, post engagement, CPA, and ROAS for each ad. " +
+                "Use to see which individual ads/creatives are performing well or poorly within an account.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    account_name: { type: "string", description: "Meta account name (partial match ok)" },
+                    campaign_name: { type: "string", description: "Filter to ads within campaigns matching this substring (optional)" },
+                    date_range: {
+                        type: "string",
+                        enum: ["THIS_MONTH", "LAST_7_DAYS", "LAST_30_DAYS", "LAST_MONTH", "CUSTOM"],
+                        description: "Date range preset (default: LAST_30_DAYS). Use CUSTOM with start_date/end_date.",
+                    },
+                    start_date: { type: "string", description: "Start date YYYY-MM-DD — required with date_range=CUSTOM" },
+                    end_date: { type: "string", description: "End date YYYY-MM-DD — required with date_range=CUSTOM" },
+                    sort_by: {
+                        type: "string",
+                        enum: ["spend", "ctr", "cpc", "purchases", "cpa"],
+                        description: "Field to sort the ads array by, descending (default: spend)",
+                    },
+                    min_spend: { type: "number", description: "Only return ads with spend >= this value (default: 0, include all)" },
+                },
+                required: ["account_name"],
             },
         },
         {
@@ -8029,6 +8355,79 @@ async function handleToolCall(name, args = {}) {
             }
         }
 
+    } else if (name === "create_video_campaign") {
+        const search  = (args.account_name || "").toLowerCase();
+        const confirm = !!args.confirm;
+
+        if (!args.campaign_name || !args.daily_budget || !args.final_url || !args.ad_groups?.length || !args.geo_targets?.length) {
+            result = { error: "campaign_name, daily_budget, final_url, at least one ad_group, and at least one geo_target are required." };
+        } else {
+            const missingVideo = args.ad_groups.find(ag => !ag.youtube_video && !ag.youtube_videos?.length);
+            if (missingVideo) {
+                result = { error: `Ad group '${missingVideo.name || "(unnamed)"}' is missing youtube_video or youtube_videos. Provide YouTube URLs, video IDs, or asset resource names.` };
+            } else {
+                const match = Object.entries(GOOGLE_ACCOUNTS).find(([, i]) => i.name.toLowerCase().includes(search));
+                if (!match) {
+                    result = { error: `No Google account matching '${args.account_name}'` };
+                } else {
+                    const [cid, info] = match;
+                    const { token, error: authErr } = await getGoogleAccessToken(cid);
+                    if (authErr) { result = { error: `Auth: ${authErr}` }; }
+                    else {
+                        const config = {
+                            campaign_name:    args.campaign_name,
+                            daily_budget:     args.daily_budget,
+                            bidding_strategy: args.bidding_strategy || "MANUAL_CPV",
+                            final_url:        args.final_url,
+                            geo_targets:      args.geo_targets,
+                            ad_groups:        args.ad_groups,
+                        };
+
+                        if (!confirm) {
+                            result = {
+                                dry_run: true,
+                                message: "DRY RUN — set confirm=true to create. Campaign will start PAUSED.",
+                                account: info.name,
+                                planned_campaign: {
+                                    name:             config.campaign_name,
+                                    type:             "VIDEO (YouTube)",
+                                    ad_format:        "Skippable in-stream",
+                                    daily_budget:     "$" + config.daily_budget.toFixed(2),
+                                    bidding_strategy: config.bidding_strategy,
+                                    final_url:        config.final_url,
+                                    language:         "English",
+                                    geo_targets:      config.geo_targets.map(id => `geoTargetConstants/${id}`),
+                                    status:           "PAUSED (default for new campaigns)",
+                                    ad_groups:        config.ad_groups.map(ag => ({
+                                        name:           ag.name,
+                                        videos:         ag.youtube_videos || (ag.youtube_video ? [ag.youtube_video] : []),
+                                        ads_per_group:  (ag.youtube_videos || (ag.youtube_video ? [ag.youtube_video] : [])).length,
+                                        headline:       ag.headline || config.campaign_name,
+                                        call_to_action: ag.call_to_action || "Learn More",
+                                    })),
+                                },
+                            };
+                        } else {
+                            try {
+                                const res = await createVideoCampaignFull(token, cid, info.mcc, config);
+                                result = {
+                                    success: true,
+                                    account:           info.name,
+                                    campaign_name:     config.campaign_name,
+                                    campaign_resource: res.campaign_resource,
+                                    budget_resource:   res.budget_resource,
+                                    ad_groups:         res.ad_groups,
+                                    ads:               res.ads,
+                                    total_ops:         res.total_ops,
+                                    status:            "PAUSED — review in Google Ads before enabling",
+                                };
+                            } catch (e) { result = { error: e.message }; }
+                        }
+                    }
+                }
+            }
+        }
+
     } else if (name === "update_ad_copy") {
         const search     = (args.account_name || "").toLowerCase();
         const campSearch = (args.campaign_name || "").toLowerCase();
@@ -8146,6 +8545,143 @@ async function handleToolCall(name, args = {}) {
                             ads_updated:  updated,
                             new_url:      newUrl,
                         };
+                    }
+                } catch (e) { result = { error: e.message }; }
+            }
+        }
+
+    } else if (name === "update_geo_targeting") {
+        const search     = (args.account_name || "").toLowerCase();
+        const campSearch = (args.campaign_name || "").toLowerCase();
+        const toAdd      = args.add || [];
+        const toRemove   = args.remove || [];
+        const confirm    = !!args.confirm;
+
+        const match = Object.entries(GOOGLE_ACCOUNTS).find(([, i]) => i.name.toLowerCase().includes(search));
+        if (!match) {
+            result = { error: `No Google account matching '${args.account_name}'` };
+        } else {
+            const [cid, info] = match;
+            const { token, error: authErr } = await getGoogleAccessToken(cid);
+            if (authErr) { result = { error: `Auth: ${authErr}` }; }
+            else {
+                try {
+                    const campaigns = await listGoogleCampaignsFull(token, cid, info.mcc);
+                    const camp = campaigns.find(c => c.name.toLowerCase().includes(campSearch));
+                    if (!camp) {
+                        result = { error: `No campaign matching '${args.campaign_name}'`, available: campaigns.map(c => c.name) };
+                    } else {
+                        const current = await getCampaignGeoTargets(token, cid, info.mcc, camp.resource_name);
+
+                        if (!toAdd.length && !toRemove.length) {
+                            result = {
+                                account: info.name,
+                                campaign: camp.name,
+                                message: "Current geo targets — pass add/remove arrays to change",
+                                geo_targets: current.map(g => ({
+                                    criterion: g.criterion_resource_name,
+                                    geo_constant: g.geo_target_constant,
+                                    name: g.canonical_name || g.name,
+                                    type: g.target_type,
+                                })),
+                            };
+                        } else {
+                            const ops = [];
+
+                            // Resolve removals — match by criterion resource name, geo constant, ID, or name
+                            const removeMatched = [];
+                            for (const r of toRemove) {
+                                const rLower = r.toLowerCase();
+                                const found = current.find(g =>
+                                    g.criterion_resource_name === r ||
+                                    g.geo_target_constant === r ||
+                                    g.geo_target_constant === `geoTargetConstants/${r}` ||
+                                    (g.name && g.name.toLowerCase() === rLower) ||
+                                    (g.canonical_name && g.canonical_name.toLowerCase().includes(rLower))
+                                );
+                                if (found) {
+                                    removeMatched.push(found);
+                                    ops.push({
+                                        campaignCriterionOperation: {
+                                            remove: found.criterion_resource_name,
+                                        },
+                                    });
+                                } else {
+                                    throw new Error(`Cannot find current geo target matching '${r}'. Current targets: ${current.map(g => g.canonical_name || g.name || g.geo_target_constant).join(", ")}`);
+                                }
+                            }
+
+                            // Resolve additions — resolve to geo constant and look up name
+                            const addResolved = [];
+                            for (const a of toAdd) {
+                                const isId = /^\d+$/.test(a);
+                                let geoConstant;
+                                if (isId) {
+                                    geoConstant = `geoTargetConstants/${a}`;
+                                } else if (a.startsWith("geoTargetConstants/")) {
+                                    geoConstant = a;
+                                } else {
+                                    geoConstant = await resolveGeoTarget(token, info.mcc, a);
+                                }
+                                addResolved.push({ geo_constant: geoConstant, input: a });
+                                ops.push({
+                                    campaignCriterionOperation: {
+                                        create: {
+                                            campaign: camp.resource_name,
+                                            location: { geoTargetConstant: geoConstant },
+                                        },
+                                    },
+                                });
+                            }
+
+                            // Resolve human names for additions
+                            const addGeoIds = addResolved.map(a => a.geo_constant);
+                            let addNameMap = {};
+                            if (addGeoIds.length) {
+                                try {
+                                    const nameRows = await googleSearch(token, cid, info.mcc, `
+                                        SELECT geo_target_constant.resource_name,
+                                               geo_target_constant.canonical_name
+                                        FROM geo_target_constant
+                                        WHERE geo_target_constant.resource_name IN (${addGeoIds.map(id => `'${id}'`).join(", ")})`);
+                                    for (const r of nameRows) {
+                                        addNameMap[r.geoTargetConstant.resourceName] = r.geoTargetConstant.canonicalName;
+                                    }
+                                } catch (_) { /* name lookup is best-effort */ }
+                            }
+                            const addDisplay = addResolved.map(a => ({
+                                geo_constant: a.geo_constant,
+                                name: addNameMap[a.geo_constant] || a.input,
+                            }));
+
+                            if (!confirm) {
+                                result = {
+                                    dry_run: true,
+                                    message: "DRY RUN — set confirm=true to apply",
+                                    account: info.name,
+                                    campaign: camp.name,
+                                    current_targets: current.map(g => g.canonical_name || g.name || g.geo_target_constant),
+                                    removing: removeMatched.map(g => g.canonical_name || g.name || g.geo_target_constant),
+                                    adding: addDisplay,
+                                    operations: ops.length,
+                                };
+                            } else {
+                                await googleMutateOps(token, cid, info.mcc, ops);
+                                const updated = await getCampaignGeoTargets(token, cid, info.mcc, camp.resource_name);
+                                result = {
+                                    success: true,
+                                    account: info.name,
+                                    campaign: camp.name,
+                                    removed: removeMatched.length,
+                                    added: addDisplay.length,
+                                    new_geo_targets: updated.map(g => ({
+                                        geo_constant: g.geo_target_constant,
+                                        name: g.canonical_name || g.name,
+                                        type: g.target_type,
+                                    })),
+                                };
+                            }
+                        }
                     }
                 } catch (e) { result = { error: e.message }; }
             }
@@ -10074,6 +10610,107 @@ async function handleToolCall(name, args = {}) {
                 });
                 result = { account: info.name, breakdown: args.breakdown, level, date_preset: datePreset, total_rows: formatted.length, rows: formatted };
             } catch (e) { result = { error: e.message }; }
+        }
+
+    } else if (name === "get_meta_ad_performance") {
+        const search = (args.account_name || "").toLowerCase();
+        const acctMatch = Object.entries(META_ACCOUNTS).find(([, info]) => info.name.toLowerCase().includes(search));
+        if (!acctMatch) {
+            result = { error: `No Meta account found matching '${args.account_name}'. Available: ${Object.values(META_ACCOUNTS).map(a => a.name).join(", ")}` };
+        } else {
+            const [accountId, info] = acctMatch;
+            const dateRange = args.date_range || "LAST_30_DAYS";
+            if (dateRange === "CUSTOM" && (!args.start_date || !args.end_date)) {
+                result = { error: "start_date and end_date are required when date_range is CUSTOM." };
+            } else {
+                const { startDate, endDate } = metaAdPerfDateRange(dateRange, args.start_date, args.end_date);
+                try {
+                    const params = {
+                        fields: "ad_id,ad_name,adset_name,campaign_name,spend,impressions,clicks,ctr,cpc,cpm,reach,actions,cost_per_action_type,action_values",
+                        time_range: JSON.stringify({ since: startDate, until: endDate }),
+                        level: "ad",
+                        limit: 100,
+                    };
+                    if (args.campaign_name) {
+                        params.filtering = JSON.stringify([{ field: "campaign.name", operator: "CONTAIN", value: args.campaign_name }]);
+                    }
+
+                    const rows = await metaGetAll(`${metaActId(accountId)}/insights`, params);
+                    const actionVal = (arr, type) => parseFloat((arr || []).find(a => a.action_type === type)?.value || 0);
+
+                    // effective_object_story_id lives on the ad object, not the insights
+                    // endpoint (Graph API rejects it as an insights field) — fetch it separately.
+                    const storyIdByAdId = {};
+                    const adIds = [...new Set(rows.map(r => r.ad_id).filter(Boolean))];
+                    if (adIds.length) {
+                        const adObjects = await metaGetAll(`${metaActId(accountId)}/ads`, {
+                            fields: "id,effective_object_story_id",
+                            filtering: JSON.stringify([{ field: "id", operator: "IN", value: adIds }]),
+                            limit: 100,
+                        });
+                        for (const a of adObjects) storyIdByAdId[a.id] = a.effective_object_story_id;
+                    }
+
+                    const minSpend = args.min_spend || 0;
+                    let ads = rows.map(r => {
+                        const spend = parseFloat(r.spend || 0);
+                        const purchases = actionVal(r.actions, "purchase");
+                        const revenue = actionVal(r.action_values, "purchase");
+                        const cpa = purchases > 0 ? spend / purchases : null;
+                        const roas = spend > 0 ? revenue / spend : null;
+                        return {
+                            ad_name: r.ad_name,
+                            adset_name: r.adset_name,
+                            campaign_name: r.campaign_name,
+                            effective_object_story_id: storyIdByAdId[r.ad_id] || null,
+                            spend: Math.round(spend * 100) / 100,
+                            impressions: parseInt(r.impressions || 0),
+                            clicks: parseInt(r.clicks || 0),
+                            ctr: parseFloat(r.ctr || 0),
+                            cpc: parseFloat(r.cpc || 0),
+                            cpm: parseFloat(r.cpm || 0),
+                            reach: parseInt(r.reach || 0),
+                            link_clicks: actionVal(r.actions, "link_click"),
+                            landing_page_views: actionVal(r.actions, "landing_page_view"),
+                            purchases,
+                            post_engagement: actionVal(r.actions, "post_engagement"),
+                            revenue: Math.round(revenue * 100) / 100,
+                            cpa: cpa !== null ? Math.round(cpa * 100) / 100 : null,
+                            roas: roas !== null ? Math.round(roas * 100) / 100 : null,
+                        };
+                    }).filter(ad => ad.spend >= minSpend);
+
+                    const sortBy = args.sort_by || "spend";
+                    const sortKey = sortBy === "purchases" ? "purchases" : sortBy;
+                    ads.sort((a, b) => (b[sortKey] ?? -Infinity) - (a[sortKey] ?? -Infinity));
+
+                    const totals = ads.reduce((acc, ad) => {
+                        acc.spend += ad.spend;
+                        acc.clicks += ad.clicks;
+                        acc.impressions += ad.impressions;
+                        acc.purchases += ad.purchases;
+                        acc.revenue += ad.revenue;
+                        return acc;
+                    }, { spend: 0, clicks: 0, impressions: 0, purchases: 0, revenue: 0 });
+
+                    result = {
+                        account: info.name,
+                        date_range: dateRange,
+                        start_date: startDate,
+                        end_date: endDate,
+                        ads,
+                        summary: {
+                            total_spend: Math.round(totals.spend * 100) / 100,
+                            total_clicks: totals.clicks,
+                            total_impressions: totals.impressions,
+                            total_purchases: totals.purchases,
+                            total_revenue: Math.round(totals.revenue * 100) / 100,
+                            blended_cpa: totals.purchases > 0 ? Math.round((totals.spend / totals.purchases) * 100) / 100 : null,
+                            blended_roas: totals.spend > 0 ? Math.round((totals.revenue / totals.spend) * 100) / 100 : null,
+                        },
+                    };
+                } catch (e) { result = { error: e.message }; }
+            }
         }
 
     } else if (name === "update_meta_object") {
