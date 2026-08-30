@@ -213,6 +213,15 @@ function getEffectiveBudget(info, today) {
     return { budget, nc_budget: ncBudget, effective_from: effective };
 }
 
+// Pacing tolerance: how far pct_expected can drift from 100% before we call it
+// over/under pacing. Kept tight (±5%). RAISE recommendations additionally target
+// a ceiling below 100% of budget (PACING_SAFETY_MARGIN_PCT), not the literal
+// remaining balance — Google and Meta both allow a campaign to overdeliver on a
+// given day (up to ~2x the daily budget, averaged out over the billing cycle),
+// so aiming a daily-budget recommendation at exactly 100% risks landing over.
+const PACING_TOLERANCE_PCT = 5;
+const PACING_SAFETY_MARGIN_PCT = 5;
+
 function getPacingLabel(spent, budget, dom, dim) {
     if (!budget) return { status: "no_cap" };
     if (!dom)    return { status: "NO_COMPLETE_DAYS_YET", note: "First day of the month — no complete days to pace against yet.", remaining: Math.round((budget - spent) * 100) / 100 };
@@ -220,7 +229,7 @@ function getPacingLabel(spent, budget, dom, dim) {
     const pctBudget   = Math.round((spent / budget) * 100 * 10) / 10;
     const pctExpected = expected > 0 ? Math.round((spent / expected) * 100 * 10) / 10 : 0;
     const remaining   = Math.round((budget - spent) * 100) / 100;
-    const status      = pctExpected >= 105 ? "OVERPACING" : pctExpected <= 85 ? "UNDERPACING" : "ON PACE";
+    const status      = pctExpected >= 100 + PACING_TOLERANCE_PCT ? "OVERPACING" : pctExpected <= 100 - PACING_TOLERANCE_PCT ? "UNDERPACING" : "ON PACE";
     const projected   = Math.round((spent / dom) * dim * 100) / 100;
     return {
         status, pct_budget: pctBudget, pct_expected: pctExpected, remaining,
@@ -249,7 +258,7 @@ function getFlightPacing(spent, budget, flightStart, flightEnd, yesterday) {
     const expected    = budget * (elapsedDays / totalDays);
     const pctExpected = expected > 0 ? Math.round((spent / expected) * 100 * 10) / 10 : 0;
     const daysLeft    = totalDays - elapsedDays;
-    const status      = pctExpected >= 105 ? "OVERPACING" : pctExpected <= 85 ? "UNDERPACING" : "ON PACE";
+    const status      = pctExpected >= 100 + PACING_TOLERANCE_PCT ? "OVERPACING" : pctExpected <= 100 - PACING_TOLERANCE_PCT ? "UNDERPACING" : "ON PACE";
     return {
         status, ...base,
         pct_expected: pctExpected,
@@ -260,10 +269,14 @@ function getFlightPacing(spent, budget, flightStart, flightEnd, yesterday) {
 }
 
 // Compare current campaign daily budgets against the per-day spend needed to
-// land exactly on budget. daysRemaining includes today (spend is through yesterday).
-function buildDailyBudgetRec(currentDaily, remaining, daysRemaining) {
+// land under budget. daysRemaining includes today (spend is through yesterday).
+// `budget` (the total/sub-budget this remaining is measured against) is optional
+// for backward compatibility, but without it the safety margin can't be applied.
+function buildDailyBudgetRec(currentDaily, remaining, daysRemaining, budget) {
     if (currentDaily == null || daysRemaining == null || daysRemaining <= 0) return null;
-    const needed = Math.round((remaining / daysRemaining) * 100) / 100;
+    const safetyBuffer  = budget ? budget * (PACING_SAFETY_MARGIN_PCT / 100) : 0;
+    const safeRemaining = Math.max(remaining - safetyBuffer, 0);
+    const needed = Math.round((safeRemaining / daysRemaining) * 100) / 100;
     const out = {
         current_daily_budget: Math.round(currentDaily * 100) / 100,
         needed_per_day: needed,
@@ -272,13 +285,15 @@ function buildDailyBudgetRec(currentDaily, remaining, daysRemaining) {
     if (remaining <= 0) {
         out.recommendation = "BUDGET_EXHAUSTED — monthly budget already spent; pause campaigns or raise the budget.";
     } else if (currentDaily <= 0) {
-        out.recommendation = `NO_DAILY_BUDGETS — no enabled daily budgets found; set ~$${needed.toFixed(2)}/day to spend the remaining $${remaining.toFixed(2)}.`;
+        out.recommendation = needed > 0
+            ? `NO_DAILY_BUDGETS — no enabled daily budgets found; set ~$${needed.toFixed(2)}/day to spend the remaining $${remaining.toFixed(2)} (with a ${PACING_SAFETY_MARGIN_PCT}% safety buffer against overdelivery).`
+            : `NO_DAILY_BUDGETS — no enabled daily budgets found; remaining $${remaining.toFixed(2)} is within the ${PACING_SAFETY_MARGIN_PCT}% safety buffer, so no daily budget is recommended this close to the cap.`;
     } else {
         const diffPct = ((needed - currentDaily) / currentDaily) * 100;
-        if (Math.abs(diffPct) <= 10) {
-            out.recommendation = "ON_TRACK — current daily budgets land within ±10% of budget.";
+        if (Math.abs(diffPct) <= PACING_TOLERANCE_PCT) {
+            out.recommendation = `ON_TRACK — current daily budgets land within ±${PACING_TOLERANCE_PCT}% of a budget-safe pace.`;
         } else if (diffPct > 0) {
-            out.recommendation = `RAISE daily budgets $${currentDaily.toFixed(2)} → ~$${needed.toFixed(2)}/day (+${Math.round(diffPct)}%) to hit budget.`;
+            out.recommendation = `RAISE daily budgets $${currentDaily.toFixed(2)} → ~$${needed.toFixed(2)}/day (+${Math.round(diffPct)}%) to hit budget without exceeding it.`;
         } else {
             out.recommendation = `LOWER daily budgets $${currentDaily.toFixed(2)} → ~$${needed.toFixed(2)}/day (${Math.round(diffPct)}%) to avoid overspend.`;
         }
@@ -522,7 +537,7 @@ async function buildGoogleRows(defaultToken, pace_dom, dim, today, monthStart, y
             const pacing = getFlightPacing(spend, budget, info.flight_start, info.flight_end, yesterday);
             const row = { account: info.name, flight_spend: Math.round(spend * 100) / 100, ...pacing };
             if (budgets && pacing.days_remaining > 0) {
-                row.daily_budget = buildDailyBudgetRec(budgets.total, pacing.remaining, pacing.days_remaining);
+                row.daily_budget = buildDailyBudgetRec(budgets.total, pacing.remaining, pacing.days_remaining, budget);
             }
             return row;
         }
@@ -545,9 +560,9 @@ async function buildGoogleRows(defaultToken, pace_dom, dim, today, monthStart, y
                 },
             };
             if (budgets && budget) {
-                row.daily_budget = buildDailyBudgetRec(budgets.total, budget - total, daysLeft);
-                row.breakdown.nc.daily_budget    = buildDailyBudgetRec(budgets.nc,    ncBudget - nc,       daysLeft);
-                row.breakdown.other.daily_budget = buildDailyBudgetRec(budgets.other, otherBudget - other, daysLeft);
+                row.daily_budget = buildDailyBudgetRec(budgets.total, budget - total, daysLeft, budget);
+                row.breakdown.nc.daily_budget    = buildDailyBudgetRec(budgets.nc,    ncBudget - nc,       daysLeft, ncBudget);
+                row.breakdown.other.daily_budget = buildDailyBudgetRec(budgets.other, otherBudget - other, daysLeft, otherBudget);
             }
             return row;
         }
@@ -561,7 +576,7 @@ async function buildGoogleRows(defaultToken, pace_dom, dim, today, monthStart, y
             budget, ...getPacingLabel(spend, budget, pace_dom, dim),
         };
         if (budgets && budget) {
-            row.daily_budget = buildDailyBudgetRec(budgets.total, budget - spend, dim - pace_dom);
+            row.daily_budget = buildDailyBudgetRec(budgets.total, budget - spend, dim - pace_dom, budget);
         }
         return row;
     }));
@@ -582,7 +597,7 @@ async function buildMetaRows(pace_dom, dim, today, monthStart, yesterday) {
             const pacing = getFlightPacing(spend, budget, info.flight_start, info.flight_end, yesterday);
             const row = { account: info.name, flight_spend: Math.round(spend * 100) / 100, ...pacing };
             if (budgets && pacing.days_remaining > 0) {
-                row.daily_budget = buildDailyBudgetRec(budgets.total, pacing.remaining, pacing.days_remaining);
+                row.daily_budget = buildDailyBudgetRec(budgets.total, pacing.remaining, pacing.days_remaining, budget);
                 if (budgets.has_lifetime_budgets) row.daily_budget.note = "Some budgets are lifetime, not daily — current_daily_budget undercounts.";
             }
             return row;
@@ -597,7 +612,7 @@ async function buildMetaRows(pace_dom, dim, today, monthStart, yesterday) {
             budget, ...getPacingLabel(spend, budget, pace_dom, dim),
         };
         if (budgets && budget) {
-            row.daily_budget = buildDailyBudgetRec(budgets.total, budget - spend, dim - pace_dom);
+            row.daily_budget = buildDailyBudgetRec(budgets.total, budget - spend, dim - pace_dom, budget);
             if (row.daily_budget && budgets.has_lifetime_budgets) row.daily_budget.note = "Some budgets are lifetime, not daily — current_daily_budget undercounts.";
         }
         return row;
@@ -2932,11 +2947,11 @@ async function buildLinkedInRows(pace_dom, dim, today, monthStart, yesterday) {
                 if (error) row.api_error = error;
                 const db = await fetchLinkedInDailyBudgets(acctId);
                 const fp = getFlightPacing(spend, budget, info.flight_start, info.flight_end, yesterday);
-                row.daily_budget = { current_daily_budget: db.daily_total, needed_per_day: fp.needed_per_day, days_remaining: fp.days_remaining };
-                if (db.daily_total === 0 && db.campaigns > 0) row.daily_budget.recommendation = `NO_DAILY_BUDGETS — no enabled daily budgets found; set ~$${fp.needed_per_day.toFixed(2)}/day to spend the remaining $${row.remaining?.toFixed(2) || budget}.`;
-                else if (db.daily_total > fp.needed_per_day * 1.1) row.daily_budget.recommendation = `LOWER daily budgets $${db.daily_total.toFixed(2)} → ~$${fp.needed_per_day.toFixed(2)}/day to avoid overspend.`;
-                else if (db.daily_total < fp.needed_per_day * 0.9) row.daily_budget.recommendation = `RAISE daily budgets $${db.daily_total.toFixed(2)} → ~$${fp.needed_per_day.toFixed(2)}/day to hit budget.`;
-                else row.daily_budget.recommendation = "ON_TRACK — current daily budgets land within ±10% of budget.";
+                if (fp.days_remaining > 0) {
+                    row.daily_budget = buildDailyBudgetRec(db.daily_total, fp.remaining, fp.days_remaining, budget) || {};
+                } else {
+                    row.daily_budget = { current_daily_budget: db.daily_total, needed_per_day: fp.needed_per_day, days_remaining: fp.days_remaining };
+                }
                 if (db.note) row.daily_budget.note = db.note;
                 if (db.error) row.daily_budget.error = db.error;
                 return row;

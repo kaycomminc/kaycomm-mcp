@@ -1,6 +1,6 @@
 {
   "health_defaults": {
-    "pacing_tolerance_pct": 15,
+    "pacing_tolerance_pct": 5,
     "conversion_dry_spell_hours": 72,
     "cpa_tolerance_pct": 25,
     "roas_tolerance_pct": 20,
