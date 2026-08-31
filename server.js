@@ -1215,11 +1215,29 @@ async function createMetaCampaignFull(accountId, pageId, config, instagramAccoun
                         const thumbRes = await metaGet(adDef.video_id, { fields: "thumbnails" });
                         const thumbUrl = thumbRes.thumbnails?.data?.[0]?.uri;
                         if (thumbUrl) {
-                            const thumbImgRes = await metaPost(`${accountId}/adimages`, { url: thumbUrl });
-                            const imgData = thumbImgRes.images ? Object.values(thumbImgRes.images)[0] : thumbImgRes;
-                            videoThumbHash = imgData.hash;
+                            // Download thumbnail bytes ourselves — the CDN URL is signed
+                            // and Meta's adimages endpoint can't fetch it server-to-server.
+                            const imgResp = await fetchFn(thumbUrl);
+                            if (imgResp.ok) {
+                                const imgBuf = Buffer.from(await imgResp.arrayBuffer());
+                                const blob = new Blob([imgBuf]);
+                                const formData = new FormData();
+                                formData.append("access_token", META_ACCESS_TOKEN);
+                                formData.append("filename", blob, "thumbnail.jpg");
+                                const uploadResp = await fetchFn(
+                                    `https://graph.facebook.com/${META_API_VERSION}/${accountId}/adimages`,
+                                    { method: "POST", body: formData }
+                                );
+                                const uploadData = await uploadResp.json();
+                                if (!uploadData.error) {
+                                    const imgData = uploadData.images ? Object.values(uploadData.images)[0] : uploadData;
+                                    videoThumbHash = imgData.hash;
+                                }
+                            }
                         }
-                    } catch (_) { /* proceed without thumbnail — API may still accept */ }
+                    } catch (e) {
+                        results.debug.push({ step: "thumbnail_auto", video_id: adDef.video_id, error: e.message });
+                    }
                 }
                 storySpec = {
                     page_id: pageId,
@@ -5972,7 +5990,7 @@ function makeServer() {
                                                 description: "Call-to-action button (default: LEARN_MORE)",
                                             },
                                             url:        { type: "string", description: "Destination URL" },
-                                            image_hash: { type: "string", description: "Image hash from Media Library (use list_meta_media to find)" },
+                                            image_hash: { type: "string", description: "Image hash from Media Library (use list_meta_media to find). For video ads, used as the thumbnail — if omitted, the video's auto-generated thumbnail is fetched." },
                                             video_id:   { type: "string", description: "Video ID from Media Library (use list_meta_media to find)" },
                                             object_story_id: { type: "string", description: "Existing Page post ID (PAGE_ID_POST_ID) to promote as an ad. When set, primary_text/headline/url are not needed." },
                                             creative_id: { type: "string", description: "Existing creative ID to reuse. When set, no new creative is created — the ad references this creative directly." },
