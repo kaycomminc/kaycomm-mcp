@@ -1,6 +1,6 @@
 {
   "health_defaults": {
-    "pacing_tolerance_pct": 5,
+    "pacing_tolerance_pct": 15,
     "conversion_dry_spell_hours": 72,
     "cpa_tolerance_pct": 25,
     "roas_tolerance_pct": 20,
@@ -20,6 +20,14 @@
       "health": {
         "conversion_type": "sale"
       }
+    },
+    "1766078295": {
+      "name": "Denver Parade of Homes",
+      "budget": 6300,
+      "mcc": "7631184147",
+      "flight_start": "2026-07-23",
+      "flight_end": "2026-08-23",
+      "budget_schedule": []
     },
     "2275371078": {
       "name": "Childrens Therapy Services of Colorado",
@@ -58,7 +66,7 @@
     "4206275101": {
       "name": "La Loma",
       "budget": 1125,
-      "mcc": "7631184147"
+      "mcc": "4206275101"
     },
     "9547060400": {
       "name": "Eye Associates of NF",
@@ -182,6 +190,14 @@
       "flight_end": "2026-09-30",
       "page_id": "626075927259136"
     },
+    "act_1371124644901073": {
+      "name": "Denver Parade of Homes",
+      "budget": 11700,
+      "page_id": "121015354580784",
+      "flight_start": "2026-07-23",
+      "flight_end": "2026-08-23",
+      "budget_schedule": []
+    },
     "act_2983430398459267": {
       "name": "Florida State Guard",
       "budget": 19720,
@@ -191,9 +207,29 @@
       "health": {
         "frequency_cap": 3
       }
+    },
+    "act_293300855349374": {
+      "name": "Gulf Coast Land Sales",
+      "budget": 2000,
+      "page_id": "1243894692145685",
+      "flight_start": "2026-09-01",
+      "flight_end": "2026-09-30"
     }
   },
-  "stackadapt": {},
+  "stackadapt": {
+    "51727": {
+      "name": "TOC (StackAdapt)",
+      "budget": 0
+    },
+    "97806": {
+      "name": "Southern Quality Propane (StackAdapt)",
+      "budget": 0
+    },
+    "108228": {
+      "name": "Metro Electrical Services (StackAdapt)",
+      "budget": 0
+    }
+  },
   "linkedin": {
     "513144628": {
       "name": "Florida State Guard",
