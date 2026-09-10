@@ -15,14 +15,17 @@ function generateBillingSheet(targetMonth) {
   const daysInMonth = monthEnd.getDate();
 
   const monthName = monthStart.toLocaleString('en-US', { month: 'long' });
-  const invoiceDate = formatDate(monthEnd);
-  const dueDate = formatDate(new Date(year, month + 1, 30));
+  const defaultDay = billing.settings.default_invoice_day || 1;
+  const defaultInvoiceDate = new Date(year, month, defaultDay);
+  const defaultDueDate = addDays(defaultInvoiceDate, 30);
 
   const rows = [];
 
   for (const [key, client] of Object.entries(billing.clients)) {
     if (!client.active) continue;
     if (!client.line_items || client.line_items.length === 0) continue;
+
+    const { invoiceDate, dueDate } = getInvoiceDates(client, defaultInvoiceDate, defaultDueDate, year, month);
 
     if (client.billing_type === 'flighted') {
       const flightStart = new Date(client.flight_start);
@@ -78,6 +81,21 @@ function generateBillingSheet(targetMonth) {
   }
 
   return { rows, monthName, year, daysInMonth };
+}
+
+function addDays(d, days) {
+  const result = new Date(d);
+  result.setDate(result.getDate() + days);
+  return result;
+}
+
+function getInvoiceDates(client, defaultInvoiceDate, defaultDueDate, year, month) {
+  if (client.invoice_day) {
+    const invoiceDate = new Date(year, month, client.invoice_day);
+    const dueDate = addDays(invoiceDate, 30);
+    return { invoiceDate: formatDate(invoiceDate), dueDate: formatDate(dueDate) };
+  }
+  return { invoiceDate: formatDate(defaultInvoiceDate), dueDate: formatDate(defaultDueDate) };
 }
 
 function formatDate(d) {
