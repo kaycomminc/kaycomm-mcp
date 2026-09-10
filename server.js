@@ -1177,9 +1177,9 @@ async function createMetaCampaignFull(accountId, pageId, config, instagramAccoun
                 objective: config.objective,
                 status: "PAUSED",
                 special_ad_categories: config.special_ad_categories || [],
-                bid_strategy: config.campaign_bid_strategy || "LOWEST_COST_WITHOUT_CAP",
             };
             if (config.cbo) {
+                campaignBody.bid_strategy = config.campaign_bid_strategy || "LOWEST_COST_WITHOUT_CAP";
                 if (config.lifetime_budget) {
                     campaignBody.lifetime_budget = Math.round(config.lifetime_budget * 100);
                 } else {
