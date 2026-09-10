@@ -1,0 +1,165 @@
+{
+  "settings": {
+    "company": "Kay Communications, LLC",
+    "default_payment_terms": "Net 30",
+    "invoice_prefix": "",
+    "notes": ""
+  },
+  "clients": {
+    "woca": {
+      "customer": "Volume Nine",
+      "billing_type": "recurring",
+      "active": true,
+      "line_items": [],
+      "notes": "V9 subcontract — uploaded to WorkSuite"
+    },
+    "boulevard_carroll": {
+      "customer": "Volume Nine",
+      "billing_type": "recurring",
+      "active": true,
+      "line_items": [],
+      "notes": "V9 subcontract — uploaded to WorkSuite"
+    },
+    "charlies_soap": {
+      "customer": "Volume Nine",
+      "billing_type": "recurring",
+      "active": true,
+      "line_items": [],
+      "notes": "V9 subcontract — uploaded to WorkSuite"
+    },
+    "ctc": {
+      "customer": "Volume Nine",
+      "billing_type": "recurring",
+      "active": true,
+      "line_items": [],
+      "notes": "V9 subcontract — uploaded to WorkSuite"
+    },
+    "nationwide_sw": {
+      "customer": "Volume Nine",
+      "billing_type": "recurring",
+      "active": true,
+      "line_items": [],
+      "notes": "V9 subcontract — uploaded to WorkSuite"
+    },
+    "enzoic": {
+      "customer": "Volume Nine",
+      "billing_type": "recurring",
+      "active": true,
+      "line_items": [],
+      "notes": "V9 subcontract — uploaded to WorkSuite"
+    },
+    "otb": {
+      "customer": "Volume Nine",
+      "billing_type": "recurring",
+      "active": true,
+      "line_items": [],
+      "notes": "V9 subcontract — uploaded to WorkSuite"
+    },
+    "spartan_exteriors": {
+      "customer": "Volume Nine",
+      "billing_type": "recurring",
+      "active": true,
+      "line_items": [],
+      "notes": "V9 subcontract — uploaded to WorkSuite"
+    },
+    "alderwood": {
+      "customer": "Volume Nine",
+      "billing_type": "recurring",
+      "active": true,
+      "line_items": [],
+      "notes": "V9 subcontract — uploaded to WorkSuite"
+    },
+    "la_loma": {
+      "customer": "Volume Nine",
+      "billing_type": "recurring",
+      "active": true,
+      "line_items": [],
+      "notes": "V9 subcontract — uploaded to WorkSuite"
+    },
+    "v9_general": {
+      "customer": "Volume Nine",
+      "billing_type": "recurring",
+      "active": true,
+      "line_items": [],
+      "notes": "V9 general monthly invoice"
+    },
+    "dpoh": {
+      "customer": "Volume Nine",
+      "billing_type": "flighted",
+      "active": true,
+      "flight_start": "2026-07-23",
+      "flight_end": "2026-08-23",
+      "line_items": [],
+      "notes": "V9 subcontract — flighted campaign, uploaded to WorkSuite"
+    },
+    "grova_creative": {
+      "customer": "G Williams",
+      "billing_type": "recurring",
+      "active": true,
+      "line_items": [],
+      "notes": "Direct client — QuickBooks"
+    },
+    "adele_creative": {
+      "customer": "Adele Creative",
+      "billing_type": "recurring",
+      "active": true,
+      "line_items": [],
+      "notes": "Direct client — QuickBooks"
+    },
+    "eye_associates": {
+      "customer": "Eye Associates of NF",
+      "billing_type": "recurring",
+      "active": true,
+      "line_items": [],
+      "notes": "Direct client — QuickBooks"
+    },
+    "digital_practice_growth": {
+      "customer": "Digital Practice Growth",
+      "billing_type": "recurring",
+      "active": true,
+      "line_items": [],
+      "notes": "Direct client — QuickBooks"
+    },
+    "axis_office": {
+      "customer": "Axis Office",
+      "billing_type": "recurring",
+      "active": true,
+      "line_items": [],
+      "notes": "Direct client — QuickBooks"
+    },
+    "famu": {
+      "customer": "FAMU Online",
+      "billing_type": "flighted",
+      "active": true,
+      "flight_start": "2026-09-01",
+      "flight_end": "2026-10-31",
+      "line_items": [],
+      "notes": "Direct client — flighted campaign"
+    },
+    "florida_state_guard": {
+      "customer": "Florida State Guard",
+      "billing_type": "flighted",
+      "active": true,
+      "flight_start": "2026-08-18",
+      "flight_end": "2027-01-01",
+      "line_items": [],
+      "notes": "Direct client — flighted campaign, multi-platform (Google + Meta + LinkedIn)"
+    },
+    "summit_express": {
+      "customer": "Summit Express",
+      "billing_type": "recurring",
+      "active": false,
+      "line_items": [],
+      "notes": "Budget currently $0 — paused"
+    },
+    "gulf_coast": {
+      "customer": "Gulf Coast Land Sales",
+      "billing_type": "flighted",
+      "active": true,
+      "flight_start": "2026-09-01",
+      "flight_end": "2026-09-30",
+      "line_items": [],
+      "notes": "Meta only — flighted campaign"
+    }
+  }
+}
