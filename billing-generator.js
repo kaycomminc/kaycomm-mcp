@@ -17,7 +17,8 @@ function generateBillingSheet(targetMonth) {
   const monthName = monthStart.toLocaleString('en-US', { month: 'long' });
   const defaultDay = billing.settings.default_invoice_day || 1;
   const defaultInvoiceDate = new Date(year, month, defaultDay);
-  const defaultDueDate = addDays(defaultInvoiceDate, 30);
+  const termsDays = parseInt((billing.settings.default_payment_terms || 'Net 15').replace(/\D/g, '')) || 15;
+  const defaultDueDate = addDays(defaultInvoiceDate, termsDays);
 
   const rows = [];
 
@@ -92,7 +93,8 @@ function addDays(d, days) {
 function getInvoiceDates(client, defaultInvoiceDate, defaultDueDate, year, month) {
   if (client.invoice_day) {
     const invoiceDate = new Date(year, month, client.invoice_day);
-    const dueDate = addDays(invoiceDate, 30);
+    const termsDays = parseInt((billing.settings.default_payment_terms || 'Net 15').replace(/\D/g, '')) || 15;
+    const dueDate = addDays(invoiceDate, termsDays);
     return { invoiceDate: formatDate(invoiceDate), dueDate: formatDate(dueDate) };
   }
   return { invoiceDate: formatDate(defaultInvoiceDate), dueDate: formatDate(defaultDueDate) };

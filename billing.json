@@ -1,7 +1,7 @@
 {
   "settings": {
     "company": "Kay Communications, LLC",
-    "default_payment_terms": "Net 30",
+    "default_payment_terms": "Net 15",
     "default_invoice_day": 1,
     "invoice_prefix": "",
     "notes": ""
