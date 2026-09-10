@@ -1116,6 +1116,39 @@ async function buildMetaTargetingSpec(targeting) {
 async function createMetaCampaignFull(accountId, pageId, config, instagramAccountId) {
     const results = { campaign: null, ad_sets: [], debug: [] };
 
+    // Auto-detect or create Instagram actor ID if not provided
+    if (!instagramAccountId && pageId) {
+        const sources = [
+            { endpoint: `${accountId}/instagram_accounts`, type: "ad_account_instagram" },
+            { endpoint: `${pageId}/page_backed_instagram_accounts`, type: "page_backed" },
+            { endpoint: `${pageId}/instagram_accounts`, type: "page_connected" },
+        ];
+        for (const src of sources) {
+            if (instagramAccountId) break;
+            try {
+                const res = await metaGet(src.endpoint);
+                if (res.data?.length) {
+                    instagramAccountId = res.data[0].id;
+                    results.debug.push({ step: "instagram_auto_detect", type: src.type, id: instagramAccountId });
+                }
+            } catch (e) {
+                results.debug.push({ step: "instagram_auto_detect", source: src.type, error: e.message });
+            }
+        }
+        // If still no IG account, try creating a Page-Backed Instagram Account
+        if (!instagramAccountId) {
+            try {
+                const createRes = await metaPost(`${pageId}/page_backed_instagram_accounts`, {});
+                if (createRes.id) {
+                    instagramAccountId = createRes.id;
+                    results.debug.push({ step: "instagram_pbia_created", id: instagramAccountId });
+                }
+            } catch (e) {
+                results.debug.push({ step: "instagram_pbia_create_failed", error: e.message });
+            }
+        }
+    }
+
     // Validate all budgets upfront
     const campaignBudgets = {};
     if (config.lifetime_budget) campaignBudgets.lifetime_budget = config.lifetime_budget;
@@ -1132,34 +1165,48 @@ async function createMetaCampaignFull(accountId, pageId, config, instagramAccoun
         if (adSetBudgetErrors) throw new Error(`Ad set "${adSet.name}" budget validation failed: ` + adSetBudgetErrors.join(" | "));
     }
 
-    try {
-        // Step 1: Create campaign
-        const campaignBody = {
-            name: config.campaign_name,
-            objective: config.objective,
-            status: "PAUSED",
-            special_ad_categories: config.special_ad_categories || [],
-            bid_strategy: config.campaign_bid_strategy || "LOWEST_COST_WITHOUT_CAP",
-        };
-        if (config.cbo) {
-            if (config.lifetime_budget) {
-                campaignBody.lifetime_budget = Math.round(config.lifetime_budget * 100);
+    if (config.existing_campaign_id) {
+        // Use existing campaign — skip creation
+        results.campaign = { id: config.existing_campaign_id, name: config.campaign_name || "(existing)", existing: true };
+        results.debug.push({ step: "campaign_reuse", id: config.existing_campaign_id });
+    } else {
+        try {
+            // Step 1: Create campaign
+            const campaignBody = {
+                name: config.campaign_name,
+                objective: config.objective,
+                status: "PAUSED",
+                special_ad_categories: config.special_ad_categories || [],
+                bid_strategy: config.campaign_bid_strategy || "LOWEST_COST_WITHOUT_CAP",
+            };
+            if (config.cbo) {
+                if (config.lifetime_budget) {
+                    campaignBody.lifetime_budget = Math.round(config.lifetime_budget * 100);
+                } else {
+                    campaignBody.daily_budget = Math.round(config.daily_budget * 100);
+                }
             } else {
-                campaignBody.daily_budget = Math.round(config.daily_budget * 100);
+                campaignBody.is_adset_budget_sharing_enabled = false;
             }
+            results.debug.push({ step: "campaign", body: campaignBody });
+            const campRes = await metaPost(`${accountId}/campaigns`, campaignBody);
+            results.campaign = { id: campRes.id, name: config.campaign_name };
+        } catch (e) {
+            e.message = `Campaign creation failed: ${e.message}`;
+            if (e.metaBody) e.message += ` | Request body: ${JSON.stringify(e.metaBody)}`;
+            throw e;
         }
-        results.debug.push({ step: "campaign", body: campaignBody });
-        const campRes = await metaPost(`${accountId}/campaigns`, campaignBody);
-        results.campaign = { id: campRes.id, name: config.campaign_name };
-    } catch (e) {
-        e.message = `Campaign creation failed: ${e.message}`;
-        if (e.metaBody) e.message += ` | Request body: ${JSON.stringify(e.metaBody)}`;
-        throw e;
     }
 
     // Step 2: Create ad sets + ads
     for (const adSetDef of (config.ad_sets || [])) {
-        const { spec: targetingSpec } = await buildMetaTargetingSpec(adSetDef.targeting || {});
+        // Support "existing:<adset_id>" in name to add ads to an existing ad set
+        const existingAdsetId = adSetDef.existing_adset_id || (adSetDef.name?.startsWith("existing:") ? adSetDef.name.split(":")[1] : null);
+        let targetingSpec = {};
+        if (!existingAdsetId) {
+            const built = await buildMetaTargetingSpec(adSetDef.targeting || {});
+            targetingSpec = built.spec;
+        }
 
         const adSetBody = {
             name: adSetDef.name,
@@ -1171,6 +1218,9 @@ async function createMetaCampaignFull(accountId, pageId, config, instagramAccoun
         };
         if (!config.cbo && adSetDef.daily_budget) {
             adSetBody.daily_budget = Math.round(adSetDef.daily_budget * 100);
+        }
+        if (!config.cbo && adSetDef.lifetime_budget) {
+            adSetBody.lifetime_budget = Math.round(adSetDef.lifetime_budget * 100);
         }
         if (adSetDef.bid_strategy) adSetBody.bid_strategy = adSetDef.bid_strategy;
         if (adSetDef.bid_amount)   adSetBody.bid_amount   = Math.round(adSetDef.bid_amount * 100);
@@ -1194,16 +1244,24 @@ async function createMetaCampaignFull(accountId, pageId, config, instagramAccoun
             }
         }
 
-        let adSetRes;
-        try {
-            results.debug.push({ step: "adset", name: adSetDef.name, body: adSetBody });
-            adSetRes = await metaPost(`${accountId}/adsets`, adSetBody);
-        } catch (e) {
-            e.message = `Ad set "${adSetDef.name}" creation failed: ${e.message}`;
-            if (e.metaBody) e.message += ` | Request body: ${JSON.stringify(e.metaBody)}`;
-            throw e;
+        let adSetId;
+        if (existingAdsetId) {
+            // Use existing ad set — skip creation
+            adSetId = existingAdsetId;
+            results.debug.push({ step: "adset_reuse", name: adSetDef.name, id: adSetId });
+        } else {
+            let adSetRes;
+            try {
+                results.debug.push({ step: "adset", name: adSetDef.name, body: adSetBody });
+                adSetRes = await metaPost(`${accountId}/adsets`, adSetBody);
+            } catch (e) {
+                e.message = `Ad set "${adSetDef.name}" creation failed: ${e.message}`;
+                if (e.metaBody) e.message += ` | Request body: ${JSON.stringify(e.metaBody)}`;
+                throw e;
+            }
+            adSetId = adSetRes.id;
         }
-        const adSetResult = { name: adSetDef.name, id: adSetRes.id, ads: [] };
+        const adSetResult = { name: adSetDef.name, id: adSetId, ads: [], existing: !!existingAdsetId };
 
         // Step 3: Create ads (creative + ad for each)
         for (const adDef of (adSetDef.ads || [])) {
@@ -1310,7 +1368,7 @@ async function createMetaCampaignFull(accountId, pageId, config, instagramAccoun
             }
 
             try {
-                const adBody = { name: adDef.name, adset_id: adSetRes.id, creative: { creative_id: finalCreativeId }, status: "PAUSED" };
+                const adBody = { name: adDef.name, adset_id: adSetId, creative: { creative_id: finalCreativeId }, status: "PAUSED" };
                 results.debug.push({ step: "ad", name: adDef.name, body: adBody });
                 const adRes = await metaPost(`${accountId}/ads`, adBody);
                 adSetResult.ads.push({ name: adDef.name, ad_id: adRes.id, creative_id: finalCreativeId });
@@ -5903,6 +5961,7 @@ function makeServer() {
                 type: "object",
                 properties: {
                     account_name:  { type: "string", description: "Client name (partial match ok)" },
+                    existing_campaign_id: { type: "string", description: "Existing campaign ID to add ad sets/ads into (skip campaign creation). When set, campaign_name/objective/budget are optional." },
                     campaign_name: { type: "string", description: "Name for the new campaign" },
                     objective: {
                         type: "string",
@@ -5925,7 +5984,9 @@ function makeServer() {
                             type: "object",
                             properties: {
                                 name:         { type: "string", description: "Ad set name" },
+                                existing_adset_id: { type: "string", description: "Existing ad set ID to add ads into (skip ad set creation). When set, targeting/budget/etc are ignored." },
                                 daily_budget: { type: "number", description: "Ad set daily budget in dollars (only when CBO is off)" },
+                                lifetime_budget: { type: "number", description: "Ad set lifetime budget in dollars (only when CBO is off). Requires end_time." },
                                 optimization_goal: {
                                     type: "string",
                                     enum: ["LINK_CLICKS", "LANDING_PAGE_VIEWS", "IMPRESSIONS", "REACH", "LEAD_GENERATION", "OFFSITE_CONVERSIONS"],
@@ -6004,7 +6065,7 @@ function makeServer() {
                     },
                     confirm: { type: "boolean", description: "Set true to create. Omit for dry-run preview." },
                 },
-                required: ["account_name", "campaign_name", "objective", "ad_sets"],
+                required: ["account_name", "ad_sets"],
             },
         },
         {
@@ -7696,7 +7757,8 @@ async function handleToolCall(name, args = {}) {
     } else if (name === "health_check") {
         const checks = {};
 
-        // Google: token refresh + a trivial query against the first account
+        // Google: token refresh + a trivial query against the default token,
+        // then verify each account that uses a separate refresh token.
         const [firstCid, firstInfo] = Object.entries(GOOGLE_ACCOUNTS)[0];
         const { token, error: gErr } = await getGoogleAccessToken(firstCid);
         if (gErr) {
@@ -7708,6 +7770,25 @@ async function handleToolCall(name, args = {}) {
                 checks.google = { status: "✅ OK", note: "Token refresh and API query both working." };
             } catch (e) {
                 checks.google = { status: "⚠️ TOKEN OK, QUERY FAILING", error: e.message };
+            }
+        }
+
+        // Check accounts with separate refresh tokens (refresh_token_env)
+        const altTokenAccounts = Object.entries(GOOGLE_ACCOUNTS).filter(([, info]) => info.refresh_token_env);
+        if (altTokenAccounts.length) {
+            checks.google_alt_tokens = {};
+            for (const [cid, info] of altTokenAccounts) {
+                const { token: t, error: tErr } = await getGoogleAccessToken(cid);
+                if (tErr) {
+                    checks.google_alt_tokens[info.name] = { status: "❌ FAILING", env: info.refresh_token_env, error: tErr };
+                } else {
+                    try {
+                        await googleSearch(t, cid, info.mcc, "SELECT customer.id FROM customer LIMIT 1");
+                        checks.google_alt_tokens[info.name] = { status: "✅ OK", env: info.refresh_token_env };
+                    } catch (e) {
+                        checks.google_alt_tokens[info.name] = { status: "⚠️ TOKEN OK, QUERY FAILING", env: info.refresh_token_env, error: e.message };
+                    }
+                }
             }
         }
 
@@ -9078,9 +9159,15 @@ async function handleToolCall(name, args = {}) {
         const confirm = !!args.confirm;
         const cbo     = args.cbo !== false;
 
-        if (!args.campaign_name || !args.objective || (!args.daily_budget && !args.lifetime_budget) || !args.ad_sets?.length) {
-            result = { error: "campaign_name, objective, daily_budget or lifetime_budget, and at least one ad_set are required." };
-        } else if (args.daily_budget < 1) {
+        // Support "existing:<campaign_id>" in campaign_name to add ads to an existing campaign
+        const existingCampaignId = args.existing_campaign_id || (args.campaign_name?.startsWith("existing:") ? args.campaign_name.split(":")[1] : null);
+        const isExisting = !!existingCampaignId;
+        const needsCampaignBudget = cbo && !isExisting;
+        if (!isExisting && (!args.campaign_name || !args.objective || (needsCampaignBudget && !args.daily_budget && !args.lifetime_budget))) {
+            result = { error: "campaign_name, objective, daily_budget or lifetime_budget are required (or pass existing_campaign_id to add to an existing campaign). When cbo=false, budget is set per ad set instead." };
+        } else if (!args.ad_sets?.length) {
+            result = { error: "At least one ad_set is required." };
+        } else if (needsCampaignBudget && args.daily_budget < 1) {
             result = { error: "daily_budget must be at least $1.00 (Meta minimum)." };
         } else {
             const acctMatch = Object.entries(META_ACCOUNTS).find(([, info]) => info.name.toLowerCase().includes(search));
@@ -9132,6 +9219,7 @@ async function handleToolCall(name, args = {}) {
                                     name: adSetDef.name,
                                     optimization_goal: adSetDef.optimization_goal || "LINK_CLICKS",
                                     daily_budget: !cbo && adSetDef.daily_budget ? `$${adSetDef.daily_budget.toFixed(2)}` : "(CBO)",
+                                    lifetime_budget: !cbo && adSetDef.lifetime_budget ? `$${adSetDef.lifetime_budget.toFixed(2)}` : undefined,
                                     bid_strategy: adSetDef.bid_strategy || "(campaign default)",
                                     bid_amount: adSetDef.bid_amount ? `$${adSetDef.bid_amount.toFixed(2)}` : null,
                                     roas_control: adSetDef.roas_control || null,
@@ -9155,12 +9243,15 @@ async function handleToolCall(name, args = {}) {
                                 account: acctInfo.name,
                                 page_id: pageId,
                                 planned: {
-                                    campaign: {
-                                        name: args.campaign_name,
-                                        objective: args.objective,
-                                        daily_budget: `$${args.daily_budget.toFixed(2)}`,
-                                        cbo,
-                                    },
+                                    campaign: existingCampaignId
+                                        ? { existing_id: existingCampaignId, note: "Adding ads to existing campaign" }
+                                        : {
+                                            name: args.campaign_name,
+                                            objective: args.objective,
+                                            daily_budget: args.daily_budget ? `$${args.daily_budget.toFixed(2)}` : undefined,
+                                            lifetime_budget: args.lifetime_budget ? `$${args.lifetime_budget.toFixed(2)}` : undefined,
+                                            cbo,
+                                        },
                                     ad_sets: adSetPreviews,
                                 },
                             };
@@ -9168,6 +9259,7 @@ async function handleToolCall(name, args = {}) {
                         } else {
                             // Confirmed — create everything
                             const config = {
+                                existing_campaign_id: existingCampaignId,
                                 campaign_name: args.campaign_name,
                                 objective: args.objective,
                                 daily_budget: args.daily_budget,
