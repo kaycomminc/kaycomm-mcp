@@ -167,8 +167,6 @@
       "name": "PHQ",
       "budget": 765,
       "mcc": "8621281595",
-      "flight_start": "2026-09-10",
-      "flight_end": "2027-05-01",
       "health": {
         "conversion_type": "lead"
       }
@@ -228,8 +226,6 @@
     "act_547352620606461": {
       "name": "PHQ",
       "budget": 510,
-      "flight_start": "2026-09-10",
-      "flight_end": "2027-05-01",
       "page_id": "513620928749165"
     }
   },
