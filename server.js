@@ -964,13 +964,15 @@ async function getMetaPixels(accountId) {
 async function getMetaCreativeDetails(creativeIds) {
     const results = [];
     for (const cid of creativeIds) {
-        const data = await metaGet(cid, { fields: "id,name,object_story_id,object_story_spec,call_to_action_type" });
+        const data = await metaGet(cid, { fields: "id,name,object_story_id,object_story_spec,call_to_action_type,url_tags,asset_feed_spec" });
         results.push({
             id: data.id,
             name: data.name,
             object_story_id: data.object_story_id || null,
             call_to_action_type: data.call_to_action_type || null,
+            url_tags: data.url_tags || null,
             object_story_spec: data.object_story_spec || null,
+            asset_feed_spec: data.asset_feed_spec || null,
         });
     }
     return results;
@@ -1159,6 +1161,8 @@ async function buildMetaTargetingSpec(targeting) {
     return { spec, warnings };
 }
 
+const DEFAULT_META_URL_TAGS = "utm_source=facebook&utm_medium=paid_social&utm_campaign={{campaign.name}}&utm_term={{adset.name}}&utm_content={{ad.name}}&placement={{placement}}";
+
 async function createMetaCampaignFull(accountId, pageId, config, instagramAccountId) {
     const results = { campaign: null, ad_sets: [], debug: [] };
 
@@ -1276,7 +1280,6 @@ async function createMetaCampaignFull(accountId, pageId, config, instagramAccoun
         if (adSetDef.daily_min_spend_target) adSetBody.daily_min_spend_target = Math.round(adSetDef.daily_min_spend_target * 100);
         if (adSetDef.daily_spend_cap) adSetBody.daily_spend_cap = Math.round(adSetDef.daily_spend_cap * 100);
         if (adSetDef.is_dynamic_creative) adSetBody.is_dynamic_creative = true;
-        if (adSetDef.url_tags) adSetBody.url_tags = adSetDef.url_tags;
         if (adSetDef.promoted_object) {
             adSetBody.promoted_object = adSetDef.promoted_object;
         } else if (adSetBody.optimization_goal === "OFFSITE_CONVERSIONS") {
@@ -1391,35 +1394,36 @@ async function createMetaCampaignFull(accountId, pageId, config, instagramAccoun
                 if (adDef.image_hash) storySpec.link_data.image_hash = adDef.image_hash;
             }
 
-            if (instagramAccountId) storySpec.instagram_actor_id = instagramAccountId;
+            if (instagramAccountId) storySpec.instagram_user_id = instagramAccountId;
 
-            let finalCreativeId;
+            // Creative is embedded inline on the ad call (not created standalone and
+            // swapped in) so Ads Manager's edit form shows headline/description.
+            let creative;
             if (adDef.creative_id) {
-                finalCreativeId = adDef.creative_id;
+                creative = { creative_id: adDef.creative_id };
                 results.debug.push({ step: "creative_reuse", name: adDef.name, creative_id: adDef.creative_id });
             } else {
-                let creativeRes;
-                try {
-                    const creativeBody = adDef.object_story_id
-                        ? { name: `${adDef.name} Creative`, object_story_id: adDef.object_story_id }
-                        : { name: `${adDef.name} Creative`, object_story_spec: storySpec };
-                    creativeBody.contextual_multi_ads = JSON.stringify({ enroll_status: "OPT_OUT" });
-                    if (adDef.lead_gen_form_id) creativeBody.lead_gen_form_id = adDef.lead_gen_form_id;
-                    results.debug.push({ step: "creative", name: adDef.name, body: creativeBody });
-                    creativeRes = await metaPost(`${accountId}/adcreatives`, creativeBody);
-                } catch (e) {
-                    e.message = `Creative "${adDef.name}" creation failed: ${e.message}`;
-                    if (e.metaBody) e.message += ` | Request body: ${JSON.stringify(e.metaBody)}`;
-                    throw e;
-                }
-                finalCreativeId = creativeRes.id;
+                creative = adDef.object_story_id
+                    ? { name: `${adDef.name} Creative`, object_story_id: adDef.object_story_id }
+                    : { name: `${adDef.name} Creative`, object_story_spec: storySpec };
+                creative.contextual_multi_ads = JSON.stringify({ enroll_status: "OPT_OUT" });
+                creative.url_tags = adDef.url_tags || adSetDef.url_tags || DEFAULT_META_URL_TAGS;
+                if (adDef.lead_gen_form_id) creative.lead_gen_form_id = adDef.lead_gen_form_id;
             }
 
             try {
-                const adBody = { name: adDef.name, adset_id: adSetId, creative: { creative_id: finalCreativeId }, status: "PAUSED" };
+                const adBody = { name: adDef.name, adset_id: adSetId, creative, status: "PAUSED" };
                 results.debug.push({ step: "ad", name: adDef.name, body: adBody });
                 const adRes = await metaPost(`${accountId}/ads`, adBody);
-                adSetResult.ads.push({ name: adDef.name, ad_id: adRes.id, creative_id: finalCreativeId });
+                let finalCreativeId = adDef.creative_id;
+                if (!finalCreativeId) {
+                    try {
+                        finalCreativeId = (await metaGet(adRes.id, { fields: "creative" })).creative?.id;
+                    } catch (e) {
+                        results.debug.push({ step: "creative_lookup", ad_id: adRes.id, error: e.message });
+                    }
+                }
+                adSetResult.ads.push({ name: adDef.name, ad_id: adRes.id, creative_id: finalCreativeId, url_tags: creative.url_tags });
             } catch (e) {
                 e.message = `Ad "${adDef.name}" creation failed: ${e.message}`;
                 if (e.metaBody) e.message += ` | Request body: ${JSON.stringify(e.metaBody)}`;
@@ -6174,6 +6178,7 @@ function makeServer() {
                                             video_id:   { type: "string", description: "Video ID from Media Library (use list_meta_media to find)" },
                                             object_story_id: { type: "string", description: "Existing Page post ID (PAGE_ID_POST_ID) to promote as an ad. When set, primary_text/headline/url are not needed." },
                                             creative_id: { type: "string", description: "Existing creative ID to reuse. When set, no new creative is created — the ad references this creative directly." },
+                                            url_tags: { type: "string", description: "UTM query string appended to the destination URL, e.g. 'utm_source=facebook&utm_medium=paid_social&utm_campaign={{campaign.name}}&utm_content={{ad.name}}'. Falls back to the ad set's url_tags, then a default with {{campaign.name}}/{{adset.name}}/{{ad.name}}/{{placement}} macros." },
                                         },
                                         required: ["name"],
                                     },
