@@ -164,12 +164,31 @@ const WRITE_LOG_FILE = process.env.WRITE_LOG_FILE || path.join(__dirname, "write
 function logWriteAction(tool, args, result) {
     try {
         const entry = {
-            ts:   new Date().toISOString(),
+            ts:      new Date().toISOString(),
             tool,
-            args: Object.fromEntries(Object.entries(args || {}).filter(([k]) => k !== "confirm")),
-            ok:   !(result && result.error),
+            args:    Object.fromEntries(Object.entries(args || {}).filter(([k]) => k !== "confirm")),
+            ok:      !(result && result.error),
+            account: args?.account_name || args?.name || null,
         };
         if (result?.error) entry.error = result.error;
+        if (result?.code) entry.code = result.code;
+
+        // Capture summary of result, if object
+        if (result && typeof result === "object" && !result.error) {
+            const summaryKeys = ["account", "campaign", "ad_group", "updated", "resource_name", "resource_names",
+                                 "previous", "previous_budget", "old_budget", "new_budget", "message"];
+            const summary = {};
+            for (const key of summaryKeys) {
+                if (key in result) {
+                    let val = result[key];
+                    // Truncate strings to 300 chars
+                    if (typeof val === "string" && val.length > 300) val = val.substring(0, 300);
+                    summary[key] = val;
+                }
+            }
+            if (Object.keys(summary).length > 0) entry.summary = summary;
+        }
+
         fs.appendFileSync(WRITE_LOG_FILE, JSON.stringify(entry) + "\n");
     } catch (_) { /* logging must never break a write */ }
 }
@@ -185,7 +204,7 @@ function readWriteLog({ days = 30, account_name, tool, limit = 50 } = {}) {
         try { e = JSON.parse(line); } catch (_) { continue; }
         if (e.ts < cutoff) continue;
         if (tool && e.tool !== tool) continue;
-        if (search && !(e.args?.account_name || e.args?.name || "").toLowerCase().includes(search)) continue;
+        if (search && !((e.account || e.args?.account_name || e.args?.name || "").toLowerCase().includes(search))) continue;
         entries.push(e);
     }
     return entries.slice(-limit).reverse(); // newest first
