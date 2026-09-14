@@ -1357,6 +1357,8 @@ async function createMetaCampaignFull(accountId, pageId, config, instagramAccoun
                     const creativeBody = adDef.object_story_id
                         ? { name: `${adDef.name} Creative`, object_story_id: adDef.object_story_id }
                         : { name: `${adDef.name} Creative`, object_story_spec: storySpec };
+                    creativeBody.contextual_multi_ads = JSON.stringify({ enroll_status: "OPT_OUT" });
+                    if (adDef.lead_gen_form_id) creativeBody.lead_gen_form_id = adDef.lead_gen_form_id;
                     results.debug.push({ step: "creative", name: adDef.name, body: creativeBody });
                     creativeRes = await metaPost(`${accountId}/adcreatives`, creativeBody);
                 } catch (e) {
@@ -3234,7 +3236,7 @@ async function fetchAdDisapprovals(token, customerId, mccId) {
         FROM ad_group_ad
         WHERE ad_group_ad.status != 'REMOVED'
           AND campaign.status = 'ENABLED'
-          AND ad_group.status != 'REMOVED'`);
+          AND ad_group.status = 'ENABLED'`);
     return rows
         .filter(r => (r.adGroupAd.policySummary?.approvalStatus || "APPROVED") !== "APPROVED")
         .map(r => ({
@@ -4111,6 +4113,8 @@ async function fetchChangeHistory(token, customerId, mccId, days, resourceType) 
                change_event.change_resource_type,
                change_event.resource_change_operation,
                change_event.changed_fields,
+               change_event.user_email,
+               change_event.client_type,
                change_event.campaign,
                change_event.ad_group
         FROM change_event
@@ -4124,6 +4128,8 @@ async function fetchChangeHistory(token, customerId, mccId, days, resourceType) 
             resource_type:  e.changeResourceType,
             operation:      e.resourceChangeOperation,
             changed_fields: e.changedFields || null,
+            user_email:     e.userEmail || null,
+            client_type:    e.clientType || null,
             campaign:       e.campaign  || null,
             ad_group:       e.adGroup   || null,
         };
@@ -6408,15 +6414,29 @@ function makeServer() {
         },
         {
             name: "manage_meta_leads",
-            description: "List lead forms on a Facebook Page, or retrieve leads from a lead form. " +
-                "Use to check lead gen form setup or download lead data.",
+            description: "List lead forms on a Facebook Page, retrieve leads from a form, or create a new Instant Form (lead gen form). " +
+                "Use to check lead gen form setup, download lead data, or build on-platform lead capture.",
             inputSchema: {
                 type: "object",
                 properties: {
                     account_name: { type: "string", description: "Meta account name (partial match ok) — used to find the page_id" },
-                    action: { type: "string", enum: ["list_forms", "get_leads"], description: "Action to perform" },
+                    action: { type: "string", enum: ["list_forms", "get_leads", "create_form"], description: "Action to perform" },
                     form_id: { type: "string", description: "Lead form ID — required for get_leads" },
                     limit: { type: "number", description: "Max leads to return (default: 100)" },
+                    form_name: { type: "string", description: "create_form: display name for the form" },
+                    questions: {
+                        type: "array",
+                        description: "create_form: array of question objects. Prefill fields use {type:'FULL_NAME'|'EMAIL'|'PHONE'}. " +
+                            "Custom questions use {type:'CUSTOM', key:'unique_key', label:'Question text', options:[{value:'Option 1'},{value:'Option 2'}]} for dropdowns, " +
+                            "or omit options for free text.",
+                        items: { type: "object" },
+                    },
+                    privacy_policy_url: { type: "string", description: "create_form: required URL to the privacy policy page" },
+                    thank_you_page: {
+                        type: "object",
+                        description: "create_form: optional thank-you screen config {title, body, button_text, button_url}",
+                    },
+                    confirm: { type: "boolean", description: "Set true to create. Omit for dry-run preview." },
                 },
                 required: ["account_name", "action"],
             },
@@ -7705,22 +7725,19 @@ async function handleToolCall(name, args = {}) {
         const errors   = [];
 
         if (platform === "google" || platform === "both") {
-            const firstCid = Object.keys(GOOGLE_ACCOUNTS)[0];
-            const { token, error: authErr } = await getGoogleAccessToken(firstCid);
-            if (authErr) { errors.push(`Google auth: ${authErr}`); }
-            else {
-                for (const [cid, info] of Object.entries(GOOGLE_ACCOUNTS)) {
-                    if (info.flight_end && info.flight_end < yesterday) continue; // flight over — spend stopping is expected
-                    try {
-                        const [byDate, zeroImp] = await Promise.all([
-                            fetchGoogleDailySpend(token, cid, info.mcc, start8, yesterday),
-                            fetchZeroImpressionCampaigns(token, cid, info.mcc, yesterday),
-                        ]);
-                        const anomaly = detectSpendAnomaly(byDate, yesterday);
-                        if (anomaly) flags.push({ platform: "Google", account: info.name, ...anomaly });
-                        if (zeroImp.length) flags.push({ platform: "Google", account: info.name, type: "ZERO_IMPRESSIONS_YESTERDAY", campaigns: zeroImp });
-                    } catch (e) { errors.push(`${info.name} (Google): ${e.message}`); }
-                }
+            for (const [cid, info] of Object.entries(GOOGLE_ACCOUNTS)) {
+                if (info.flight_end && info.flight_end < yesterday) continue; // flight over — spend stopping is expected
+                try {
+                    const { token, error: authErr } = await getGoogleAccessToken(cid);
+                    if (authErr) { errors.push(`${info.name} (Google): Auth: ${authErr}`); continue; }
+                    const [byDate, zeroImp] = await Promise.all([
+                        fetchGoogleDailySpend(token, cid, info.mcc, start8, yesterday),
+                        fetchZeroImpressionCampaigns(token, cid, info.mcc, yesterday),
+                    ]);
+                    const anomaly = detectSpendAnomaly(byDate, yesterday);
+                    if (anomaly) flags.push({ platform: "Google", account: info.name, ...anomaly });
+                    if (zeroImp.length) flags.push({ platform: "Google", account: info.name, type: "ZERO_IMPRESSIONS_YESTERDAY", campaigns: zeroImp });
+                } catch (e) { errors.push(`${info.name} (Google): ${e.message}`); }
             }
         }
 
@@ -10639,15 +10656,16 @@ async function handleToolCall(name, args = {}) {
             for (const [accountId, info] of targets) {
                 try {
                     const ads = await metaGetAll(`${metaActId(accountId)}/ads`, {
-                        fields: "id,name,status,effective_status,ad_review_feedback,campaign{name}",
+                        fields: "id,name,status,effective_status,ad_review_feedback,campaign{name},adset{effective_status}",
                         filtering: JSON.stringify([{ field: "effective_status", operator: "IN", value: ["DISAPPROVED", "PENDING_REVIEW", "WITH_ISSUES"] }]),
                     });
-                    if (ads.length) {
-                        totalIssues += ads.length;
+                    const activeAds = ads.filter(a => a.adset?.effective_status === "ACTIVE");
+                    if (activeAds.length) {
+                        totalIssues += activeAds.length;
                         accounts.push({
                             account: info.name,
-                            issue_count: ads.length,
-                            ads: ads.map(a => ({
+                            issue_count: activeAds.length,
+                            ads: activeAds.map(a => ({
                                 id: a.id, name: a.name, status: a.status,
                                 effective_status: a.effective_status,
                                 campaign: a.campaign?.name,
@@ -10914,8 +10932,58 @@ async function handleToolCall(name, args = {}) {
                                 })),
                             };
                         }
+                    } else if (args.action === "create_form") {
+                        if (!pageId) { result = { error: `No page_id configured for '${info.name}'.` }; }
+                        else if (!args.form_name) { result = { error: "form_name is required for create_form." }; }
+                        else if (!args.questions || !args.questions.length) { result = { error: "questions array is required for create_form." }; }
+                        else if (!args.privacy_policy_url) { result = { error: "privacy_policy_url is required for create_form." }; }
+                        else {
+                            const formQuestions = args.questions.map(q => {
+                                if (q.type === "FULL_NAME" || q.type === "EMAIL" || q.type === "PHONE" || q.type === "CITY" || q.type === "STATE" || q.type === "ZIP") {
+                                    return { type: q.type };
+                                }
+                                const cq = { type: "CUSTOM", key: q.key, label: q.label };
+                                if (q.options && q.options.length) cq.options = q.options;
+                                return cq;
+                            });
+                            const followUpUrl = (args.thank_you_page && args.thank_you_page.website_url) || args.privacy_policy_url;
+                            const formBody = {
+                                name: args.form_name,
+                                questions: JSON.stringify(formQuestions),
+                                privacy_policy: JSON.stringify({ url: args.privacy_policy_url }),
+                                follow_up_action_url: followUpUrl,
+                                locale: "EN_US",
+                            };
+                            if (args.thank_you_page) {
+                                formBody.thank_you_page = JSON.stringify({
+                                    title: args.thank_you_page.title || "Thank You!",
+                                    body: args.thank_you_page.body || "",
+                                    button_text: args.thank_you_page.button_text || "Visit Website",
+                                    button_type: "VIEW_WEBSITE",
+                                    website_url: args.thank_you_page.website_url || followUpUrl,
+                                });
+                            }
+                            if (args.confirm) {
+                                const created = await metaPost(`${pageId}/leadgen_forms`, formBody);
+                                result = {
+                                    account: info.name, page_id: pageId,
+                                    form_id: created.id, status: "created",
+                                    form_name: args.form_name,
+                                    questions: formQuestions,
+                                };
+                            } else {
+                                result = {
+                                    dry_run: true, account: info.name, page_id: pageId,
+                                    form_name: args.form_name,
+                                    questions: formQuestions,
+                                    privacy_policy_url: args.privacy_policy_url,
+                                    thank_you_page: args.thank_you_page || null,
+                                    note: "Set confirm=true to create the form.",
+                                };
+                            }
+                        }
                     } else {
-                        result = { error: `Unknown action '${args.action}'. Valid: list_forms, get_leads.` };
+                        result = { error: `Unknown action '${args.action}'. Valid: list_forms, get_leads, create_form.` };
                     }
                 } catch (e) { result = { error: e.message }; }
             }

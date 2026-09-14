@@ -6,8 +6,7 @@
  *
  * Exchanges the current META_ACCESS_TOKEN for a fresh ~60-day token
  * (grant_type=fb_exchange_token), verifies the new token works, writes it
- * into Claude Desktop's config, and prints it for pasting into
- * Railway → Variables.
+ * into Claude Desktop's config, and pushes it to Railway automatically.
  *
  * Needs META_APP_ID and META_APP_SECRET (Meta app → Settings → Basic) in
  * addition to the existing credentials — set them as env vars or add them
@@ -23,12 +22,13 @@
  *   2. node refresh-meta-token.js <paste-that-token>
  *
  * The script exchanges it for a long-lived (~60 day) token, verifies it,
- * updates Claude Desktop's config, and prints it for Railway.
+ * updates Claude Desktop's config, and pushes the new token to Railway.
  * health_check warns 14 days before expiry.
  */
 const os   = require("os");
 const fs   = require("fs");
 const path = require("path");
+const { execFileSync } = require("child_process");
 
 const CONFIG_PATH = path.join(os.homedir(), "Library", "Application Support", "Claude", "claude_desktop_config.json");
 
@@ -111,10 +111,40 @@ async function main() {
         console.log("Could not find the kaycomm-pacing env block in Claude Desktop's config — update META_ACCESS_TOKEN there manually.");
     }
 
-    // 4. Railway must be updated by hand
-    console.log("\nNow paste the new token into Railway → kaycomm-mcp → Variables → META_ACCESS_TOKEN:\n");
-    console.log(newToken);
-    console.log("\n(Railway restarts the service automatically when the variable is saved.)");
+    // 4. Push to Railway automatically
+    await syncToRailway({ META_ACCESS_TOKEN: newToken });
+}
+
+async function syncToRailway(vars) {
+    const railwayBin = findRailwayCli();
+    if (!railwayBin) {
+        console.log("\n⚠️  Railway CLI not found — update Railway variables manually:");
+        for (const [k, v] of Object.entries(vars)) console.log(`  ${k}=${v}`);
+        return;
+    }
+    for (const [key, value] of Object.entries(vars)) {
+        try {
+            execFileSync(railwayBin, ["variables", "set", `${key}=${value}`], {
+                cwd: __dirname,
+                stdio: ["ignore", "pipe", "pipe"],
+                timeout: 30_000,
+            });
+            console.log(`✅ Railway: ${key} updated`);
+        } catch (e) {
+            console.error(`❌ Railway: failed to set ${key} — ${e.stderr?.toString().trim() || e.message}`);
+            console.log(`   Manual fallback: railway variables set ${key}=<token>`);
+        }
+    }
+    console.log("Railway will auto-redeploy with the new variable(s).");
+}
+
+function findRailwayCli() {
+    for (const candidate of ["/opt/homebrew/bin/railway", "/usr/local/bin/railway"]) {
+        if (fs.existsSync(candidate)) return candidate;
+    }
+    try {
+        return execFileSync("which", ["railway"], { encoding: "utf8" }).trim() || null;
+    } catch { return null; }
 }
 
 main().catch(e => { console.error("ERROR:", e.message); process.exit(1); });
