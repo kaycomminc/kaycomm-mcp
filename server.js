@@ -210,6 +210,19 @@ function readWriteLog({ days = 30, account_name, tool, limit = 50 } = {}) {
     return entries.slice(-limit).reverse(); // newest first
 }
 
+// Exact name match wins; otherwise a unique substring match. Ambiguous → error.
+function resolveAccount(store, search) {
+    const s = (search || "").toLowerCase().trim();
+    if (!s) return { error: "account_name is required" };
+    const entries = Object.entries(store);
+    const exact = entries.filter(([, i]) => i.name.toLowerCase() === s);
+    if (exact.length === 1) return { match: exact[0] };
+    const partial = entries.filter(([, i]) => i.name.toLowerCase().includes(s));
+    if (partial.length === 1) return { match: partial[0] };
+    if (!partial.length) return { error: `No account matching '${search}'` };
+    return { error: `Ambiguous account '${search}' matches: ${partial.map(([, i]) => i.name).join(", ")} — use the exact name` };
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 // Resolve an account's budget (and nc_budget) for a given date, honoring an
@@ -6873,7 +6886,6 @@ async function handleToolCall(name, args = {}) {
         }
 
     } else if (name === "pause_campaign" || name === "enable_campaign") {
-        const search    = (args.account_name || "").toLowerCase();
         const campSearch = (args.campaign_name || "").toLowerCase();
         const platform  = args.platform || "google";
         const confirm   = !!args.confirm;
@@ -6881,8 +6893,8 @@ async function handleToolCall(name, args = {}) {
         const metaStatus = name === "pause_campaign" ? "PAUSED" : "ACTIVE";
 
         if (platform === "google") {
-            const match = Object.entries(GOOGLE_ACCOUNTS).find(([, i]) => i.name.toLowerCase().includes(search));
-            if (!match) { result = { error: `No Google account matching '${args.account_name}'` }; }
+            const { match, error: acctErr } = resolveAccount(GOOGLE_ACCOUNTS, args.account_name);
+            if (!match) { result = { error: acctErr }; }
             else {
                 const [cid, info] = match;
                 const { token, error: authErr } = await getGoogleAccessToken(cid);
@@ -6904,8 +6916,8 @@ async function handleToolCall(name, args = {}) {
             }
         } else {
             // Meta
-            const match = Object.entries(META_ACCOUNTS).find(([, i]) => i.name.toLowerCase().includes(search));
-            if (!match) { result = { error: `No Meta account matching '${args.account_name}'` }; }
+            const { match, error: acctErr } = resolveAccount(META_ACCOUNTS, args.account_name);
+            if (!match) { result = { error: acctErr }; }
             else {
                 const [accountId, info] = match;
                 try {
@@ -6964,7 +6976,6 @@ async function handleToolCall(name, args = {}) {
         }
 
     } else if (name === "pause_keyword" || name === "enable_keyword") {
-        const search     = (args.account_name || "").toLowerCase();
         const kwSearch   = (args.keyword_text || "").toLowerCase().trim();
         const campSearch = args.campaign_name ? args.campaign_name.toLowerCase() : null;
         const agSearch   = args.ad_group_name ? args.ad_group_name.toLowerCase() : null;
@@ -6973,9 +6984,9 @@ async function handleToolCall(name, args = {}) {
         const confirm    = !!args.confirm;
         const newStatus  = name === "pause_keyword" ? "PAUSED" : "ENABLED";
 
-        const match = Object.entries(GOOGLE_ACCOUNTS).find(([, i]) => i.name.toLowerCase().includes(search));
+        const { match, error: acctErr } = resolveAccount(GOOGLE_ACCOUNTS, args.account_name);
         if (!kwSearch) { result = { error: "keyword_text is required." }; }
-        else if (!match) { result = { error: `No Google account matching '${args.account_name}'` }; }
+        else if (!match) { result = { error: acctErr }; }
         else {
             const [cid, info] = match;
             const { token, error: authErr } = await getGoogleAccessToken(cid);
@@ -11231,6 +11242,7 @@ module.exports = {
     getPacingLabel, getFlightPacing, buildDailyBudgetRec, getDateInfo, getEffectiveBudget, pctChange,
     // Exported for tests
     clampTopN, shapeAgg, emptyAgg, addAgg, mergeAgg, listingCaseValueLabel, SHOPPING_GROUP_DIMENSIONS,
+    resolveAccount,
 };
 
 if (!process.env.MCP_TEST) main().catch(console.error);
