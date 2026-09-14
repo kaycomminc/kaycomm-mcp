@@ -6813,7 +6813,7 @@ async function handleToolCall(name, args = {}) {
 
         if (!keywords.length) { result = { error: "Provide at least one keyword." }; }
         else {
-            const match = Object.entries(GOOGLE_ACCOUNTS).find(([, i]) => i.name.toLowerCase().includes(search));
+            const match = resolveAccount(GOOGLE_ACCOUNTS, search).match;
             if (!match) { result = { error: `No Google account matching '${args.account_name}'` }; }
             else {
                 const [cid, info] = match;
@@ -6951,7 +6951,7 @@ async function handleToolCall(name, args = {}) {
         const confirm    = !!args.confirm;
         const newStatus  = name === "pause_ad_group" ? "PAUSED" : "ENABLED";
 
-        const match = Object.entries(GOOGLE_ACCOUNTS).find(([, i]) => i.name.toLowerCase().includes(search));
+        const match = resolveAccount(GOOGLE_ACCOUNTS, search).match;
         if (!match) { result = { error: `No Google account matching '${args.account_name}'` }; }
         else {
             const [cid, info] = match;
@@ -7091,7 +7091,7 @@ async function handleToolCall(name, args = {}) {
         } else if (dailyBudgetErrors) {
             result = { error: dailyBudgetErrors.join(" | ") };
         } else if (platform === "google") {
-            const match = Object.entries(GOOGLE_ACCOUNTS).find(([, i]) => i.name.toLowerCase().includes(search));
+            const match = resolveAccount(GOOGLE_ACCOUNTS, search).match;
             if (!match) { result = { error: `No Google account matching '${args.account_name}'` }; }
             else {
                 const [cid, info] = match;
@@ -7114,7 +7114,7 @@ async function handleToolCall(name, args = {}) {
             }
         } else {
             // Meta
-            const match = Object.entries(META_ACCOUNTS).find(([, i]) => i.name.toLowerCase().includes(search));
+            const match = resolveAccount(META_ACCOUNTS, search).match;
             if (!match) { result = { error: `No Meta account matching '${args.account_name}'` }; }
             else {
                 const [accountId, info] = match;
@@ -7377,7 +7377,7 @@ async function handleToolCall(name, args = {}) {
         const confirm = !!args.confirm;
         const level   = args.level || "adset";
 
-        const acctMatch = Object.entries(META_ACCOUNTS).find(([, info]) => info.name.toLowerCase().includes(search));
+        const acctMatch = resolveAccount(META_ACCOUNTS, search).match;
         if (!acctMatch) {
             result = { error: `No Meta account found matching '${args.account_name}'. Available: ${Object.values(META_ACCOUNTS).map(a => a.name).join(", ")}` };
         } else {
@@ -7623,7 +7623,7 @@ async function handleToolCall(name, args = {}) {
         const matchType = (args.match_type || "EXACT").toUpperCase();
         const confirm   = !!args.confirm;
 
-        const acctMatch = Object.entries(GOOGLE_ACCOUNTS).find(([, info]) => info.name.toLowerCase().includes(search));
+        const acctMatch = resolveAccount(GOOGLE_ACCOUNTS, search).match;
         if (!acctMatch) {
             result = { error: `No Google account found matching '${args.account_name}'` };
         } else {
@@ -8159,7 +8159,7 @@ async function handleToolCall(name, args = {}) {
         if (!args.ad_group_name) {
             result = { error: "ad_group_name is required." };
         } else {
-            const match = Object.entries(GOOGLE_ACCOUNTS).find(([, i]) => i.name.toLowerCase().includes(search));
+            const match = resolveAccount(GOOGLE_ACCOUNTS, search).match;
             if (!match) {
                 result = { error: `No Google account matching '${args.account_name}'` };
             } else {
@@ -8226,7 +8226,7 @@ async function handleToolCall(name, args = {}) {
         } else if (!keywords.length && !hasRsa) {
             result = { error: "Provide keywords, or headlines + descriptions + final_url for an RSA." };
         } else {
-            const match = Object.entries(GOOGLE_ACCOUNTS).find(([, i]) => i.name.toLowerCase().includes(search));
+            const match = resolveAccount(GOOGLE_ACCOUNTS, search).match;
             if (!match) {
                 result = { error: `No Google account matching '${args.account_name}'` };
             } else {
@@ -8341,7 +8341,7 @@ async function handleToolCall(name, args = {}) {
         const strategy   = (args.strategy || "").toUpperCase();
         const confirm    = !!args.confirm;
 
-        const match = Object.entries(GOOGLE_ACCOUNTS).find(([, i]) => i.name.toLowerCase().includes(search));
+        const match = resolveAccount(GOOGLE_ACCOUNTS, search).match;
         if (!match) {
             result = { error: `No Google account matching '${args.account_name}'` };
         } else {
@@ -8385,7 +8385,7 @@ async function handleToolCall(name, args = {}) {
         if (!args.campaign_name || !args.daily_budget || !args.ad_groups?.length || !args.geo_targets?.length) {
             result = { error: "campaign_name, daily_budget, at least one ad_group, and at least one geo_target are required." };
         } else {
-            const match = Object.entries(GOOGLE_ACCOUNTS).find(([, i]) => i.name.toLowerCase().includes(search));
+            const match = resolveAccount(GOOGLE_ACCOUNTS, search).match;
             if (!match) {
                 result = { error: `No Google account matching '${args.account_name}'` };
             } else {
@@ -8483,7 +8483,7 @@ async function handleToolCall(name, args = {}) {
         else if (!args.final_url) { result = { error: "final_url is required." }; }
         else if (!args.geo_targets?.length) { result = { error: "At least one geo_target is required." }; }
         else {
-            const match = Object.entries(GOOGLE_ACCOUNTS).find(([, i]) => i.name.toLowerCase().includes(search));
+            const match = resolveAccount(GOOGLE_ACCOUNTS, search).match;
             if (!match) {
                 result = { error: `No Google account matching '${args.account_name}'` };
             } else {
@@ -8564,7 +8564,7 @@ async function handleToolCall(name, args = {}) {
             if (missingVideo) {
                 result = { error: `Ad group '${missingVideo.name || "(unnamed)"}' is missing youtube_video or youtube_videos. Provide YouTube URLs, video IDs, or asset resource names.` };
             } else {
-                const match = Object.entries(GOOGLE_ACCOUNTS).find(([, i]) => i.name.toLowerCase().includes(search));
+                const match = resolveAccount(GOOGLE_ACCOUNTS, search).match;
                 if (!match) {
                     result = { error: `No Google account matching '${args.account_name}'` };
                 } else {
@@ -8635,7 +8635,7 @@ async function handleToolCall(name, args = {}) {
         const headlines  = args.headlines  || null;
         const descs      = args.descriptions || null;
 
-        const match = Object.entries(GOOGLE_ACCOUNTS).find(([, i]) => i.name.toLowerCase().includes(search));
+        const match = resolveAccount(GOOGLE_ACCOUNTS, search).match;
         if (!match) {
             result = { error: `No Google account matching '${args.account_name}'` };
         } else {
@@ -8700,7 +8700,7 @@ async function handleToolCall(name, args = {}) {
         const confirm    = !!args.confirm;
         const newUrl     = args.final_url || null;
 
-        const match = Object.entries(GOOGLE_ACCOUNTS).find(([, i]) => i.name.toLowerCase().includes(search));
+        const match = resolveAccount(GOOGLE_ACCOUNTS, search).match;
         if (!match) {
             result = { error: `No Google account matching '${args.account_name}'` };
         } else {
@@ -8755,7 +8755,7 @@ async function handleToolCall(name, args = {}) {
         const toRemove   = args.remove || [];
         const confirm    = !!args.confirm;
 
-        const match = Object.entries(GOOGLE_ACCOUNTS).find(([, i]) => i.name.toLowerCase().includes(search));
+        const match = resolveAccount(GOOGLE_ACCOUNTS, search).match;
         if (!match) {
             result = { error: `No Google account matching '${args.account_name}'` };
         } else {
@@ -8895,7 +8895,7 @@ async function handleToolCall(name, args = {}) {
         if (!extType || !assets.length) {
             result = { error: "extension_type and at least one asset are required." };
         } else {
-            const match = Object.entries(GOOGLE_ACCOUNTS).find(([, i]) => i.name.toLowerCase().includes(search));
+            const match = resolveAccount(GOOGLE_ACCOUNTS, search).match;
             if (!match) {
                 result = { error: `No Google account matching '${args.account_name}'` };
             } else {
@@ -8939,7 +8939,7 @@ async function handleToolCall(name, args = {}) {
         const confirm      = !!args.confirm;
         const dupStatus    = (args.status || "PAUSED").toUpperCase();
 
-        const acctMatch = Object.entries(META_ACCOUNTS).find(([, info]) => info.name.toLowerCase().includes(search));
+        const acctMatch = resolveAccount(META_ACCOUNTS, search).match;
         if (!acctMatch) {
             result = { error: `No Meta account found matching '${args.account_name}'. Available: ${Object.values(META_ACCOUNTS).map(a => a.name).join(", ")}` };
         } else {
@@ -9055,7 +9055,7 @@ async function handleToolCall(name, args = {}) {
         if (!args.files?.length) {
             result = { error: "files array is required and must contain at least one item." };
         } else {
-            const acctMatch = Object.entries(META_ACCOUNTS).find(([, info]) => info.name.toLowerCase().includes(search));
+            const acctMatch = resolveAccount(META_ACCOUNTS, search).match;
             if (!acctMatch) {
                 result = { error: `No Meta account found matching '${args.account_name}'. Available: ${Object.values(META_ACCOUNTS).map(a => a.name).join(", ")}` };
             } else {
@@ -9263,7 +9263,7 @@ async function handleToolCall(name, args = {}) {
         } else if (needsCampaignBudget && args.daily_budget < 1) {
             result = { error: "daily_budget must be at least $1.00 (Meta minimum)." };
         } else {
-            const acctMatch = Object.entries(META_ACCOUNTS).find(([, info]) => info.name.toLowerCase().includes(search));
+            const acctMatch = resolveAccount(META_ACCOUNTS, search).match;
             if (!acctMatch) {
                 result = { error: `No Meta account found matching '${args.account_name}'. Available: ${Object.values(META_ACCOUNTS).map(a => a.name).join(", ")}` };
             } else {
@@ -10186,7 +10186,7 @@ async function handleToolCall(name, args = {}) {
         const search  = (args.account_name || "").toLowerCase();
         const action  = args.action || "list";
         const confirm = !!args.confirm;
-        const match   = Object.entries(GOOGLE_ACCOUNTS).find(([, i]) => i.name.toLowerCase().includes(search));
+        const match   = resolveAccount(GOOGLE_ACCOUNTS, search).match;
         if (!match) {
             result = { error: `No Google account found matching '${args.account_name}'` };
         } else {
@@ -10333,7 +10333,7 @@ async function handleToolCall(name, args = {}) {
 
     } else if (name === "connect_meta_webhooks") {
         const search = (args.account_name || "").toLowerCase();
-        const acctMatch = Object.entries(META_ACCOUNTS).find(([, info]) => info.name.toLowerCase().includes(search));
+        const acctMatch = resolveAccount(META_ACCOUNTS, search).match;
         if (!acctMatch) {
             result = { error: `No Meta account found matching '${args.account_name}'. Available: ${Object.values(META_ACCOUNTS).map(a => a.name).join(", ")}` };
         } else {
@@ -10370,7 +10370,7 @@ async function handleToolCall(name, args = {}) {
 
     } else if (name === "create_meta_subscription") {
         const search = (args.account_name || "").toLowerCase();
-        const acctMatch = Object.entries(META_ACCOUNTS).find(([, info]) => info.name.toLowerCase().includes(search));
+        const acctMatch = resolveAccount(META_ACCOUNTS, search).match;
         if (!acctMatch) {
             result = { error: `No Meta account found matching '${args.account_name}'. Available: ${Object.values(META_ACCOUNTS).map(a => a.name).join(", ")}` };
         } else {
@@ -10397,7 +10397,7 @@ async function handleToolCall(name, args = {}) {
 
     } else if (name === "update_meta_subscription") {
         const search = (args.account_name || "").toLowerCase();
-        const acctMatch = Object.entries(META_ACCOUNTS).find(([, info]) => info.name.toLowerCase().includes(search));
+        const acctMatch = resolveAccount(META_ACCOUNTS, search).match;
         if (!acctMatch) {
             result = { error: `No Meta account found matching '${args.account_name}'. Available: ${Object.values(META_ACCOUNTS).map(a => a.name).join(", ")}` };
         } else {
@@ -10421,7 +10421,7 @@ async function handleToolCall(name, args = {}) {
 
     } else if (name === "delete_meta_subscription") {
         const search = (args.account_name || "").toLowerCase();
-        const acctMatch = Object.entries(META_ACCOUNTS).find(([, info]) => info.name.toLowerCase().includes(search));
+        const acctMatch = resolveAccount(META_ACCOUNTS, search).match;
         if (!acctMatch) {
             result = { error: `No Meta account found matching '${args.account_name}'. Available: ${Object.values(META_ACCOUNTS).map(a => a.name).join(", ")}` };
         } else {
@@ -10445,7 +10445,7 @@ async function handleToolCall(name, args = {}) {
 
     } else if (name === "create_meta_audience") {
         const search = (args.account_name || "").toLowerCase();
-        const acctMatch = Object.entries(META_ACCOUNTS).find(([, info]) => info.name.toLowerCase().includes(search));
+        const acctMatch = resolveAccount(META_ACCOUNTS, search).match;
         if (!acctMatch) {
             result = { error: `No Meta account found matching '${args.account_name}'. Available: ${Object.values(META_ACCOUNTS).map(a => a.name).join(", ")}` };
         } else {
@@ -10506,7 +10506,7 @@ async function handleToolCall(name, args = {}) {
 
     } else if (name === "manage_meta_audience_users") {
         const search = (args.account_name || "").toLowerCase();
-        const acctMatch = Object.entries(META_ACCOUNTS).find(([, info]) => info.name.toLowerCase().includes(search));
+        const acctMatch = resolveAccount(META_ACCOUNTS, search).match;
         if (!acctMatch) {
             result = { error: `No Meta account found matching '${args.account_name}'. Available: ${Object.values(META_ACCOUNTS).map(a => a.name).join(", ")}` };
         } else {
@@ -10622,7 +10622,7 @@ async function handleToolCall(name, args = {}) {
 
     } else if (name === "manage_meta_ad_rules") {
         const search = (args.account_name || "").toLowerCase();
-        const acctMatch = Object.entries(META_ACCOUNTS).find(([, info]) => info.name.toLowerCase().includes(search));
+        const acctMatch = resolveAccount(META_ACCOUNTS, search).match;
         if (!acctMatch) {
             result = { error: `No Meta account found matching '${args.account_name}'. Available: ${Object.values(META_ACCOUNTS).map(a => a.name).join(", ")}` };
         } else {
@@ -10925,7 +10925,7 @@ async function handleToolCall(name, args = {}) {
 
     } else if (name === "update_meta_object") {
         const search = (args.account_name || "").toLowerCase();
-        const acctMatch = Object.entries(META_ACCOUNTS).find(([, info]) => info.name.toLowerCase().includes(search));
+        const acctMatch = resolveAccount(META_ACCOUNTS, search).match;
         if (!acctMatch) {
             result = { error: `No Meta account found matching '${args.account_name}'. Available: ${Object.values(META_ACCOUNTS).map(a => a.name).join(", ")}` };
         } else {
@@ -10969,7 +10969,7 @@ async function handleToolCall(name, args = {}) {
 
     } else if (name === "manage_meta_leads") {
         const search = (args.account_name || "").toLowerCase();
-        const acctMatch = Object.entries(META_ACCOUNTS).find(([, info]) => info.name.toLowerCase().includes(search));
+        const acctMatch = resolveAccount(META_ACCOUNTS, search).match;
         if (!acctMatch) {
             result = { error: `No Meta account found matching '${args.account_name}'. Available: ${Object.values(META_ACCOUNTS).map(a => a.name).join(", ")}` };
         } else {
