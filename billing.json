@@ -222,7 +222,7 @@
       "billing_type": "flighted",
       "active": true,
       "flight_start": "2026-09-01",
-      "flight_end": "2026-09-30",
+      "flight_end": "2027-05-01",
       "line_items": [
         {
           "product_service": "Google Ads + Meta",
@@ -231,7 +231,7 @@
           "prorate_partial": false
         }
       ],
-      "notes": "Billed through Adele Creative. One-month flight."
+      "notes": "Billed through Adele Creative. Monthly through May 2027. April invoice covers through 5/1."
     },
     "spartan_exteriors": {
       "customer": "Volume Nine",
