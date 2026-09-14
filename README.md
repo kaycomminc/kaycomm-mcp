@@ -130,3 +130,61 @@ definitions for the pinned version before adding GAQL.
   question the flag was really for: which assets are held back. The response
   carries a `note` saying labels are unavailable, and a `needs_attention` list
   of assets whose primary status is not `ELIGIBLE`.
+
+---
+
+## Write safety
+
+`resolveAccount` settles which account a write lands in. Two things extend it.
+
+**Ambiguity is an error inside the account too.** Campaign, ad group, adset and
+list lookups still called `.find()` on a substring, which silently takes the
+first match — `campaign_name: "Brand"` against "Brand - Search" /
+"Brand - Shopping" paused whichever Google returned first. `matchByName` applies
+the same rules `resolveAccount` uses to the object being mutated: prefer an
+exact (case-insensitive) name, return the candidates rather than guess when
+several match.
+
+**A confirmed write must name its target exactly.** Partial names still resolve
+for discovery and dry runs, but `confirm=true` requires the full name, for both
+the account and the object. The dry run echoes it, so the flow is: call without
+`confirm`, read the exact name back, re-run with it. This closes the path where
+one call both chose the target by substring and mutated it, with no preview in
+between.
+
+Read-only tools are unchanged — partial matching is what makes them convenient,
+and they cannot damage anything.
+
+## Inactive accounts
+
+An account we can no longer reach — cancelled, or access revoked at the MCC —
+returns an error row on every pacing call. Two permanent errors train you to skim
+past error rows, which is exactly when a new one needs to stand out.
+
+Mark it in `accounts.json`:
+
+```json
+"6754409854": {
+  "name": "Axis Office",
+  "budget": 10000,
+  "mcc": "7631184147",
+  "inactive": "CUSTOMER_NOT_ENABLED — account disabled in Google Ads"
+}
+```
+
+The pacing tools skip the API call and report it under a top-level `skipped`
+list with its budget and reason, so the roster stays complete while `accounts`
+carries only live rows. `"inactive": true` works too, with a generic reason. A
+row carrying `error` is still a live row — a real failure is never filed away as
+an expected skip. Remove the key when access is restored.
+
+## Lifetime budgets and pacing confidence
+
+`current_daily_budget` sums enabled **daily** budgets, so a Meta campaign on a
+lifetime budget contributes nothing to it and the account reads as underfunded.
+Every RAISE / LOWER recommendation derives from that number, so acting on one
+would double-fund the account.
+
+When lifetime budgets are present, `daily_budget` carries `confidence: "reduced"`
+and a `REDUCED_CONFIDENCE` recommendation naming the shortfall without advising a
+change, rather than a confident RAISE beside a note that is easy to read past.
