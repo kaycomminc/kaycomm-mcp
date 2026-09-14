@@ -108,30 +108,56 @@ function formatDate(d) {
 
 function toCSV(rows) {
   const headers = [
-    'Customer',
-    'Invoice Date',
-    'Due Date',
+    '*InvoiceNo',
+    '*Customer',
+    '*InvoiceDate',
+    '*DueDate',
     'Terms',
-    'Product/Service',
-    'Description',
-    'Qty',
-    'Rate',
-    'Amount'
+    'Location',
+    'Memo',
+    'Item(Product/Service)',
+    'ItemDescription',
+    'ItemQuantity',
+    'ItemRate',
+    '*ItemAmount',
+    'Shipping address',
+    'Ship via',
+    'Shipping date',
+    'Tracking no.',
+    'Shipping Charge',
+    'Service Date'
   ];
 
-  const csvRows = [headers.join(',')];
+  const grouped = {};
+  let invoiceNum = 1;
   for (const row of rows) {
-    csvRows.push([
-      csvEscape(row.customer),
-      row.invoiceDate,
-      row.dueDate,
-      row.terms,
-      csvEscape(row.item),
-      csvEscape(row.description),
-      row.quantity,
-      row.rate.toFixed(2),
-      row.amount.toFixed(2)
-    ].join(','));
+    const groupKey = `${row.customer}||${row.invoiceDate}`;
+    if (!grouped[groupKey]) {
+      grouped[groupKey] = { invoiceNo: invoiceNum++, rows: [] };
+    }
+    grouped[groupKey].rows.push(row);
+  }
+
+  const csvRows = [headers.join(',')];
+  for (const group of Object.values(grouped)) {
+    group.rows.forEach((row, i) => {
+      const prefix = billing.settings.invoice_prefix || '';
+      csvRows.push([
+        i === 0 ? `${prefix}${group.invoiceNo}` : `${prefix}${group.invoiceNo}`,
+        i === 0 ? csvEscape(row.customer) : '',
+        i === 0 ? row.invoiceDate : '',
+        i === 0 ? row.dueDate : '',
+        i === 0 ? row.terms : '',
+        '',
+        '',
+        csvEscape(row.item),
+        csvEscape(row.description),
+        row.quantity,
+        row.rate.toFixed(2),
+        row.amount.toFixed(2),
+        '', '', '', '', '', ''
+      ].join(','));
+    });
   }
   return csvRows.join('\n');
 }
