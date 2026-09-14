@@ -223,6 +223,15 @@ function resolveAccount(store, search) {
     return { error: `Ambiguous account '${search}' matches: ${partial.map(([, i]) => i.name).join(", ")} — use the exact name` };
 }
 
+// Run fn over items with at most `limit` in flight; preserves order.
+async function mapLimit(items, limit, fn) {
+    const out = new Array(items.length);
+    let next = 0;
+    const worker = async () => { while (next < items.length) { const i = next++; out[i] = await fn(items[i], i); } };
+    await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+    return out;
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 // Resolve an account's budget (and nc_budget) for a given date, honoring an
@@ -7704,16 +7713,15 @@ async function handleToolCall(name, args = {}) {
             .filter(([, i]) => !search || i.name.toLowerCase().includes(search));
         if (!targets.length) { result = { error: `No Google account matching '${args.account_name}'` }; }
         else {
-            const accounts = [];
-            for (const [cid, info] of targets) {
+            const accounts = await mapLimit(targets, 5, async ([cid, info]) => {
                 try {
                     const { token, error: authErr } = await getGoogleAccessToken(cid);
-                    if (authErr) { accounts.push({ account: info.name, error: `Auth: ${authErr}` }); continue; }
+                    if (authErr) return { account: info.name, error: `Auth: ${authErr}` };
                     const actions = await fetchConversionHealth(token, cid, info.mcc);
                     const silent   = actions.filter(a => a.health === "GONE_SILENT");
                     const inactive = actions.filter(a => a.health === "INACTIVE_30D");
                     const allSilent = actions.length > 0 && actions.every(a => a.conversions_7d === 0);
-                    accounts.push({
+                    return {
                         account: info.name,
                         total_actions: actions.length,
                         alert: allSilent ? "⚠️ NO conversion action fired in 7 days — tracking may be broken account-wide"
@@ -7722,9 +7730,9 @@ async function handleToolCall(name, args = {}) {
                         gone_silent: silent,
                         inactive_30d: inactive,
                         healthy: actions.filter(a => a.health === "OK"),
-                    });
-                } catch (e) { accounts.push({ account: info.name, error: e.message }); }
-            }
+                    };
+                } catch (e) { return { account: info.name, error: e.message }; }
+            });
             result = { checked: accounts.length, accounts };
         }
 
@@ -7734,22 +7742,23 @@ async function handleToolCall(name, args = {}) {
             .filter(([, i]) => !search || i.name.toLowerCase().includes(search));
         if (!targets.length) { result = { error: `No Google account matching '${args.account_name}'` }; }
         else {
-            const accounts = [];
-            let totalIssues = 0;
-            for (const [cid, info] of targets) {
+            const accounts = await mapLimit(targets, 5, async ([cid, info]) => {
                 try {
                     const { token, error: authErr } = await getGoogleAccessToken(cid);
-                    if (authErr) { accounts.push({ account: info.name, error: `Auth: ${authErr}` }); continue; }
+                    if (authErr) return { account: info.name, error: `Auth: ${authErr}` };
                     const issues = await fetchAdDisapprovals(token, cid, info.mcc);
-                    totalIssues += issues.length;
-                    if (issues.length) accounts.push({ account: info.name, issue_count: issues.length, ads: issues });
-                } catch (e) { accounts.push({ account: info.name, error: e.message }); }
-            }
+                    if (issues.length) return { account: info.name, issue_count: issues.length, ads: issues };
+                    return null;  // No issues for this account
+                } catch (e) { return { account: info.name, error: e.message }; }
+            });
+            // Filter out accounts with no issues, count total issues
+            const accountsWithIssues = accounts.filter(a => a != null);
+            const totalIssues = accountsWithIssues.reduce((sum, a) => sum + (a.issue_count || 0), 0);
             result = {
                 checked: targets.length,
                 total_flagged_ads: totalIssues,
                 message: totalIssues === 0 ? "✅ All ads in enabled campaigns are fully approved." : `${totalIssues} ad(s) need attention.`,
-                accounts,
+                accounts: accountsWithIssues,
             };
         }
 
@@ -7778,30 +7787,44 @@ async function handleToolCall(name, args = {}) {
         const errors   = [];
 
         if (platform === "google" || platform === "both") {
-            for (const [cid, info] of Object.entries(GOOGLE_ACCOUNTS)) {
-                if (info.flight_end && info.flight_end < yesterday) continue; // flight over — spend stopping is expected
+            const googleTargets = Object.entries(GOOGLE_ACCOUNTS)
+                .filter(([, info]) => !info.flight_end || info.flight_end >= yesterday);
+            const googleResults = await mapLimit(googleTargets, 5, async ([cid, info]) => {
                 try {
                     const { token, error: authErr } = await getGoogleAccessToken(cid);
-                    if (authErr) { errors.push(`${info.name} (Google): Auth: ${authErr}`); continue; }
+                    if (authErr) return { error: `${info.name} (Google): Auth: ${authErr}` };
                     const [byDate, zeroImp] = await Promise.all([
                         fetchGoogleDailySpend(token, cid, info.mcc, start8, yesterday),
                         fetchZeroImpressionCampaigns(token, cid, info.mcc, yesterday),
                     ]);
                     const anomaly = detectSpendAnomaly(byDate, yesterday);
-                    if (anomaly) flags.push({ platform: "Google", account: info.name, ...anomaly });
-                    if (zeroImp.length) flags.push({ platform: "Google", account: info.name, type: "ZERO_IMPRESSIONS_YESTERDAY", campaigns: zeroImp });
-                } catch (e) { errors.push(`${info.name} (Google): ${e.message}`); }
+                    const result = { flags: [] };
+                    if (anomaly) result.flags.push({ platform: "Google", account: info.name, ...anomaly });
+                    if (zeroImp.length) result.flags.push({ platform: "Google", account: info.name, type: "ZERO_IMPRESSIONS_YESTERDAY", campaigns: zeroImp });
+                    return result;
+                } catch (e) { return { error: `${info.name} (Google): ${e.message}` }; }
+            });
+            for (const res of googleResults) {
+                if (res?.error) errors.push(res.error);
+                if (res?.flags) flags.push(...res.flags);
             }
         }
 
         if (platform === "meta" || platform === "both") {
-            for (const [accountId, info] of Object.entries(META_ACCOUNTS)) {
-                if (info.flight_end && info.flight_end < yesterday) continue; // flight over — spend stopping is expected
+            const metaTargets = Object.entries(META_ACCOUNTS)
+                .filter(([, info]) => !info.flight_end || info.flight_end >= yesterday);
+            const metaResults = await mapLimit(metaTargets, 5, async ([accountId, info]) => {
                 try {
                     const byDate  = await fetchMetaDailySpend(accountId, start8, yesterday);
                     const anomaly = detectSpendAnomaly(byDate, yesterday);
-                    if (anomaly) flags.push({ platform: "Meta", account: info.name, ...anomaly });
-                } catch (e) { errors.push(`${info.name} (Meta): ${e.message}`); }
+                    const result = { flags: [] };
+                    if (anomaly) result.flags.push({ platform: "Meta", account: info.name, ...anomaly });
+                    return result;
+                } catch (e) { return { error: `${info.name} (Meta): ${e.message}` }; }
+            });
+            for (const res of metaResults) {
+                if (res?.error) errors.push(res.error);
+                if (res?.flags) flags.push(...res.flags);
             }
         }
 
