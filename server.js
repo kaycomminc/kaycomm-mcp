@@ -1589,7 +1589,16 @@ async function fetchGoogleCampaignPerf(token, customerId, mccId, dateRange, star
         SELECT campaign.name, campaign.status, campaign.advertising_channel_type,
                metrics.cost_micros, metrics.clicks, metrics.impressions,
                metrics.conversions, metrics.conversions_value,
-               metrics.ctr, metrics.average_cpc, metrics.search_impression_share
+               metrics.ctr, metrics.average_cpc, metrics.search_impression_share,
+               metrics.search_budget_lost_impression_share,
+               metrics.search_rank_lost_impression_share,
+               metrics.search_top_impression_share,
+               metrics.search_absolute_top_impression_share,
+               metrics.search_budget_lost_top_impression_share,
+               metrics.search_rank_lost_top_impression_share,
+               metrics.search_budget_lost_absolute_top_impression_share,
+               metrics.search_rank_lost_absolute_top_impression_share,
+               metrics.search_exact_match_impression_share
         FROM campaign
         WHERE segments.date ${dateClause}
           AND metrics.impressions > 0
@@ -1615,6 +1624,15 @@ async function fetchGoogleCampaignPerf(token, customerId, mccId, dateRange, star
             cpa:              cpa ? "$" + cpa : null,
             roas:             roas,
             impression_share: row.metrics.searchImpressionShare || null,
+            lost_is_budget:   row.metrics.searchBudgetLostImpressionShare ?? null,
+            lost_is_rank:     row.metrics.searchRankLostImpressionShare ?? null,
+            top_is:           row.metrics.searchTopImpressionShare ?? null,
+            abs_top_is:       row.metrics.searchAbsoluteTopImpressionShare ?? null,
+            lost_top_is_budget:     row.metrics.searchBudgetLostTopImpressionShare ?? null,
+            lost_top_is_rank:       row.metrics.searchRankLostTopImpressionShare ?? null,
+            lost_abs_top_is_budget: row.metrics.searchBudgetLostAbsoluteTopImpressionShare ?? null,
+            lost_abs_top_is_rank:   row.metrics.searchRankLostAbsoluteTopImpressionShare ?? null,
+            exact_match_is:   row.metrics.searchExactMatchImpressionShare ?? null,
         };
     });
 }
@@ -1810,7 +1828,12 @@ async function fetchGoogleKeywordPerf(token, customerId, mccId, dateRange, start
                ad_group_criterion.status,
                metrics.cost_micros, metrics.clicks, metrics.impressions,
                metrics.conversions, metrics.ctr, metrics.average_cpc,
-               metrics.search_impression_share, metrics.search_top_impression_share
+               metrics.search_impression_share, metrics.search_top_impression_share,
+               metrics.search_absolute_top_impression_share,
+               metrics.search_rank_lost_impression_share,
+               metrics.search_rank_lost_top_impression_share,
+               metrics.search_rank_lost_absolute_top_impression_share,
+               metrics.search_exact_match_impression_share
         FROM keyword_view
         WHERE segments.date ${dateClause}
           AND metrics.impressions > 0
@@ -1833,6 +1856,11 @@ async function fetchGoogleKeywordPerf(token, customerId, mccId, dateRange, start
         conversions:      parseFloat(row.metrics.conversions || 0),
         impression_share: row.metrics.searchImpressionShare ?? null,
         top_is:           row.metrics.searchTopImpressionShare ?? null,
+        abs_top_is:       row.metrics.searchAbsoluteTopImpressionShare ?? null,
+        lost_is_rank:     row.metrics.searchRankLostImpressionShare ?? null,
+        lost_top_is_rank:     row.metrics.searchRankLostTopImpressionShare ?? null,
+        lost_abs_top_is_rank: row.metrics.searchRankLostAbsoluteTopImpressionShare ?? null,
+        exact_match_is:   row.metrics.searchExactMatchImpressionShare ?? null,
     }));
 }
 
@@ -4712,6 +4740,42 @@ async function viewSharedNegativeList(token, customerId, mccId, sharedSetResourc
     return rows.map(r => ({ text: r.sharedCriterion.keyword.text, match_type: r.sharedCriterion.keyword.matchType }));
 }
 
+// Campaign- and ad-group-level negatives (not in shared lists), grouped by campaign.
+async function listCampaignNegatives(token, customerId, mccId, campaignFilters = []) {
+    const [campRows, agRows] = await Promise.all([
+        googleSearch(token, customerId, mccId, `
+            SELECT campaign.name, campaign.status,
+                   campaign_criterion.keyword.text, campaign_criterion.keyword.match_type
+            FROM campaign_criterion
+            WHERE campaign_criterion.negative = TRUE
+              AND campaign_criterion.type = 'KEYWORD'
+              AND campaign.status != 'REMOVED'`),
+        googleSearch(token, customerId, mccId, `
+            SELECT campaign.name, campaign.status, ad_group.name,
+                   ad_group_criterion.keyword.text, ad_group_criterion.keyword.match_type
+            FROM ad_group_criterion
+            WHERE ad_group_criterion.negative = TRUE
+              AND ad_group_criterion.type = 'KEYWORD'
+              AND ad_group_criterion.status != 'REMOVED'
+              AND campaign.status != 'REMOVED'`),
+    ]);
+    const wanted = campaignFilters.map(c => c.toLowerCase());
+    const keep = name => !wanted.length || wanted.some(w => name.toLowerCase().includes(w));
+    const byCampaign = {};
+    const entry = r => (byCampaign[r.campaign.name] = byCampaign[r.campaign.name] ||
+        { campaign: r.campaign.name, status: r.campaign.status, campaign_negatives: [], ad_group_negatives: [] });
+    for (const r of campRows) {
+        if (!keep(r.campaign.name)) continue;
+        entry(r).campaign_negatives.push({ text: r.campaignCriterion.keyword.text, match_type: r.campaignCriterion.keyword.matchType });
+    }
+    for (const r of agRows) {
+        if (!keep(r.campaign.name)) continue;
+        entry(r).ad_group_negatives.push({ ad_group: r.adGroup.name, text: r.adGroupCriterion.keyword.text, match_type: r.adGroupCriterion.keyword.matchType });
+    }
+    return Object.values(byCampaign).sort((a, b) =>
+        (a.status === "ENABLED" ? 0 : 1) - (b.status === "ENABLED" ? 0 : 1) || a.campaign.localeCompare(b.campaign));
+}
+
 // ── MCP Server ────────────────────────────────────────────────────────────────
 // makeServer() builds a fresh Server instance with both handlers registered.
 // stdio mode and SSE mode share one module-level instance; the stateless
@@ -5893,17 +5957,18 @@ function makeServer() {
             name: "manage_negative_lists",
             description: "Manage shared negative keyword lists in a Google Ads account. " +
                 "Actions: list (all lists + attached campaigns), view (keywords in a list), create (new empty list), " +
-                "add_keywords (add negatives to a list), attach (link a list to campaigns). " +
+                "add_keywords (add negatives to a list), attach (link a list to campaigns), " +
+                "campaign_negatives (read negatives set directly on campaigns and ad groups, outside shared lists; optional campaign_names filter). " +
                 "Write actions are dry run by default — set confirm=true to apply.",
             inputSchema: {
                 type: "object",
                 properties: {
                     account_name: { type: "string", description: "Client name (partial match ok)" },
-                    action:       { type: "string", enum: ["list", "view", "create", "add_keywords", "attach"], description: "What to do (default: list)" },
+                    action:       { type: "string", enum: ["list", "view", "create", "add_keywords", "attach", "campaign_negatives"], description: "What to do (default: list)" },
                     list_name:    { type: "string", description: "Shared list name (partial match ok for view/add_keywords/attach; exact name for create)" },
                     keywords:     { type: "array", items: { type: "string" }, description: "Keywords to add (for add_keywords)" },
                     match_type:   { type: "string", enum: ["EXACT", "PHRASE", "BROAD"], description: "Match type for added keywords (default: PHRASE)" },
-                    campaign_names: { type: "array", items: { type: "string" }, description: "Campaign names to attach the list to (partial match ok, for attach)" },
+                    campaign_names: { type: "array", items: { type: "string" }, description: "Campaign names (partial match ok) — targets for attach, or filter for campaign_negatives" },
                     confirm:      { type: "boolean", description: "Set true to apply create/add_keywords/attach. Omit for dry run." },
                 },
                 required: ["account_name"],
@@ -10199,6 +10264,11 @@ async function handleToolCall(name, args = {}) {
                         const lists = await listSharedNegativeLists(token, cid, info.mcc);
                         result = { account: info.name, total: lists.length, lists };
 
+                    } else if (action === "campaign_negatives") {
+                        const campaigns = await listCampaignNegatives(token, cid, info.mcc, args.campaign_names || []);
+                        const total = campaigns.reduce((n, c) => n + c.campaign_negatives.length + c.ad_group_negatives.length, 0);
+                        result = { account: info.name, total_negatives: total, campaigns };
+
                     } else if (action === "create") {
                         if (!args.list_name) { result = { error: "list_name is required for create." }; }
                         else if (!confirm) {
@@ -10262,7 +10332,7 @@ async function handleToolCall(name, args = {}) {
                                 }
                             }
                         } else {
-                            result = { error: `Unknown action '${action}'. Valid: list, view, create, add_keywords, attach.` };
+                            result = { error: `Unknown action '${action}'. Valid: list, view, create, add_keywords, attach, campaign_negatives.` };
                         }
                     }
                 } catch (e) { result = { error: e.message }; }
