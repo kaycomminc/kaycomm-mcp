@@ -198,12 +198,12 @@ ${JSON.stringify(data, null, 2)}
 Write the digest with these rules:
 - Open with a single line saying how many accounts need action today and how many are fine.
 - Then a "Needs attention" section listing only accounts with status "alert" or "warn", or where "exhausted" is true. For each: the account, platform, spend, budget, how far off pace, and the recommended daily budget. If a recommendation string is present, use it.
-- Then a "Denver Parade of Homes" section. This runs on a fixed flight window, not a monthly budget, and its budget steps up on a schedule. Give flight to date spend against the flight budget and the recommended daily for the days remaining.
+- Then a "Flight accounts" section for accounts with flight: true — flight to date spend vs flight budget and recommended daily.
 - Then a one line "Everything else on pace" roll up naming the remaining accounts with no detail.
 - If any platform has an "error" or "missing" field, say plainly that the data did not come back for it. Never fill a gap with a guess.
 - If "platformErrors" is not empty, lead with it: that whole platform failed to report, so its accounts are unknown rather than at zero. Do not describe those accounts as underpacing.
 - Accounts with "capped": false are report only. Mention their run rate but do not describe them as off pace.
-- For Summit Express, include ROAS since it is ecommerce.
+- For accounts with a performance block, include ROAS and conversion value.
 - If "unlisted" is not empty, add a final line naming those accounts as tracked in accounts.json but not configured in the digest.
 
 Style: direct, concise, no preamble, no sign off. This is delivered as a plain text email, so write plain text: no markdown, no asterisks for bold, no bullet characters other than a leading "- ". Section headings on their own line. Never use em dashes. Use commas, periods, or parentheses instead. Currency to the dollar is fine, drop the cents.`;
