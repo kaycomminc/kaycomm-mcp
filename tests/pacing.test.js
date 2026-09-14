@@ -31,12 +31,17 @@ test("getPacingLabel: day 1 of month (dom=0) — no division blowup", () => {
     assert.ok(Number.isFinite(r.remaining));
 });
 
-test("getPacingLabel: last day of month (dom === dim)", () => {
+test("getPacingLabel: last day of month (dom === dim), default 5% tolerance", () => {
     const r = getPacingLabel(950, 1000, 31, 31);
-    assert.equal(r.status, "ON PACE");
+    assert.equal(r.status, "UNDERPACING");
     assert.equal(r.pct_budget, 95);
     assert.equal(r.pct_expected, 95);
     assert.ok(Number.isFinite(r.projected_month_end));
+});
+
+test("getPacingLabel: last day of month with 15% tolerance returns ON PACE", () => {
+    const r = getPacingLabel(950, 1000, 31, 31, 15);
+    assert.equal(r.status, "ON PACE");
 });
 
 test("getPacingLabel: budget = 0 short-circuits to no_cap", () => {

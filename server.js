@@ -62,7 +62,7 @@ let LINKEDIN_ACCOUNTS = {};
 let HEALTH_DEFAULTS = {};
 
 const BUILTIN_HEALTH_DEFAULTS = {
-    pacing_tolerance_pct: 15,
+    pacing_tolerance_pct: 5,
     conversion_dry_spell_hours: 72,
     cpa_tolerance_pct: 25,
     roas_tolerance_pct: 20,
@@ -219,14 +219,14 @@ function getEffectiveBudget(info, today) {
 // governs when we flag drift and when we call a daily budget ON_TRACK.
 const PACING_TOLERANCE_PCT = 5;
 
-function getPacingLabel(spent, budget, dom, dim) {
+function getPacingLabel(spent, budget, dom, dim, tolerancePct = PACING_TOLERANCE_PCT) {
     if (!budget) return { status: "no_cap" };
     if (!dom)    return { status: "NO_COMPLETE_DAYS_YET", note: "First day of the month — no complete days to pace against yet.", remaining: Math.round((budget - spent) * 100) / 100 };
     const expected    = budget * (dom / dim);
     const pctBudget   = Math.round((spent / budget) * 100 * 10) / 10;
     const pctExpected = expected > 0 ? Math.round((spent / expected) * 100 * 10) / 10 : 0;
     const remaining   = Math.round((budget - spent) * 100) / 100;
-    const status      = pctExpected >= 100 + PACING_TOLERANCE_PCT ? "OVERPACING" : pctExpected <= 100 - PACING_TOLERANCE_PCT ? "UNDERPACING" : "ON PACE";
+    const status      = pctExpected >= 100 + tolerancePct ? "OVERPACING" : pctExpected <= 100 - tolerancePct ? "UNDERPACING" : "ON PACE";
     const projected   = Math.round((spent / dom) * dim * 100) / 100;
     return {
         status, pct_budget: pctBudget, pct_expected: pctExpected, remaining,
@@ -236,7 +236,7 @@ function getPacingLabel(spent, budget, dom, dim) {
 }
 
 // Pacing for flight-based budgets (fixed start/end dates instead of calendar months)
-function getFlightPacing(spent, budget, flightStart, flightEnd, yesterday) {
+function getFlightPacing(spent, budget, flightStart, flightEnd, yesterday, tolerancePct = PACING_TOLERANCE_PCT) {
     const day = s => Date.UTC(+s.slice(0, 4), +s.slice(5, 7) - 1, +s.slice(8, 10)) / 86400000;
     const totalDays   = day(flightEnd) - day(flightStart) + 1;
     const elapsedDays = Math.max(0, Math.min(totalDays, day(yesterday) - day(flightStart) + 1));
@@ -255,7 +255,7 @@ function getFlightPacing(spent, budget, flightStart, flightEnd, yesterday) {
     const expected    = budget * (elapsedDays / totalDays);
     const pctExpected = expected > 0 ? Math.round((spent / expected) * 100 * 10) / 10 : 0;
     const daysLeft    = totalDays - elapsedDays;
-    const status      = pctExpected >= 100 + PACING_TOLERANCE_PCT ? "OVERPACING" : pctExpected <= 100 - PACING_TOLERANCE_PCT ? "UNDERPACING" : "ON PACE";
+    const status      = pctExpected >= 100 + tolerancePct ? "OVERPACING" : pctExpected <= 100 - tolerancePct ? "UNDERPACING" : "ON PACE";
     return {
         status, ...base,
         pct_expected: pctExpected,
@@ -267,7 +267,7 @@ function getFlightPacing(spent, budget, flightStart, flightEnd, yesterday) {
 
 // Compare current campaign daily budgets against the per-day spend needed to
 // land exactly on budget. daysRemaining includes today (spend is through yesterday).
-function buildDailyBudgetRec(currentDaily, remaining, daysRemaining) {
+function buildDailyBudgetRec(currentDaily, remaining, daysRemaining, tolerancePct = PACING_TOLERANCE_PCT) {
     if (currentDaily == null || daysRemaining == null || daysRemaining <= 0) return null;
     const needed = Math.round((remaining / daysRemaining) * 100) / 100;
     const out = {
@@ -281,8 +281,8 @@ function buildDailyBudgetRec(currentDaily, remaining, daysRemaining) {
         out.recommendation = `NO_DAILY_BUDGETS — no enabled daily budgets found; set ~$${needed.toFixed(2)}/day to spend the remaining $${remaining.toFixed(2)}.`;
     } else {
         const diffPct = ((needed - currentDaily) / currentDaily) * 100;
-        if (Math.abs(diffPct) <= PACING_TOLERANCE_PCT) {
-            out.recommendation = `ON_TRACK — current daily budgets land within ±${PACING_TOLERANCE_PCT}% of budget.`;
+        if (Math.abs(diffPct) <= tolerancePct) {
+            out.recommendation = `ON_TRACK — current daily budgets land within ±${tolerancePct}% of budget.`;
         } else if (diffPct > 0) {
             out.recommendation = `RAISE daily budgets $${currentDaily.toFixed(2)} → ~$${needed.toFixed(2)}/day (+${Math.round(diffPct)}%) to hit budget.`;
         } else {
@@ -525,10 +525,11 @@ async function buildGoogleRows(defaultToken, pace_dom, dim, today, monthStart, y
                 emptyWindow(info.flight_start, until) ? { spend: 0, error: null }
                     : fetchGoogleMTD(token, cid, info.mcc, info.flight_start, until), budgetsPromise]);
             if (error) return { account: info.name, error };
-            const pacing = getFlightPacing(spend, budget, info.flight_start, info.flight_end, yesterday);
+            const tolerance = getHealthConfig(info)?.pacing_tolerance_pct ?? PACING_TOLERANCE_PCT;
+            const pacing = getFlightPacing(spend, budget, info.flight_start, info.flight_end, yesterday, tolerance);
             const row = { account: info.name, flight_spend: Math.round(spend * 100) / 100, ...pacing };
             if (budgets && pacing.days_remaining > 0) {
-                row.daily_budget = buildDailyBudgetRec(budgets.total, pacing.remaining, pacing.days_remaining);
+                row.daily_budget = buildDailyBudgetRec(budgets.total, pacing.remaining, pacing.days_remaining, tolerance);
             }
             return row;
         }
@@ -542,18 +543,19 @@ async function buildGoogleRows(defaultToken, pace_dom, dim, today, monthStart, y
             const ncBudget    = nc_budget;
             const otherBudget = budget - ncBudget;
             const daysLeft    = dim - pace_dom;
+            const tolerance   = getHealthConfig(info)?.pacing_tolerance_pct ?? PACING_TOLERANCE_PCT;
             const row = {
                 account: info.name, mtd_spend: Math.round(total * 100) / 100,
-                budget, ...getPacingLabel(total, budget, pace_dom, dim),
+                budget, ...getPacingLabel(total, budget, pace_dom, dim, tolerance),
                 breakdown: {
-                    nc:    { spend: Math.round(nc * 100) / 100,    budget: ncBudget,    ...getPacingLabel(nc, ncBudget, pace_dom, dim) },
-                    other: { spend: Math.round(other * 100) / 100, budget: otherBudget, ...getPacingLabel(other, otherBudget, pace_dom, dim) },
+                    nc:    { spend: Math.round(nc * 100) / 100,    budget: ncBudget,    ...getPacingLabel(nc, ncBudget, pace_dom, dim, tolerance) },
+                    other: { spend: Math.round(other * 100) / 100, budget: otherBudget, ...getPacingLabel(other, otherBudget, pace_dom, dim, tolerance) },
                 },
             };
             if (budgets && budget) {
-                row.daily_budget = buildDailyBudgetRec(budgets.total, budget - total, daysLeft);
-                row.breakdown.nc.daily_budget    = buildDailyBudgetRec(budgets.nc,    ncBudget - nc,       daysLeft);
-                row.breakdown.other.daily_budget = buildDailyBudgetRec(budgets.other, otherBudget - other, daysLeft);
+                row.daily_budget = buildDailyBudgetRec(budgets.total, budget - total, daysLeft, tolerance);
+                row.breakdown.nc.daily_budget    = buildDailyBudgetRec(budgets.nc,    ncBudget - nc,       daysLeft, tolerance);
+                row.breakdown.other.daily_budget = buildDailyBudgetRec(budgets.other, otherBudget - other, daysLeft, tolerance);
             }
             return row;
         }
@@ -562,12 +564,13 @@ async function buildGoogleRows(defaultToken, pace_dom, dim, today, monthStart, y
             emptyWindow(monthStart, yesterday) ? { spend: 0, error: null }
                 : fetchGoogleMTD(token, cid, info.mcc, monthStart, yesterday), budgetsPromise]);
         if (error) return { account: info.name, error };
+        const tolerance = getHealthConfig(info)?.pacing_tolerance_pct ?? PACING_TOLERANCE_PCT;
         const row = {
             account: info.name, mtd_spend: Math.round(spend * 100) / 100,
-            budget, ...getPacingLabel(spend, budget, pace_dom, dim),
+            budget, ...getPacingLabel(spend, budget, pace_dom, dim, tolerance),
         };
         if (budgets && budget) {
-            row.daily_budget = buildDailyBudgetRec(budgets.total, budget - spend, dim - pace_dom);
+            row.daily_budget = buildDailyBudgetRec(budgets.total, budget - spend, dim - pace_dom, tolerance);
         }
         return row;
     }));
@@ -585,10 +588,11 @@ async function buildMetaRows(pace_dom, dim, today, monthStart, yesterday) {
                 emptyWindow(info.flight_start, until) ? { spend: 0, error: null }
                     : fetchMetaMTD(id, info.flight_start, until), budgetsPromise]);
             if (error) return { account: info.name, error };
-            const pacing = getFlightPacing(spend, budget, info.flight_start, info.flight_end, yesterday);
+            const tolerance = getHealthConfig(info)?.pacing_tolerance_pct ?? PACING_TOLERANCE_PCT;
+            const pacing = getFlightPacing(spend, budget, info.flight_start, info.flight_end, yesterday, tolerance);
             const row = { account: info.name, flight_spend: Math.round(spend * 100) / 100, ...pacing };
             if (budgets && pacing.days_remaining > 0) {
-                row.daily_budget = buildDailyBudgetRec(budgets.total, pacing.remaining, pacing.days_remaining);
+                row.daily_budget = buildDailyBudgetRec(budgets.total, pacing.remaining, pacing.days_remaining, tolerance);
                 if (budgets.has_lifetime_budgets) row.daily_budget.note = "Some budgets are lifetime, not daily — current_daily_budget undercounts.";
             }
             return row;
@@ -598,12 +602,13 @@ async function buildMetaRows(pace_dom, dim, today, monthStart, yesterday) {
             emptyWindow(monthStart, yesterday) ? { spend: 0, error: null }
                 : fetchMetaMTD(id, monthStart, yesterday), budgetsPromise]);
         if (error) return { account: info.name, error };
+        const tolerance = getHealthConfig(info)?.pacing_tolerance_pct ?? PACING_TOLERANCE_PCT;
         const row = {
             account: info.name, mtd_spend: Math.round(spend * 100) / 100,
-            budget, ...getPacingLabel(spend, budget, pace_dom, dim),
+            budget, ...getPacingLabel(spend, budget, pace_dom, dim, tolerance),
         };
         if (budgets && budget) {
-            row.daily_budget = buildDailyBudgetRec(budgets.total, budget - spend, dim - pace_dom);
+            row.daily_budget = buildDailyBudgetRec(budgets.total, budget - spend, dim - pace_dom, tolerance);
             if (row.daily_budget && budgets.has_lifetime_budgets) row.daily_budget.note = "Some budgets are lifetime, not daily — current_daily_budget undercounts.";
         }
         return row;
@@ -2926,18 +2931,19 @@ function rangeToDates(dateRange, startDate, endDate) {
 async function buildStackAdaptRows(pace_dom, dim, today, monthStart, yesterday) {
     return Promise.all(Object.entries(STACKADAPT_ADVERTISERS).map(async ([advId, info]) => {
         const { budget } = getEffectiveBudget(info, today);
+        const tolerance = getHealthConfig(info)?.pacing_tolerance_pct ?? PACING_TOLERANCE_PCT;
         try {
             if (info.flight_start && info.flight_end) {
                 const until = yesterday < info.flight_end ? yesterday : info.flight_end;
                 const { spend } = emptyWindow(info.flight_start, until) ? { spend: 0 }
                     : await fetchStackAdaptSpend(advId, info.flight_start, until);
                 return { account: info.name, flight_spend: Math.round(spend * 100) / 100,
-                    ...getFlightPacing(spend, budget, info.flight_start, info.flight_end, yesterday) };
+                    ...getFlightPacing(spend, budget, info.flight_start, info.flight_end, yesterday, tolerance) };
             }
             const { spend } = emptyWindow(monthStart, yesterday) ? { spend: 0 }
                 : await fetchStackAdaptSpend(advId, monthStart, yesterday);
             return { account: info.name, mtd_spend: Math.round(spend * 100) / 100,
-                budget, ...getPacingLabel(spend, budget, pace_dom, dim) };
+                budget, ...getPacingLabel(spend, budget, pace_dom, dim, tolerance) };
         } catch (e) { return { account: info.name, error: e.message }; }
     }));
 }
@@ -3006,18 +3012,19 @@ async function fetchLinkedInDailyBudgets(accountId) {
 async function buildLinkedInRows(pace_dom, dim, today, monthStart, yesterday) {
     return Promise.all(Object.entries(LINKEDIN_ACCOUNTS).map(async ([acctId, info]) => {
         const { budget } = getEffectiveBudget(info, today);
+        const tolerance = getHealthConfig(info)?.pacing_tolerance_pct ?? PACING_TOLERANCE_PCT;
         try {
             if (info.flight_start && info.flight_end) {
                 const until = yesterday < info.flight_end ? yesterday : info.flight_end;
                 const { spend, error } = emptyWindow(info.flight_start, until) ? { spend: 0 }
                     : await fetchLinkedInMTD(acctId, info.flight_start, until);
                 const row = { account: info.name, flight_spend: Math.round(spend * 100) / 100,
-                    ...getFlightPacing(spend, budget, info.flight_start, info.flight_end, yesterday) };
+                    ...getFlightPacing(spend, budget, info.flight_start, info.flight_end, yesterday, tolerance) };
                 if (error) row.api_error = error;
                 const db = await fetchLinkedInDailyBudgets(acctId);
-                const fp = getFlightPacing(spend, budget, info.flight_start, info.flight_end, yesterday);
+                const fp = getFlightPacing(spend, budget, info.flight_start, info.flight_end, yesterday, tolerance);
                 if (fp.days_remaining > 0) {
-                    row.daily_budget = buildDailyBudgetRec(db.daily_total, fp.remaining, fp.days_remaining) || {};
+                    row.daily_budget = buildDailyBudgetRec(db.daily_total, fp.remaining, fp.days_remaining, tolerance) || {};
                 } else {
                     row.daily_budget = { current_daily_budget: db.daily_total, needed_per_day: fp.needed_per_day, days_remaining: fp.days_remaining };
                 }
@@ -3028,7 +3035,7 @@ async function buildLinkedInRows(pace_dom, dim, today, monthStart, yesterday) {
             const { spend, error } = emptyWindow(monthStart, yesterday) ? { spend: 0 }
                 : await fetchLinkedInMTD(acctId, monthStart, yesterday);
             const row = { account: info.name, mtd_spend: Math.round(spend * 100) / 100,
-                budget, ...getPacingLabel(spend, budget, pace_dom, dim) };
+                budget, ...getPacingLabel(spend, budget, pace_dom, dim, tolerance) };
             if (error) row.api_error = error;
             return row;
         } catch (e) { return { account: info.name, error: e.message }; }
