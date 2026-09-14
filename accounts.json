@@ -46,7 +46,8 @@
       "mcc": "6000302846",
       "health": {
         "conversion_type": "sale"
-      }
+      },
+      "inactive": "USER_PERMISSION_DENIED — no access under MCC 6000302846"
     },
     "3340507097": {
       "name": "FAMU Online",
@@ -136,7 +137,8 @@
       "name": "Axis Office",
       "budget": 10000,
       "mcc": "7631184147",
-      "health": false
+      "health": false,
+      "inactive": "CUSTOMER_NOT_ENABLED — account disabled in Google Ads"
     },
     "7539940999": {
       "name": "Digital Practice Growth",

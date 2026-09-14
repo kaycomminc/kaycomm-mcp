@@ -1,6 +1,11 @@
-import { test } from "node:test";
-import assert from "assert";
-import { resolveAccount } from "../server.js";
+// MCP_TEST must be set before server.js is loaded, or main() starts the stdio
+// server and the test process never exits. That is also why this file uses
+// require() rather than import: ESM hoists the import above any assignment.
+process.env.MCP_TEST = "1";
+const test = require("node:test");
+const assert = require("node:assert/strict");
+
+const { resolveAccount } = require("../server.js");
 
 // Test store
 const testStore = {
