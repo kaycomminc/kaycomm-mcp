@@ -18,7 +18,7 @@
           "rate": 600
         }
       ],
-      "notes": "V9 subcontract — uploaded to WorkSuite. Sep 2026 had two $600 invoices (#1842 + #1849) — confirm if this is now 2 line items going forward."
+      "notes": "V9 subcontract — uploaded to WorkSuite"
     },
     "alderwood": {
       "customer": "Volume Nine",
@@ -44,7 +44,7 @@
           "rate": 400
         }
       ],
-      "notes": "V9 subcontract — uploaded to WorkSuite. Started June 2026."
+      "notes": "V9 subcontract — uploaded to WorkSuite"
     },
     "enzoic": {
       "customer": "Volume Nine",
@@ -96,7 +96,7 @@
           "rate": 2000
         }
       ],
-      "notes": "V9 subcontract — uploaded to WorkSuite. Still billing even though ad budget is $0 in accounts.json."
+      "notes": "V9 subcontract — uploaded to WorkSuite"
     },
     "woca": {
       "customer": "Volume Nine",
@@ -122,7 +122,7 @@
           "rate": 600
         }
       ],
-      "notes": "V9 subcontract — uploaded to WorkSuite. Started Sep 2026."
+      "notes": "V9 subcontract — uploaded to WorkSuite"
     },
     "charlies_soap": {
       "customer": "Volume Nine",
@@ -135,7 +135,7 @@
           "rate": 1000
         }
       ],
-      "notes": "V9 subcontract — uploaded to WorkSuite. Started Sep 2026 recurring. Had one-time $750 audit in Aug (Paid Search Audit)."
+      "notes": "V9 subcontract — uploaded to WorkSuite"
     },
     "v9_ads": {
       "customer": "Volume Nine",
@@ -148,23 +148,20 @@
           "rate": 350
         }
       ],
-      "notes": "V9 subcontract — uploaded to WorkSuite. Started Sep 2026."
+      "notes": "V9 subcontract — uploaded to WorkSuite"
     },
-    "dpoh": {
+    "axis_office": {
       "customer": "Volume Nine",
-      "billing_type": "flighted",
-      "active": false,
-      "flight_start": "2026-07-23",
-      "flight_end": "2026-08-23",
+      "billing_type": "recurring",
+      "active": true,
       "line_items": [
         {
-          "product_service": "Google Ads + Meta",
-          "description": "Denver PoH",
-          "rate": 1250,
-          "prorate_partial": false
+          "product_service": "Google Ads",
+          "description": "Axis Office",
+          "rate": 350
         }
       ],
-      "notes": "V9 subcontract — flighted campaign, completed. $1,250 billed in Aug."
+      "notes": "V9 subcontract — uploaded to WorkSuite. First invoice Oct 2026 (for September)."
     },
     "eye_associates": {
       "customer": "G Williams",
@@ -179,27 +176,18 @@
       ],
       "notes": "Billed through G Williams"
     },
-    "famu": {
+    "gulf_coast": {
       "customer": "G Williams",
-      "billing_type": "flighted",
+      "billing_type": "recurring",
       "active": true,
-      "flight_start": "2026-07-01",
-      "flight_end": "2026-10-31",
       "line_items": [
         {
           "product_service": "Facebook Ads",
-          "description": "FAMU Online",
-          "rate": 5800,
-          "prorate_partial": false
-        },
-        {
-          "product_service": "YouTube Ads",
-          "description": "FAMU Ads",
-          "rate": 3000,
-          "prorate_partial": false
+          "description": "Gulf Coast Land Sales",
+          "rate": 4000
         }
       ],
-      "notes": "Billed through G Williams. Facebook Ads billed $5,800 in Jul. YouTube Ads billed $3,000 in Aug (described as '2 month run'). Confirm ongoing monthly amounts."
+      "notes": "Billed through G Williams. Amount may vary month to month — review before generating."
     },
     "florida_state_guard": {
       "customer": "Adele Creative",
@@ -227,7 +215,7 @@
           "prorate_partial": true
         }
       ],
-      "notes": "Billed through Adele Creative. First invoice was $28,000 total for 8/18-9/30 period. Confirm if these are the ongoing monthly rates or if they change."
+      "notes": "Billed through Adele Creative. Amounts vary monthly — review before generating."
     },
     "phq_ads": {
       "customer": "Adele Creative",
@@ -243,30 +231,59 @@
           "prorate_partial": false
         }
       ],
-      "notes": "Billed through Adele Creative. One-month flight — confirm if extending."
+      "notes": "Billed through Adele Creative. One-month flight."
     },
-    "gulf_coast": {
-      "customer": "Gulf Coast Land Sales",
-      "billing_type": "flighted",
-      "active": true,
-      "flight_start": "2026-09-01",
-      "flight_end": "2026-09-30",
+    "spartan_exteriors": {
+      "customer": "Volume Nine",
+      "billing_type": "recurring",
+      "active": false,
       "line_items": [],
-      "notes": "Meta only — in accounts.json but no invoice found yet. Confirm amount."
+      "notes": "As-needed only — not recurring. Create one-off invoice when work is done."
+    },
+    "dpoh": {
+      "customer": "Volume Nine",
+      "billing_type": "flighted",
+      "active": false,
+      "flight_start": "2026-07-23",
+      "flight_end": "2026-08-23",
+      "line_items": [
+        {
+          "product_service": "Google Ads + Meta",
+          "description": "Denver PoH",
+          "rate": 1250,
+          "prorate_partial": false
+        }
+      ],
+      "notes": "V9 subcontract — completed."
+    },
+    "famu": {
+      "customer": "G Williams",
+      "billing_type": "flighted",
+      "active": false,
+      "flight_start": "2026-07-01",
+      "flight_end": "2026-08-31",
+      "line_items": [
+        {
+          "product_service": "Facebook Ads",
+          "description": "FAMU Online",
+          "rate": 5800,
+          "prorate_partial": false
+        },
+        {
+          "product_service": "YouTube Ads",
+          "description": "FAMU Ads",
+          "rate": 3000,
+          "prorate_partial": false
+        }
+      ],
+      "notes": "Billed through G Williams. One-time invoices — completed."
     },
     "digital_practice_growth": {
       "customer": "Digital Practice Growth",
       "billing_type": "recurring",
       "active": false,
       "line_items": [],
-      "notes": "In accounts.json but no invoices found in May-Sep 2026 export. Confirm if billing."
-    },
-    "axis_office": {
-      "customer": "Axis Office",
-      "billing_type": "recurring",
-      "active": false,
-      "line_items": [],
-      "notes": "In accounts.json but no invoices found in May-Sep 2026 export. Confirm if billing."
+      "notes": "In accounts.json but not currently billing."
     }
   }
 }
