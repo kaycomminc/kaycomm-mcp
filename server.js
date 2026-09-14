@@ -6462,7 +6462,23 @@ function makeServer() {
 
 const server = makeServer();
 
+// Track recent write attempts to prevent duplicate writes
+const RECENT_WRITES = new Map();
+
 async function handleToolCall(name, args = {}) {
+    // Duplicate-write guard: if confirm=true and we've seen this exact call
+    // recently (<30s ago with ok result), block it
+    if (args.confirm === true) {
+        const key = name + JSON.stringify(Object.keys(args).sort().reduce((o, k) => { o[k] = args[k]; return o; }, {}));
+        const recent = RECENT_WRITES.get(key);
+        if (recent && Date.now() - recent.timestamp < 30000 && !recent.error) {
+            return {
+                error: `DUPLICATE_WRITE_BLOCKED: identical confirmed call ran ${Math.floor((Date.now() - recent.timestamp) / 1000)}s ago. Re-issue after 30s if intentional.`,
+                code: "DUPLICATE_WRITE_BLOCKED",
+            };
+        }
+    }
+
     const { today, yesterday, month_start, dom, pace_dom, dim } = getDateInfo();
     let result;
 
@@ -10887,7 +10903,7 @@ async function handleToolCall(name, args = {}) {
                     if (budgetLines.length) dryRun.budget_confirmation = "BUDGET CHANGES (in dollars):\n" + budgetLines.join("\n");
                     result = dryRun;
                 } else if (budgetLines.length && !args.budget_confirmed) {
-                    result = { error: "BUDGET CHANGE REQUIRES CONFIRMATION. Set budget_confirmed=true in addition to confirm=true. Budget changes:\n" + budgetLines.join("\n") };
+                    result = { error: "BUDGET CHANGE REQUIRES CONFIRMATION. Set budget_confirmed=true in addition to confirm=true. Do not retry without budget_confirmed=true. Budget changes:\n" + budgetLines.join("\n"), code: "NEEDS_BUDGET_CONFIRMED" };
                 } else {
                     try {
                         await metaPost(args.object_id, body);
@@ -11002,6 +11018,15 @@ async function handleToolCall(name, args = {}) {
 
     // Every mutation gates on confirm=true, so this catches all confirmed writes
     if (args && args.confirm === true) logWriteAction(name, args, result);
+
+    // Record confirmed writes for duplicate detection; prune entries older than 60s
+    if (args && args.confirm === true) {
+        const key = name + JSON.stringify(Object.keys(args).sort().reduce((o, k) => { o[k] = args[k]; return o; }, {}));
+        RECENT_WRITES.set(key, { timestamp: Date.now(), error: result.error });
+        for (const [k, v] of RECENT_WRITES) {
+            if (Date.now() - v.timestamp > 60000) RECENT_WRITES.delete(k);
+        }
+    }
 
     return result;
 }
