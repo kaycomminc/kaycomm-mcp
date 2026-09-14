@@ -11150,8 +11150,8 @@ async function main() {
                     } catch (err) {
                         console.error("[archive] run failed:", err);
                     }
-                }, { timezone: "America/Chicago" });
-                console.log("[archive] scheduled daily at 6:00 AM CT");
+                }, { timezone: "America/New_York" });
+                console.log("[archive] scheduled daily at 6:00 AM ET");
             } catch (err) {
                 console.error("[archive] failed to register, server continues:", err.message);
             }

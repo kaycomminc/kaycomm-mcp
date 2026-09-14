@@ -49,7 +49,8 @@ async function getAccessToken(customerId, info) {
 }
 
 async function fetchChangeEvents(token, customerId, mccId, startDate, today) {
-  const apiVersion = process.env.GOOGLE_API_VERSION || "v19";
+  // Keep in sync with GOOGLE_API_VERSION in server.js
+  const apiVersion = process.env.GOOGLE_API_VERSION || "v24";
   const allRows = [];
   let pageToken = null;
 
