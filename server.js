@@ -13,9 +13,22 @@ const { StdioServerTransport } = require("@modelcontextprotocol/sdk/server/stdio
 const { SSEServerTransport }   = require("@modelcontextprotocol/sdk/server/sse.js");
 const { StreamableHTTPServerTransport } = require("@modelcontextprotocol/sdk/server/streamableHttp.js");
 const { CallToolRequestSchema, ListToolsRequestSchema } = require("@modelcontextprotocol/sdk/types.js");
+const { AsyncLocalStorage } = require("node:async_hooks");
+const { randomUUID } = require("node:crypto");
+const { fault, decorateTool, validateArgs, writeIdentity, annotateResult } = require("./src/mcp/contracts");
+const { FileWriteStore, PostgresWriteStore, assertReserved } = require("./src/mcp/write-guard");
+const { sameSecret, readJson, safeHttpHandler } = require("./src/mcp/http");
+const requestContext = new AsyncLocalStorage();
+const TOOL_TIMEOUT_MS = Number(process.env.MCP_TOOL_TIMEOUT_MS) || 150000;
+const UPSTREAM_TIMEOUT_MS = Number(process.env.MCP_UPSTREAM_TIMEOUT_MS) || 30000;
 
-let fetchFn = globalThis.fetch;
-if (!fetchFn) fetchFn = require("node-fetch");
+const nativeFetch = globalThis.fetch || require("node-fetch");
+const fetchFn = (url, options = {}) => {
+    const context = requestContext.getStore();
+    context?.controller.signal.throwIfAborted();
+    const signals = [AbortSignal.timeout(UPSTREAM_TIMEOUT_MS), options.signal, context?.controller.signal].filter(Boolean);
+    return nativeFetch(url, { ...options, signal: AbortSignal.any(signals) });
+};
 
 // ── Credentials — loaded from environment variables ───────────────────────────
 // Set these in Railway → Variables, and in claude_desktop_config.json env block for local use
@@ -139,6 +152,7 @@ function loadAccounts() {
 }
 
 function saveAccounts() {
+    requestContext.getStore()?.controller.signal.throwIfAborted();
     const data = { health_defaults: HEALTH_DEFAULTS, google: GOOGLE_ACCOUNTS, meta: META_ACCOUNTS, stackadapt: STACKADAPT_ADVERTISERS, linkedin: LINKEDIN_ACCOUNTS };
     fs.writeFileSync(ACCOUNTS_FILE, JSON.stringify(data, null, 2) + "\n");
 }
@@ -162,37 +176,28 @@ loadAccounts();
 const WRITE_LOG_FILE = process.env.WRITE_LOG_FILE || path.join(__dirname, "write-log.jsonl");
 
 function logWriteAction(tool, args, result) {
+    // Allowlist only operational metadata. Never log audience PII, uploaded media,
+    // webhook tokens, targeting, creative text, or provider error payloads.
     try {
+        const context = requestContext.getStore();
         const entry = {
-            ts:      new Date().toISOString(),
-            tool,
-            args:    Object.fromEntries(Object.entries(args || {}).filter(([k]) => k !== "confirm")),
-            ok:      !(result && result.error),
-            account: args?.account_name || args?.name || null,
+            ts: new Date().toISOString(), tool,
+            request_id: context?.requestId,
+            account: args?.account_name || null,
+            ok: result?._meta?.status === "success",
+            status: result?._meta?.status || "error",
+            codes: result?._meta?.errors?.map(e => e.code) || [],
         };
-        if (result?.error) entry.error = result.error;
-        if (result?.code) entry.code = result.code;
-
-        // Capture summary of result, if object
-        if (result && typeof result === "object" && !result.error) {
-            const summaryKeys = ["account", "campaign", "ad_group", "updated", "resource_name", "resource_names",
-                                 "previous", "previous_budget", "old_budget", "new_budget", "message"];
-            const summary = {};
-            for (const key of summaryKeys) {
-                if (key in result) {
-                    let val = result[key];
-                    // Truncate strings to 300 chars
-                    if (typeof val === "string" && val.length > 300) val = val.substring(0, 300);
-                    summary[key] = val;
-                }
-            }
-            if (Object.keys(summary).length > 0) entry.summary = summary;
-        }
-
-        fs.appendFileSync(WRITE_LOG_FILE, JSON.stringify(entry) + "\n");
-    } catch (_) { /* logging must never break a write */ }
+        const allowed = ["action", "platform", "level", "object_id", "campaign_id", "adset_id", "ad_id",
+            "budget", "daily_budget", "lifetime_budget", "new_budget", "target_cpa", "target_roas"];
+        entry.args = Object.fromEntries(allowed.filter(k => ["string", "number", "boolean"].includes(typeof args?.[k]))
+            .map(k => [k, args[k]]));
+        fs.appendFileSync(WRITE_LOG_FILE, JSON.stringify(entry) + "\n", { mode: 0o600 });
+        fs.chmodSync(WRITE_LOG_FILE, 0o600);
+    } catch (error) {
+        console.error("[write-audit] log failed", { code: error.code || "AUDIT_LOG_ERROR" });
+    }
 }
-
 function readWriteLog({ days = 30, account_name, tool, limit = 50 } = {}) {
     if (!fs.existsSync(WRITE_LOG_FILE)) return [];
     const cutoff = new Date(Date.now() - days * 86400000).toISOString();
@@ -415,6 +420,7 @@ async function fetchWithRetry(url, opts, tries = 3) {
             }
             return resp;
         } catch (e) {           // network-level failure
+            requestContext.getStore()?.controller.signal.throwIfAborted();
             if (i >= tries - 1) throw e;
             await new Promise(r => setTimeout(r, (2 ** i) * 1000 + Math.random() * 250));
         }
@@ -566,23 +572,29 @@ async function fetchMetaMTD(accountId, monthStart, yesterday) {
 // effective_status filters out anything paused directly or via its parent.
 async function fetchMetaDailyBudgets(accountId) {
     const [camps, adsets] = await Promise.all([
-        metaGet(`${accountId}/campaigns`, { fields: "id,effective_status,daily_budget,lifetime_budget", limit: 200 }),
-        metaGet(`${accountId}/adsets`,    { fields: "id,campaign_id,effective_status,daily_budget,lifetime_budget", limit: 500 }),
+        // metaGetAll follows Graph's paging.next cursor. A single metaGet here
+        // silently dropped campaigns/ad sets after the first page and could
+        // turn an under-counted current budget into a misleading RAISE.
+        metaGetAll(`${accountId}/campaigns`, { fields: "id,effective_status,daily_budget,lifetime_budget", limit: 200 }),
+        metaGetAll(`${accountId}/adsets`,    { fields: "id,campaign_id,effective_status,daily_budget,lifetime_budget", limit: 500 }),
     ]);
     let total = 0, hasLifetime = false;
     const campHasBudget = new Set();
-    for (const c of (camps.data || [])) {
+    for (const c of camps) {
         if (c.effective_status !== "ACTIVE") continue;
         if (c.daily_budget)    { total += parseInt(c.daily_budget) / 100; campHasBudget.add(c.id); }
         if (c.lifetime_budget) { hasLifetime = true; campHasBudget.add(c.id); }
     }
-    for (const s of (adsets.data || [])) {
+    for (const s of adsets) {
         if (s.effective_status !== "ACTIVE") continue;
         if (campHasBudget.has(s.campaign_id)) continue;
         if (s.daily_budget)    total += parseInt(s.daily_budget) / 100;
         if (s.lifetime_budget) hasLifetime = true;
     }
-    return { total, has_lifetime_budgets: hasLifetime };
+    // Only return a recommendation input after both complete paginated reads
+    // succeeded. Callers catch a rejected fetch and omit daily_budget, so a
+    // failed/incomplete budget read can never recommend raising spend.
+    return { total, has_lifetime_budgets: hasLifetime, complete: true };
 }
 
 // ── Row builders ──────────────────────────────────────────────────────────────
@@ -617,8 +629,62 @@ function partitionSkipped(rows) {
     };
 }
 
-async function buildGoogleRows(defaultToken, pace_dom, dim, today, monthStart, yesterday) {
-    return Promise.all(Object.entries(GOOGLE_ACCOUNTS).map(async ([cid, info]) => {
+function reportingPeriod(info, monthStart, yesterday) {
+    if (info.flight_start && info.flight_end) {
+        return {
+            type: "flight",
+            start_date: info.flight_start,
+            end_date: info.flight_end,
+            spend_through: yesterday < info.flight_end ? yesterday : info.flight_end,
+        };
+    }
+    return { type: "month_to_date", start_date: monthStart, end_date: yesterday };
+}
+
+function budgetFetchState(fetcher) {
+    return fetcher()
+        .then(budgets => ({ budgets }))
+        .catch(error => ({
+            budgetError: { error: error.message || String(error), code: "BUDGET_FETCH_FAILED" },
+        }));
+}
+
+function withReportingPeriod(row, info, monthStart, yesterday) {
+    return { ...row, period: reportingPeriod(info, monthStart, yesterday) };
+}
+
+function selectDetailAccounts(search) {
+    const stores = [
+        ["Meta", META_ACCOUNTS], ["Google", GOOGLE_ACCOUNTS],
+        ["StackAdapt", STACKADAPT_ADVERTISERS], ["LinkedIn", LINKEDIN_ACCOUNTS],
+    ];
+    const normalized = String(search || "").trim().toLowerCase();
+    if (!normalized) return { error: "account_name is required" };
+
+    // Resolve the client name globally first. If one platform has an exact
+    // client name, do not mix it with partial matches from another platform.
+    const exact = stores.flatMap(([platform, store]) => Object.entries(store)
+        .filter(([, info]) => info.name.toLowerCase().trim() === normalized)
+        .map(match => ({ platform, match })));
+    if (exact.length) {
+        const selected = {};
+        for (const { platform, match } of exact) {
+            if (selected[platform]) return { error: `Ambiguous account '${search}' matches multiple ${platform} entries` };
+            selected[platform] = match;
+        }
+        return { selected };
+    }
+
+    const selected = {};
+    for (const [platform, store] of stores) {
+        const resolved = resolveAccount(store, search);
+        if (resolved.match) selected[platform] = resolved.match;
+        else if (resolved.error?.startsWith("Ambiguous")) return { error: resolved.error };
+    }
+    return { selected };
+}
+
+async function buildGoogleRow(defaultToken, pace_dom, dim, today, monthStart, yesterday, cid, info) {
         if (info.inactive) return skippedRow(info);
         let token = defaultToken;
         if (info.refresh_token_env) {
@@ -627,26 +693,28 @@ async function buildGoogleRows(defaultToken, pace_dom, dim, today, monthStart, y
             token = t;
         }
         const { budget, nc_budget } = getEffectiveBudget(info, today);
-        const budgetsPromise = fetchGoogleDailyBudgets(token, cid, info.mcc).catch(() => null);
+        const budgetsPromise = budgetFetchState(() => fetchGoogleDailyBudgets(token, cid, info.mcc));
 
         if (info.flight_start && info.flight_end) {
             // Flight-based budget: spend over the flight window, paced against flight days
             const until = yesterday < info.flight_end ? yesterday : info.flight_end;
-            const [{ spend, error }, budgets] = await Promise.all([
+            const [{ spend, error }, budgetState] = await Promise.all([
                 emptyWindow(info.flight_start, until) ? { spend: 0, error: null }
                     : fetchGoogleMTD(token, cid, info.mcc, info.flight_start, until), budgetsPromise]);
             if (error) return { account: info.name, error };
             const tolerance = getHealthConfig(info)?.pacing_tolerance_pct ?? PACING_TOLERANCE_PCT;
             const pacing = getFlightPacing(spend, budget, info.flight_start, info.flight_end, yesterday, tolerance);
             const row = { account: info.name, flight_spend: Math.round(spend * 100) / 100, ...pacing };
-            if (budgets && pacing.days_remaining > 0) {
+            const { budgets, budgetError } = budgetState;
+            if (budgetError) row.daily_budget_error = budgetError;
+            else if (budgets && pacing.days_remaining > 0) {
                 row.daily_budget = buildDailyBudgetRec(budgets.total, pacing.remaining, pacing.days_remaining, tolerance);
             }
             return row;
         }
 
         if (nc_budget) {
-            const [{ nc, other, error }, budgets] = await Promise.all([
+            const [{ nc, other, error }, budgetState] = await Promise.all([
                 emptyWindow(monthStart, yesterday) ? { nc: 0, other: 0, error: null }
                     : fetchGoogleMTDbyNC(token, cid, info.mcc, monthStart, yesterday), budgetsPromise]);
             if (error) return { account: info.name, error };
@@ -663,7 +731,9 @@ async function buildGoogleRows(defaultToken, pace_dom, dim, today, monthStart, y
                     other: { spend: Math.round(other * 100) / 100, budget: otherBudget, ...getPacingLabel(other, otherBudget, pace_dom, dim, tolerance) },
                 },
             };
-            if (budgets && budget) {
+            const { budgets, budgetError } = budgetState;
+            if (budgetError) row.daily_budget_error = budgetError;
+            else if (budgets && budget) {
                 row.daily_budget = buildDailyBudgetRec(budgets.total, budget - total, daysLeft, tolerance);
                 row.breakdown.nc.daily_budget    = buildDailyBudgetRec(budgets.nc,    ncBudget - nc,       daysLeft, tolerance);
                 row.breakdown.other.daily_budget = buildDailyBudgetRec(budgets.other, otherBudget - other, daysLeft, tolerance);
@@ -671,7 +741,7 @@ async function buildGoogleRows(defaultToken, pace_dom, dim, today, monthStart, y
             return row;
         }
 
-        const [{ spend, error }, budgets] = await Promise.all([
+        const [{ spend, error }, budgetState] = await Promise.all([
             emptyWindow(monthStart, yesterday) ? { spend: 0, error: null }
                 : fetchGoogleMTD(token, cid, info.mcc, monthStart, yesterday), budgetsPromise]);
         if (error) return { account: info.name, error };
@@ -680,36 +750,52 @@ async function buildGoogleRows(defaultToken, pace_dom, dim, today, monthStart, y
             account: info.name, mtd_spend: Math.round(spend * 100) / 100,
             budget, ...getPacingLabel(spend, budget, pace_dom, dim, tolerance),
         };
-        if (budgets && budget) {
+        const { budgets, budgetError } = budgetState;
+        if (budgetError) row.daily_budget_error = budgetError;
+        else if (budgets && budget) {
             row.daily_budget = buildDailyBudgetRec(budgets.total, budget - spend, dim - pace_dom, tolerance);
         }
         return row;
-    }));
 }
 
-async function buildMetaRows(pace_dom, dim, today, monthStart, yesterday) {
-    return Promise.all(Object.entries(META_ACCOUNTS).map(async ([id, info]) => {
+async function buildGoogleRows(defaultToken, pace_dom, dim, today, monthStart, yesterday) {
+    const entries = Object.entries(GOOGLE_ACCOUNTS);
+    return mapLimit(entries, 5, async ([cid, info]) => {
+        try {
+            return withReportingPeriod(
+                await buildGoogleRow(defaultToken, pace_dom, dim, today, monthStart, yesterday, cid, info),
+                info, monthStart, yesterday,
+            );
+        } catch (error) {
+            return { account: info.name, error: error.message || String(error), period: reportingPeriod(info, monthStart, yesterday) };
+        }
+    });
+}
+
+async function buildMetaRow(pace_dom, dim, today, monthStart, yesterday, id, info) {
         if (info.inactive) return skippedRow(info);
         const { budget } = getEffectiveBudget(info, today);
-        const budgetsPromise = fetchMetaDailyBudgets(id).catch(() => null);
+        const budgetsPromise = budgetFetchState(() => fetchMetaDailyBudgets(id));
 
         if (info.flight_start && info.flight_end) {
             // Flight-based budget: spend over the flight window, paced against flight days
             const until = yesterday < info.flight_end ? yesterday : info.flight_end;
-            const [{ spend, error }, budgets] = await Promise.all([
+            const [{ spend, error }, budgetState] = await Promise.all([
                 emptyWindow(info.flight_start, until) ? { spend: 0, error: null }
                     : fetchMetaMTD(id, info.flight_start, until), budgetsPromise]);
             if (error) return { account: info.name, error };
             const tolerance = getHealthConfig(info)?.pacing_tolerance_pct ?? PACING_TOLERANCE_PCT;
             const pacing = getFlightPacing(spend, budget, info.flight_start, info.flight_end, yesterday, tolerance);
             const row = { account: info.name, flight_spend: Math.round(spend * 100) / 100, ...pacing };
-            if (budgets && pacing.days_remaining > 0) {
+            const { budgets, budgetError } = budgetState;
+            if (budgetError) row.daily_budget_error = budgetError;
+            else if (budgets?.complete && pacing.days_remaining > 0) {
                 row.daily_budget = buildDailyBudgetRec(budgets.total, pacing.remaining, pacing.days_remaining, tolerance, { hasLifetimeBudgets: budgets.has_lifetime_budgets });
             }
             return row;
         }
 
-        const [{ spend, error }, budgets] = await Promise.all([
+        const [{ spend, error }, budgetState] = await Promise.all([
             emptyWindow(monthStart, yesterday) ? { spend: 0, error: null }
                 : fetchMetaMTD(id, monthStart, yesterday), budgetsPromise]);
         if (error) return { account: info.name, error };
@@ -718,11 +804,26 @@ async function buildMetaRows(pace_dom, dim, today, monthStart, yesterday) {
             account: info.name, mtd_spend: Math.round(spend * 100) / 100,
             budget, ...getPacingLabel(spend, budget, pace_dom, dim, tolerance),
         };
-        if (budgets && budget) {
+        const { budgets, budgetError } = budgetState;
+        if (budgetError) row.daily_budget_error = budgetError;
+        else if (budgets?.complete && budget) {
             row.daily_budget = buildDailyBudgetRec(budgets.total, budget - spend, dim - pace_dom, tolerance, { hasLifetimeBudgets: budgets.has_lifetime_budgets });
         }
         return row;
-    }));
+}
+
+async function buildMetaRows(pace_dom, dim, today, monthStart, yesterday) {
+    const entries = Object.entries(META_ACCOUNTS);
+    return mapLimit(entries, 5, async ([id, info]) => {
+        try {
+            return withReportingPeriod(
+                await buildMetaRow(pace_dom, dim, today, monthStart, yesterday, id, info),
+                info, monthStart, yesterday,
+            );
+        } catch (error) {
+            return { account: info.name, error: error.message || String(error), period: reportingPeriod(info, monthStart, yesterday) };
+        }
+    });
 }
 
 // ── Negative keyword write ────────────────────────────────────────────────────
@@ -892,6 +993,7 @@ async function metaGet(path, extraParams = {}) {
     const params = new URLSearchParams({ access_token: META_ACCESS_TOKEN, ...extraParams });
     const resp = await fetchWithRetry(`https://graph.facebook.com/${META_API_VERSION}/${path}?${params}`);
     const data = await resp.json();
+    if (!resp.ok && !data.error) throw new Error(`Meta API request failed (${resp.status})`);
     if (data.error) throw new Error(data.error.message);
     return data;
 }
@@ -963,12 +1065,15 @@ function metaConversions(actions = []) {
 async function metaGetAll(path, extraParams = {}) {
     const rows = [];
     let data = await metaGet(path, extraParams);
+    if (!Array.isArray(data.data)) throw new Error("Meta API returned an incomplete paginated response");
     rows.push(...(data.data || []));
     let next = data.paging?.next;
     while (next) {
         const resp = await fetchWithRetry(next); // paging.next carries the access token
         data = await resp.json();
+        if (!resp.ok && !data.error) throw new Error(`Meta API request failed (${resp.status})`);
         if (data.error) throw new Error(data.error.message);
+        if (!Array.isArray(data.data)) throw new Error("Meta API returned an incomplete paginated response");
         rows.push(...(data.data || []));
         next = data.paging?.next;
     }
@@ -2109,6 +2214,9 @@ async function fetchSearchTerms(token, customerId, mccId, dateRange, startDate, 
 
     return {
         total_terms: terms.length,
+        source_row_limit: 500,
+        possibly_truncated: terms.length >= 500,
+        review_note: "The legacy wasted list means cost > $3 with zero recorded conversions, not proven waste or approved negatives. Review brand intent, sample size, and conversion lag before excluding a term.",
         campaigns,
         wasted:    terms.filter(t => t.cost > 3 && t.convs === 0).slice(0, 25),
         converting: terms.filter(t => t.convs > 0),
@@ -2197,6 +2305,7 @@ async function fetchPmaxSearchTermInsights(token, customerId, mccId, dateRange, 
             },
             wasted_spend_total: Math.round(wastedSpend * 100) / 100,
             wasted_terms_total: wastedAll.length,
+            review_note: "Zero-conversion spend is a review candidate, not proof of waste. Check brand intent, sample size, and conversion lag before adding negatives.",
             converting_total:   convAll.length,
             top_terms:  bySpend.slice(0, topN),
             wasted:     wastedAll.slice(0, topN),
@@ -4575,6 +4684,9 @@ async function fetchPmaxListingGroups(token, customerId, mccId, dateClause, topN
                 dimension:      n.dimension || (n.parent ? "(everything else)" : "(root — all products)"),
                 type:           n.type,
                 depth:          depthOf(n),
+                // Keep the tree relationship in the response. Parent and
+                // child metrics overlap in hierarchical listing groups.
+                parent:         n.parent || null,
                 listing_source: n.listing_source,
                 ...(n.agg ? shapeAgg(n.agg) : {}),
                 _spend:         n.agg ? n.agg.spend : 0,
@@ -4609,6 +4721,7 @@ async function fetchPmaxListingGroups(token, customerId, mccId, dateClause, topN
         total_asset_groups: assetGroups.length,
         catch_all_asset_groups: assetGroups.filter(g => g.is_single_catch_all).length,
         metrics_available: !metricsError,
+        hierarchy_note: "Listing-group metrics are hierarchical and not additive across parent/child nodes; totals roll up leaf unit nodes only.",
         totals: shapeAgg(rollup),
         asset_groups: assetGroups,
     };
@@ -4853,13 +4966,14 @@ async function listCampaignNegatives(token, customerId, mccId, campaignFilters =
 // makeServer() builds a fresh Server instance with both handlers registered.
 // stdio mode and SSE mode share one module-level instance; the stateless
 // Streamable HTTP transport (see main()) gets a fresh instance per request.
+let toolCatalog;
 function makeServer() {
     const srv = new Server(
         { name: "kaycomm-pacing", version: "2.0.0" },
         { capabilities: { tools: {} } }
     );
 
-    srv.setRequestHandler(ListToolsRequestSchema, async () => ({
+    const listedTools = {
     tools: [
         {
             name: "get_google_pacing",
@@ -5933,7 +6047,7 @@ function makeServer() {
         {
             name: "get_pmax_asset_groups",
             description: "Performance Max asset group report — spend, clicks, conversions, CPA, ROAS per asset group, plus status/primary_status to spot limited or disapproved groups. " +
-                "Set include_assets=true to also pull asset-level performance labels (BEST/GOOD/LOW/LEARNING) for enabled assets. " +
+                "Set include_assets=true to pull enabled asset inventory and policy details; aggregate PMax asset performance labels are not available. " +
                 "Use with get_pmax_search_terms for a full picture of what PMax is doing.",
             inputSchema: {
                 type: "object",
@@ -5983,6 +6097,7 @@ function makeServer() {
             name: "get_pmax_listing_groups",
             description: "Performance Max listing group (product partition) tree per asset group, with metrics where available. " +
                 "Shows how product inventory is partitioned inside PMax — by item ID, brand, product type, condition, channel, or custom label — and flags asset groups that are a single undifferentiated catch-all node. " +
+                "Parent/child metrics overlap and are not additive; totals roll up leaf units only. For product-level performance, use get_shopping_performance. " +
                 "Use when a retail PMax campaign needs diagnosing and you want to know whether inventory is actually segmented or all lumped together.",
             inputSchema: {
                 type: "object",
@@ -6629,12 +6744,15 @@ function makeServer() {
             },
         },
     ],
-    }));
+    };
+    if (!toolCatalog) toolCatalog = new Map(listedTools.tools.map(t => [t.name, decorateTool(t)]));
+    srv.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [...toolCatalog.values()] }));
 
     srv.setRequestHandler(CallToolRequestSchema, async (request) => {
         const { name, arguments: args } = request.params;
         const result = await handleToolCall(name, args || {});
-        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+            structuredContent: result, isError: result._meta.status === "error" };
     });
 
     return srv;
@@ -6642,22 +6760,64 @@ function makeServer() {
 
 const server = makeServer();
 
-// Track recent write attempts to prevent duplicate writes
-const RECENT_WRITES = new Map();
+// Shared across transports and processes. Prefer Postgres on Railway; otherwise
+// keep state beside the persistent audit log (WRITE_STATE_DIR can override).
+const writeStore = process.env.DATABASE_URL
+    ? new PostgresWriteStore(() => require("./src/archive/db").getPool())
+    : new FileWriteStore(process.env.WRITE_STATE_DIR || path.join(path.dirname(WRITE_LOG_FILE), ".mcp-write-state"));
+let writeStorageReady = false;
 
 async function handleToolCall(name, args = {}) {
-    // Duplicate-write guard: if confirm=true and we've seen this exact call
-    // recently (<30s ago with ok result), block it
-    if (args.confirm === true) {
-        const key = name + JSON.stringify(Object.keys(args).sort().reduce((o, k) => { o[k] = args[k]; return o; }, {}));
-        const recent = RECENT_WRITES.get(key);
-        if (recent && Date.now() - recent.timestamp < 30000 && !recent.error) {
-            return {
-                error: `DUPLICATE_WRITE_BLOCKED: identical confirmed call ran ${Math.floor((Date.now() - recent.timestamp) / 1000)}s ago. Re-issue after 30s if intentional.`,
-                code: "DUPLICATE_WRITE_BLOCKED",
-            };
+    const context = { requestId: randomUUID(), started: Date.now(), controller: new AbortController() };
+    return requestContext.run(context, async () => {
+        let result, reservationKey, timer;
+        try {
+            validateArgs(toolCatalog.get(name), args);
+            const work = (async () => {
+                const { validateOwnership } = require("./src/mcp/ownership");
+                const ownership = await validateOwnership(name, args, {
+                    googleAccounts: GOOGLE_ACCOUNTS, metaAccounts: META_ACCOUNTS,
+                    resolveAccount, metaGetAll, metaGet,
+                });
+                if (ownership?.error) throw fault(ownership.code || "TARGET_ACCOUNT_MISMATCH", ownership.error);
+                context.controller.signal.throwIfAborted();
+                if (args.confirm === true) {
+                    const { key, payloadHash } = writeIdentity(name, args);
+                    const reservation = await writeStore.reserve(key, payloadHash);
+                    assertReserved(reservation);
+                    reservationKey = key;
+                    context.controller.signal.throwIfAborted();
+                }
+                return dispatchToolCall(name, args);
+            })();
+            const deadline = new Promise((_, reject) => {
+                timer = setTimeout(() => {
+                    const error = fault("TOOL_TIMEOUT", "Tool deadline exceeded. A confirmed write may have an unknown outcome; reconcile before retrying.");
+                    context.controller.abort(error);
+                    reject(error);
+                }, TOOL_TIMEOUT_MS);
+            });
+            result = await Promise.race([work, deadline]);
+        } catch (error) {
+            result = { error: error.message, code: error.code || (error.name === "TimeoutError" ? "UPSTREAM_TIMEOUT" : "TOOL_ERROR") };
+        } finally {
+            clearTimeout(timer);
         }
-    }
+        result = annotateResult(result, context);
+        if (reservationKey) {
+            try { await writeStore.finish(reservationKey, result._meta.status === "success" ? "completed" : "unknown"); }
+            catch (error) {
+                // A pending reservation remains fail-closed if finalization fails.
+                result = annotateResult({ ...result, error: "WRITE_STATE_ERROR: Could not record the final outcome. Reconcile before retrying.", code: "WRITE_STATE_ERROR" }, context);
+                console.error("[write-state] finalization failed", { code: error.code || "WRITE_STATE_ERROR" });
+            }
+        }
+        if (args?.confirm === true) logWriteAction(name, args, result);
+        return result;
+    });
+}
+
+async function dispatchToolCall(name, args = {}) {
 
     const { today, yesterday, month_start, dom, pace_dom, dim } = getDateInfo();
     let result;
@@ -6691,82 +6851,88 @@ async function handleToolCall(name, args = {}) {
         if (allSkipped.length) result.skipped = allSkipped;
 
     } else if (name === "get_account_detail") {
-        const search = (args.account_name || "").toLowerCase();
-        const results = [];
+        const search = args.account_name;
+        const selection = selectDetailAccounts(search);
+        if (selection.error) {
+            result = { error: selection.error };
+        } else if (!Object.keys(selection.selected).length) {
+            result = { error: `No account found matching '${args.account_name}'` };
+        } else {
+            const selected = selection.selected;
+            const results = [];
+            const period = info => reportingPeriod(info, month_start, yesterday);
 
-        // Meta
-        for (const [id, info] of Object.entries(META_ACCOUNTS)) {
-            if (info.name.toLowerCase().includes(search)) {
-                const { budget } = getEffectiveBudget(info, today);
-                const { spend, error } = await fetchMetaMTD(id, month_start, yesterday);
-                if (error) results.push({ platform: "Meta", account: info.name, error });
-                else results.push({ platform: "Meta", account: info.name,
-                    mtd_spend: Math.round(spend * 100) / 100, budget,
-                    ...getPacingLabel(spend, budget, pace_dom, dim) });
-            }
-        }
-
-        // Google
-        for (const [cid, info] of Object.entries(GOOGLE_ACCOUNTS)) {
-            if (info.name.toLowerCase().includes(search)) {
-                const { token } = await getGoogleAccessToken(cid);
-                if (!token) { results.push({ platform: "Google", account: info.name, error: "Auth failed" }); continue; }
-                const { budget } = getEffectiveBudget(info, today);
-                const { spend, error } = await fetchGoogleMTD(token, cid, info.mcc, month_start, yesterday);
-                if (error) results.push({ platform: "Google", account: info.name, error });
-                else results.push({ platform: "Google", account: info.name,
-                    mtd_spend: Math.round(spend * 100) / 100, budget,
-                    ...getPacingLabel(spend, budget, pace_dom, dim) });
-            }
-        }
-
-        // StackAdapt
-        for (const [advId, info] of Object.entries(STACKADAPT_ADVERTISERS)) {
-            if (!info.name.toLowerCase().includes(search)) continue;
-            const { budget } = getEffectiveBudget(info, today);
-            try {
-                if (info.flight_start && info.flight_end) {
-                    const until = yesterday < info.flight_end ? yesterday : info.flight_end;
-                    const { spend } = emptyWindow(info.flight_start, until) ? { spend: 0 }
-                        : await fetchStackAdaptSpend(advId, info.flight_start, until);
-                    results.push({ platform: "StackAdapt", account: info.name,
-                        flight_spend: Math.round(spend * 100) / 100,
-                        ...getFlightPacing(spend, budget, info.flight_start, info.flight_end, yesterday) });
-                } else {
-                    const { spend } = emptyWindow(month_start, yesterday) ? { spend: 0 }
-                        : await fetchStackAdaptSpend(advId, month_start, yesterday);
-                    results.push({ platform: "StackAdapt", account: info.name,
-                        mtd_spend: Math.round(spend * 100) / 100, budget,
-                        ...getPacingLabel(spend, budget, pace_dom, dim) });
+            // Reuse the same row builders used by the pacing tools. In
+            // particular, a flight account is fetched over its flight window,
+            // not MTD against the full-flight budget.
+            if (selected.Meta) {
+                const [id, info] = selected.Meta;
+                try {
+                    const row = await buildMetaRow(pace_dom, dim, today, month_start, yesterday, id, info);
+                    results.push({ platform: "Meta", ...row, period: period(info) });
+                } catch (error) {
+                    results.push({ platform: "Meta", account: info.name, error: error.message || String(error), period: period(info) });
                 }
-            } catch (e) { results.push({ platform: "StackAdapt", account: info.name, error: e.message }); }
-        }
-
-        // LinkedIn
-        for (const [acctId, info] of Object.entries(LINKEDIN_ACCOUNTS)) {
-            if (!info.name.toLowerCase().includes(search)) continue;
-            const { budget } = getEffectiveBudget(info, today);
-            try {
-                if (info.flight_start && info.flight_end) {
-                    const until = yesterday < info.flight_end ? yesterday : info.flight_end;
-                    const { spend } = emptyWindow(info.flight_start, until) ? { spend: 0 }
-                        : await fetchLinkedInMTD(acctId, info.flight_start, until);
-                    results.push({ platform: "LinkedIn", account: info.name,
-                        flight_spend: Math.round(spend * 100) / 100,
-                        ...getFlightPacing(spend, budget, info.flight_start, info.flight_end, yesterday) });
-                } else {
-                    const { spend } = emptyWindow(month_start, yesterday) ? { spend: 0 }
-                        : await fetchLinkedInMTD(acctId, month_start, yesterday);
-                    results.push({ platform: "LinkedIn", account: info.name,
-                        mtd_spend: Math.round(spend * 100) / 100, budget,
-                        ...getPacingLabel(spend, budget, pace_dom, dim) });
+            }
+            if (selected.Google) {
+                const [cid, info] = selected.Google;
+                try {
+                    const tokenResult = await getGoogleAccessToken(cid);
+                    const row = tokenResult.error
+                        ? { account: info.name, error: `Auth failed: ${tokenResult.error}` }
+                        : await buildGoogleRow(tokenResult.token, pace_dom, dim, today, month_start, yesterday, cid, info);
+                    results.push({ platform: "Google", ...row, period: period(info) });
+                } catch (error) {
+                    results.push({ platform: "Google", account: info.name, error: error.message || String(error), period: period(info) });
                 }
-            } catch (e) { results.push({ platform: "LinkedIn", account: info.name, error: e.message }); }
-        }
+            }
 
-        result = results.length
-            ? { date: today, spend_through: yesterday, day: dom, days_in_month: dim, results }
-            : { error: `No account found matching '${args.account_name}'` };
+            if (selected.StackAdapt) {
+                const [advId, info] = selected.StackAdapt;
+                const { budget } = getEffectiveBudget(info, today);
+                try {
+                    if (info.flight_start && info.flight_end) {
+                        const until = yesterday < info.flight_end ? yesterday : info.flight_end;
+                        const { spend } = emptyWindow(info.flight_start, until) ? { spend: 0 }
+                            : await fetchStackAdaptSpend(advId, info.flight_start, until);
+                        results.push({ platform: "StackAdapt", account: info.name,
+                            flight_spend: Math.round(spend * 100) / 100,
+                            ...getFlightPacing(spend, budget, info.flight_start, info.flight_end, yesterday),
+                            period: period(info) });
+                    } else {
+                        const { spend } = emptyWindow(month_start, yesterday) ? { spend: 0 }
+                            : await fetchStackAdaptSpend(advId, month_start, yesterday);
+                        results.push({ platform: "StackAdapt", account: info.name,
+                            mtd_spend: Math.round(spend * 100) / 100, budget,
+                            ...getPacingLabel(spend, budget, pace_dom, dim), period: period(info) });
+                    }
+                } catch (e) { results.push({ platform: "StackAdapt", account: info.name, error: e.message, period: period(info) }); }
+            }
+
+            if (selected.LinkedIn) {
+                const [acctId, info] = selected.LinkedIn;
+                const { budget } = getEffectiveBudget(info, today);
+                try {
+                    if (info.flight_start && info.flight_end) {
+                        const until = yesterday < info.flight_end ? yesterday : info.flight_end;
+                        const { spend } = emptyWindow(info.flight_start, until) ? { spend: 0 }
+                            : await fetchLinkedInMTD(acctId, info.flight_start, until);
+                        results.push({ platform: "LinkedIn", account: info.name,
+                            flight_spend: Math.round(spend * 100) / 100,
+                            ...getFlightPacing(spend, budget, info.flight_start, info.flight_end, yesterday),
+                            period: period(info) });
+                    } else {
+                        const { spend } = emptyWindow(month_start, yesterday) ? { spend: 0 }
+                            : await fetchLinkedInMTD(acctId, month_start, yesterday);
+                        results.push({ platform: "LinkedIn", account: info.name,
+                            mtd_spend: Math.round(spend * 100) / 100, budget,
+                            ...getPacingLabel(spend, budget, pace_dom, dim), period: period(info) });
+                    }
+                } catch (e) { results.push({ platform: "LinkedIn", account: info.name, error: e.message, period: period(info) }); }
+            }
+
+            result = { date: today, spend_through: yesterday, day: dom, days_in_month: dim, results };
+        }
 
     } else if (name === "get_search_terms") {
         const search    = (args.account_name || "").toLowerCase();
@@ -7044,12 +7210,12 @@ async function handleToolCall(name, args = {}) {
     } else if (name === "pause_campaign" || name === "enable_campaign") {
         const campSearch = (args.campaign_name || "").toLowerCase();
         const platform  = args.platform || "google";
-        const confirm   = !!args.confirm;
+        const confirm   = args.confirm === true;
         const newStatus = name === "pause_campaign" ? "PAUSED" : "ENABLED";
         const metaStatus = name === "pause_campaign" ? "PAUSED" : "ACTIVE";
 
         if (platform === "google") {
-            const { match, error: acctErr } = resolveAccount(GOOGLE_ACCOUNTS, args.account_name, { confirmed: !!args.confirm });
+            const { match, error: acctErr } = resolveAccount(GOOGLE_ACCOUNTS, args.account_name, { confirmed: args.confirm === true });
             if (!match) { result = { error: acctErr }; }
             else {
                 const [cid, info] = match;
@@ -7058,7 +7224,7 @@ async function handleToolCall(name, args = {}) {
                 else {
                     try {
                         const campaigns = await listGoogleCampaignsFull(token, cid, info.mcc);
-                        const campSel = matchByName(campaigns, c => c.name, campSearch, { confirmed: !!args.confirm, label: "campaign" });
+                        const campSel = matchByName(campaigns, c => c.name, campSearch, { confirmed: args.confirm === true, label: "campaign" });
                         const camp = campSel.item;
                         if (!camp) {
                             if (campSel.error) {
@@ -7077,13 +7243,13 @@ async function handleToolCall(name, args = {}) {
             }
         } else {
             // Meta
-            const { match, error: acctErr } = resolveAccount(META_ACCOUNTS, args.account_name, { confirmed: !!args.confirm });
+            const { match, error: acctErr } = resolveAccount(META_ACCOUNTS, args.account_name, { confirmed: args.confirm === true });
             if (!match) { result = { error: acctErr }; }
             else {
                 const [accountId, info] = match;
                 try {
                     const campaigns = await getMetaCampaigns(accountId);
-                    const campSel = matchByName(campaigns, c => c.name, campSearch, { confirmed: !!args.confirm, label: "campaign" });
+                    const campSel = matchByName(campaigns, c => c.name, campSearch, { confirmed: args.confirm === true, label: "campaign" });
                     const camp = campSel.item;
                     if (!camp) {
                         if (campSel.error) {
@@ -7105,10 +7271,10 @@ async function handleToolCall(name, args = {}) {
         const search     = (args.account_name || "").toLowerCase();
         const agSearch   = (args.ad_group_name || "").toLowerCase();
         const campSearch = args.campaign_name ? args.campaign_name.toLowerCase() : null;
-        const confirm    = !!args.confirm;
+        const confirm    = args.confirm === true;
         const newStatus  = name === "pause_ad_group" ? "PAUSED" : "ENABLED";
 
-        const { match: match, error: matchErr } = resolveAccount(GOOGLE_ACCOUNTS, search, { confirmed: !!args.confirm });
+        const { match: match, error: matchErr } = resolveAccount(GOOGLE_ACCOUNTS, search, { confirmed: args.confirm === true });
         if (!match) { result = { error: matchErr }; }
         else {
             const [cid, info] = match;
@@ -7147,10 +7313,10 @@ async function handleToolCall(name, args = {}) {
         const agSearch   = args.ad_group_name ? args.ad_group_name.toLowerCase() : null;
         const matchType  = args.match_type ? args.match_type.toUpperCase() : null;
         const allMatches = !!args.all_matches;
-        const confirm    = !!args.confirm;
+        const confirm    = args.confirm === true;
         const newStatus  = name === "pause_keyword" ? "PAUSED" : "ENABLED";
 
-        const { match, error: acctErr } = resolveAccount(GOOGLE_ACCOUNTS, args.account_name, { confirmed: !!args.confirm });
+        const { match, error: acctErr } = resolveAccount(GOOGLE_ACCOUNTS, args.account_name, { confirmed: args.confirm === true });
         if (!kwSearch) { result = { error: "keyword_text is required." }; }
         else if (!match) { result = { error: acctErr }; }
         else {
@@ -7240,7 +7406,7 @@ async function handleToolCall(name, args = {}) {
         const campSearch = (args.campaign_name || "").toLowerCase();
         const platform   = args.platform || "google";
         const daily      = args.daily_budget;
-        const confirm    = !!args.confirm;
+        const confirm    = args.confirm === true;
 
         const dailyBudgetErrors = daily ? validateBudgets({ daily_budget: daily }) : null;
         if (!daily || daily <= 0) {
@@ -7248,7 +7414,7 @@ async function handleToolCall(name, args = {}) {
         } else if (dailyBudgetErrors) {
             result = { error: dailyBudgetErrors.join(" | ") };
         } else if (platform === "google") {
-            const { match: match, error: matchErr } = resolveAccount(GOOGLE_ACCOUNTS, search, { confirmed: !!args.confirm });
+            const { match: match, error: matchErr } = resolveAccount(GOOGLE_ACCOUNTS, search, { confirmed: args.confirm === true });
             if (!match) { result = { error: matchErr }; }
             else {
                 const [cid, info] = match;
@@ -7257,7 +7423,7 @@ async function handleToolCall(name, args = {}) {
                 else {
                     try {
                         const campaigns = await listGoogleCampaignsFull(token, cid, info.mcc);
-                        const campSel = matchByName(campaigns, c => c.name, campSearch, { confirmed: !!args.confirm, label: "campaign" });
+                        const campSel = matchByName(campaigns, c => c.name, campSearch, { confirmed: args.confirm === true, label: "campaign" });
                         const camp = campSel.item;
                         if (!camp) {
                             if (campSel.error) {
@@ -7276,13 +7442,13 @@ async function handleToolCall(name, args = {}) {
             }
         } else {
             // Meta
-            const { match: match, error: matchErr } = resolveAccount(META_ACCOUNTS, search, { confirmed: !!args.confirm });
+            const { match: match, error: matchErr } = resolveAccount(META_ACCOUNTS, search, { confirmed: args.confirm === true });
             if (!match) { result = { error: matchErr }; }
             else {
                 const [accountId, info] = match;
                 try {
                     const campaigns = await getMetaCampaigns(accountId);
-                    const campSel = matchByName(campaigns, c => c.name, campSearch, { confirmed: !!args.confirm, label: "campaign" });
+                    const campSel = matchByName(campaigns, c => c.name, campSearch, { confirmed: args.confirm === true, label: "campaign" });
                     const camp = campSel.item;
                     if (!camp) {
                         if (campSel.error) {
@@ -7541,10 +7707,10 @@ async function handleToolCall(name, args = {}) {
     } else if (name === "manage_meta") {
         const search  = (args.account_name || "").toLowerCase();
         const action  = args.action || "list_adsets";
-        const confirm = !!args.confirm;
+        const confirm = args.confirm === true;
         const level   = args.level || "adset";
 
-        const { match: acctMatch, error: acctMatchErr } = resolveAccount(META_ACCOUNTS, search, { confirmed: !!args.confirm });
+        const { match: acctMatch, error: acctMatchErr } = resolveAccount(META_ACCOUNTS, search, { confirmed: args.confirm === true });
         if (!acctMatch) {
             result = { error: acctMatchErr };
         } else {
@@ -7639,7 +7805,7 @@ async function handleToolCall(name, args = {}) {
                         // Use the same recursive shallow-copy as duplicate_meta_campaign
                         const targetSearch = args.target.toLowerCase();
                         const all = await getMetaCampaigns(accountId);
-                        const itemSel = matchByName(all, i => i.name, targetSearch, { confirmed: !!args.confirm, label: "item" });
+                        const itemSel = matchByName(all, i => i.name, targetSearch, { confirmed: args.confirm === true, label: "item" });
                         const item = itemSel.item;
                         if (!item) {
                             if (itemSel.error) {
@@ -7697,7 +7863,7 @@ async function handleToolCall(name, args = {}) {
                         // Ad set level duplicate — single shallow copy is fine
                         const targetSearch = args.target.toLowerCase();
                         const all = await getMetaAdsets(accountId);
-                        const itemSel = matchByName(all, i => i.name, targetSearch, { confirmed: !!args.confirm, label: "item" });
+                        const itemSel = matchByName(all, i => i.name, targetSearch, { confirmed: args.confirm === true, label: "item" });
                         const item = itemSel.item;
                         if (!item) {
                             if (itemSel.error) {
@@ -7798,9 +7964,9 @@ async function handleToolCall(name, args = {}) {
         const search    = (args.account_name || "").toLowerCase();
         const keywords  = args.keywords || [];
         const matchType = (args.match_type || "EXACT").toUpperCase();
-        const confirm   = !!args.confirm;
+        const confirm   = args.confirm === true;
 
-        const { match: acctMatch, error: acctMatchErr } = resolveAccount(GOOGLE_ACCOUNTS, search, { confirmed: !!args.confirm });
+        const { match: acctMatch, error: acctMatchErr } = resolveAccount(GOOGLE_ACCOUNTS, search, { confirmed: args.confirm === true });
         if (!acctMatch) {
             result = { error: acctMatchErr };
         } else {
@@ -7820,7 +7986,7 @@ async function handleToolCall(name, args = {}) {
                         };
                     } else {
                         const campSearch = args.campaign_name.toLowerCase();
-                        const campMatchSel = matchByName(campaigns, c => c.name, campSearch, { confirmed: !!args.confirm, label: "campaign" });
+                        const campMatchSel = matchByName(campaigns, c => c.name, campSearch, { confirmed: args.confirm === true, label: "campaign" });
                         const campMatch  = campMatchSel.item;
                         if (!campMatch) {
                             if (campMatchSel.error) {
@@ -7843,7 +8009,7 @@ async function handleToolCall(name, args = {}) {
                                 const agSearch = (args.ad_group_name || "").toLowerCase();
                                 if (!agSearch) throw new Error("ad_group_name is required when level=ad_group.");
                                 const adGroups = await listAdGroupsFull(token, cid, info.mcc, campMatch.name);
-                                const adGroupSel = matchByName(adGroups, g => g.name, agSearch, { confirmed: !!args.confirm, label: "ad group" });
+                                const adGroupSel = matchByName(adGroups, g => g.name, agSearch, { confirmed: args.confirm === true, label: "ad group" });
                                 adGroup = adGroupSel.item;
                                 if (!adGroup) {
                                     if (adGroupSel.error) {
@@ -8036,6 +8202,13 @@ async function handleToolCall(name, args = {}) {
 
     } else if (name === "health_check") {
         const checks = {};
+        checks.write_safety = {
+            storage: process.env.DATABASE_URL ? "postgres" : "filesystem",
+            ready: writeStorageReady,
+            tool_timeout_ms: TOOL_TIMEOUT_MS,
+            upstream_timeout_ms: UPSTREAM_TIMEOUT_MS,
+            ...(writeStorageReady ? {} : { error: "Write-reservation storage has not initialized; confirmed writes fail closed if storage is unavailable." }),
+        };
 
         // Google: token refresh + a trivial query against the default token,
         // then verify each account that uses a separate refresh token.
@@ -8142,7 +8315,7 @@ async function handleToolCall(name, args = {}) {
     } else if (name === "manage_accounts") {
         const action   = args.action || "list";
         const platform = args.platform;
-        const confirm  = !!args.confirm;
+        const confirm  = args.confirm === true;
         const stores   = { google: GOOGLE_ACCOUNTS, meta: META_ACCOUNTS, stackadapt: STACKADAPT_ADVERTISERS, linkedin: LINKEDIN_ACCOUNTS };
 
         if (action === "list") {
@@ -8337,7 +8510,7 @@ async function handleToolCall(name, args = {}) {
     } else if (name === "create_ad_group") {
         const search     = (args.account_name || "").toLowerCase();
         const campSearch = (args.campaign_name || "").toLowerCase();
-        const confirm    = !!args.confirm;
+        const confirm    = args.confirm === true;
         const status     = (args.status || "PAUSED").toUpperCase();
         const keywords   = args.keywords   || [];
         const headlines  = args.headlines  || [];
@@ -8346,7 +8519,7 @@ async function handleToolCall(name, args = {}) {
         if (!args.ad_group_name) {
             result = { error: "ad_group_name is required." };
         } else {
-            const { match: match, error: matchErr } = resolveAccount(GOOGLE_ACCOUNTS, search, { confirmed: !!args.confirm });
+            const { match: match, error: matchErr } = resolveAccount(GOOGLE_ACCOUNTS, search, { confirmed: args.confirm === true });
             if (!match) {
                 result = { error: matchErr };
             } else {
@@ -8356,7 +8529,7 @@ async function handleToolCall(name, args = {}) {
                 else {
                     try {
                         const campaigns = await listGoogleCampaignsFull(token, cid, info.mcc);
-                        const campSel = matchByName(campaigns, c => c.name, campSearch, { confirmed: !!args.confirm, label: "campaign" });
+                        const campSel = matchByName(campaigns, c => c.name, campSearch, { confirmed: args.confirm === true, label: "campaign" });
                         const camp = campSel.item;
                         if (!camp) {
                             if (campSel.error) {
@@ -8410,7 +8583,7 @@ async function handleToolCall(name, args = {}) {
         const headlines   = args.headlines   || [];
         const descs       = args.descriptions || [];
         const finalUrl    = args.final_url   || null;
-        const confirm     = !!args.confirm;
+        const confirm     = args.confirm === true;
         const hasRsa      = headlines.length >= 3 && descs.length >= 2 && finalUrl;
 
         if (!agResource) {
@@ -8418,7 +8591,7 @@ async function handleToolCall(name, args = {}) {
         } else if (!keywords.length && !hasRsa) {
             result = { error: "Provide keywords, or headlines + descriptions + final_url for an RSA." };
         } else {
-            const { match: match, error: matchErr } = resolveAccount(GOOGLE_ACCOUNTS, search, { confirmed: !!args.confirm });
+            const { match: match, error: matchErr } = resolveAccount(GOOGLE_ACCOUNTS, search, { confirmed: args.confirm === true });
             if (!match) {
                 result = { error: matchErr };
             } else {
@@ -8531,9 +8704,9 @@ async function handleToolCall(name, args = {}) {
         const search     = (args.account_name || "").toLowerCase();
         const campSearch = (args.campaign_name || "").toLowerCase();
         const strategy   = (args.strategy || "").toUpperCase();
-        const confirm    = !!args.confirm;
+        const confirm    = args.confirm === true;
 
-        const { match: match, error: matchErr } = resolveAccount(GOOGLE_ACCOUNTS, search, { confirmed: !!args.confirm });
+        const { match: match, error: matchErr } = resolveAccount(GOOGLE_ACCOUNTS, search, { confirmed: args.confirm === true });
         if (!match) {
             result = { error: matchErr };
         } else {
@@ -8543,7 +8716,7 @@ async function handleToolCall(name, args = {}) {
             else {
                 try {
                     const campaigns = await listGoogleCampaignsFull(token, cid, info.mcc);
-                    const campSel = matchByName(campaigns, c => c.name, campSearch, { confirmed: !!args.confirm, label: "campaign" });
+                    const campSel = matchByName(campaigns, c => c.name, campSearch, { confirmed: args.confirm === true, label: "campaign" });
                     const camp = campSel.item;
                     if (!camp) {
                         if (campSel.error) {
@@ -8577,12 +8750,12 @@ async function handleToolCall(name, args = {}) {
 
     } else if (name === "create_campaign") {
         const search  = (args.account_name || "").toLowerCase();
-        const confirm = !!args.confirm;
+        const confirm = args.confirm === true;
 
         if (!args.campaign_name || !args.daily_budget || !args.ad_groups?.length || !args.geo_targets?.length) {
             result = { error: "campaign_name, daily_budget, at least one ad_group, and at least one geo_target are required." };
         } else {
-            const { match: match, error: matchErr } = resolveAccount(GOOGLE_ACCOUNTS, search, { confirmed: !!args.confirm });
+            const { match: match, error: matchErr } = resolveAccount(GOOGLE_ACCOUNTS, search, { confirmed: args.confirm === true });
             if (!match) {
                 result = { error: matchErr };
             } else {
@@ -8661,7 +8834,7 @@ async function handleToolCall(name, args = {}) {
 
     } else if (name === "create_pmax_campaign") {
         const search  = (args.account_name || "").toLowerCase();
-        const confirm = !!args.confirm;
+        const confirm = args.confirm === true;
 
         // Validate minimums
         const hCount  = args.headlines?.length || 0;
@@ -8680,7 +8853,7 @@ async function handleToolCall(name, args = {}) {
         else if (!args.final_url) { result = { error: "final_url is required." }; }
         else if (!args.geo_targets?.length) { result = { error: "At least one geo_target is required." }; }
         else {
-            const { match: match, error: matchErr } = resolveAccount(GOOGLE_ACCOUNTS, search, { confirmed: !!args.confirm });
+            const { match: match, error: matchErr } = resolveAccount(GOOGLE_ACCOUNTS, search, { confirmed: args.confirm === true });
             if (!match) {
                 result = { error: matchErr };
             } else {
@@ -8752,7 +8925,7 @@ async function handleToolCall(name, args = {}) {
 
     } else if (name === "create_video_campaign") {
         const search  = (args.account_name || "").toLowerCase();
-        const confirm = !!args.confirm;
+        const confirm = args.confirm === true;
 
         if (!args.campaign_name || !args.daily_budget || !args.final_url || !args.ad_groups?.length || !args.geo_targets?.length) {
             result = { error: "campaign_name, daily_budget, final_url, at least one ad_group, and at least one geo_target are required." };
@@ -8761,7 +8934,7 @@ async function handleToolCall(name, args = {}) {
             if (missingVideo) {
                 result = { error: `Ad group '${missingVideo.name || "(unnamed)"}' is missing youtube_video or youtube_videos. Provide YouTube URLs, video IDs, or asset resource names.` };
             } else {
-                const { match: match, error: matchErr } = resolveAccount(GOOGLE_ACCOUNTS, search, { confirmed: !!args.confirm });
+                const { match: match, error: matchErr } = resolveAccount(GOOGLE_ACCOUNTS, search, { confirmed: args.confirm === true });
                 if (!match) {
                     result = { error: matchErr };
                 } else {
@@ -8828,11 +9001,11 @@ async function handleToolCall(name, args = {}) {
         const campSearch = (args.campaign_name || "").toLowerCase();
         const agSearch   = args.ad_group_name ? args.ad_group_name.toLowerCase() : null;
         const adResName  = args.ad_resource_name || null;
-        const confirm    = !!args.confirm;
+        const confirm    = args.confirm === true;
         const headlines  = args.headlines  || null;
         const descs      = args.descriptions || null;
 
-        const { match: match, error: matchErr } = resolveAccount(GOOGLE_ACCOUNTS, search, { confirmed: !!args.confirm });
+        const { match: match, error: matchErr } = resolveAccount(GOOGLE_ACCOUNTS, search, { confirmed: args.confirm === true });
         if (!match) {
             result = { error: matchErr };
         } else {
@@ -8894,10 +9067,10 @@ async function handleToolCall(name, args = {}) {
         const campSearch = (args.campaign_name || "").toLowerCase();
         const agSearch   = args.ad_group_name ? args.ad_group_name.toLowerCase() : null;
         const adResName  = args.ad_resource_name || null;
-        const confirm    = !!args.confirm;
+        const confirm    = args.confirm === true;
         const newUrl     = args.final_url || null;
 
-        const { match: match, error: matchErr } = resolveAccount(GOOGLE_ACCOUNTS, search, { confirmed: !!args.confirm });
+        const { match: match, error: matchErr } = resolveAccount(GOOGLE_ACCOUNTS, search, { confirmed: args.confirm === true });
         if (!match) {
             result = { error: matchErr };
         } else {
@@ -8950,9 +9123,9 @@ async function handleToolCall(name, args = {}) {
         const campSearch = (args.campaign_name || "").toLowerCase();
         const toAdd      = args.add || [];
         const toRemove   = args.remove || [];
-        const confirm    = !!args.confirm;
+        const confirm    = args.confirm === true;
 
-        const { match: match, error: matchErr } = resolveAccount(GOOGLE_ACCOUNTS, search, { confirmed: !!args.confirm });
+        const { match: match, error: matchErr } = resolveAccount(GOOGLE_ACCOUNTS, search, { confirmed: args.confirm === true });
         if (!match) {
             result = { error: matchErr };
         } else {
@@ -8962,7 +9135,7 @@ async function handleToolCall(name, args = {}) {
             else {
                 try {
                     const campaigns = await listGoogleCampaignsFull(token, cid, info.mcc);
-                    const campSel = matchByName(campaigns, c => c.name, campSearch, { confirmed: !!args.confirm, label: "campaign" });
+                    const campSel = matchByName(campaigns, c => c.name, campSearch, { confirmed: args.confirm === true, label: "campaign" });
                     const camp = campSel.item;
                     if (!camp) {
                         if (campSel.error) {
@@ -9092,12 +9265,12 @@ async function handleToolCall(name, args = {}) {
         const campSearch = (args.campaign_name || "").toLowerCase();
         const extType    = (args.extension_type || "").toUpperCase();
         const assets     = args.assets || [];
-        const confirm    = !!args.confirm;
+        const confirm    = args.confirm === true;
 
         if (!extType || !assets.length) {
             result = { error: "extension_type and at least one asset are required." };
         } else {
-            const { match: match, error: matchErr } = resolveAccount(GOOGLE_ACCOUNTS, search, { confirmed: !!args.confirm });
+            const { match: match, error: matchErr } = resolveAccount(GOOGLE_ACCOUNTS, search, { confirmed: args.confirm === true });
             if (!match) {
                 result = { error: matchErr };
             } else {
@@ -9107,7 +9280,7 @@ async function handleToolCall(name, args = {}) {
                 else {
                     try {
                         const campaigns = await listGoogleCampaignsFull(token, cid, info.mcc);
-                        const campSel = matchByName(campaigns, c => c.name, campSearch, { confirmed: !!args.confirm, label: "campaign" });
+                        const campSel = matchByName(campaigns, c => c.name, campSearch, { confirmed: args.confirm === true, label: "campaign" });
                         const camp = campSel.item;
                         if (!camp) {
                             if (campSel.error) {
@@ -9143,17 +9316,17 @@ async function handleToolCall(name, args = {}) {
     } else if (name === "duplicate_meta_campaign") {
         const search       = (args.account_name || "").toLowerCase();
         const campSearch   = (args.source_campaign || "").toLowerCase();
-        const confirm      = !!args.confirm;
+        const confirm      = args.confirm === true;
         const dupStatus    = (args.status || "PAUSED").toUpperCase();
 
-        const { match: acctMatch, error: acctMatchErr } = resolveAccount(META_ACCOUNTS, search, { confirmed: !!args.confirm });
+        const { match: acctMatch, error: acctMatchErr } = resolveAccount(META_ACCOUNTS, search, { confirmed: args.confirm === true });
         if (!acctMatch) {
             result = { error: acctMatchErr };
         } else {
             const [accountId, acctInfo] = acctMatch;
             try {
                 const campaigns = await getMetaCampaigns(accountId);
-                const campSel = matchByName(campaigns, c => c.name, campSearch, { confirmed: !!args.confirm, label: "campaign" });
+                const campSel = matchByName(campaigns, c => c.name, campSearch, { confirmed: args.confirm === true, label: "campaign" });
                 const camp = campSel.item;
                 if (!camp) {
                     if (campSel.error) {
@@ -9260,14 +9433,14 @@ async function handleToolCall(name, args = {}) {
 
     } else if (name === "upload_meta_media") {
         const search  = (args.account_name || "").toLowerCase();
-        const confirm = !!args.confirm;
+        const confirm = args.confirm === true;
         const IMAGE_EXTS = new Set(["jpg", "jpeg", "png", "gif", "bmp", "tiff"]);
         const VIDEO_EXTS = new Set(["mp4", "mov", "avi", "wmv", "flv", "mkv", "webm"]);
 
         if (!args.files?.length) {
             result = { error: "files array is required and must contain at least one item." };
         } else {
-            const { match: acctMatch, error: acctMatchErr } = resolveAccount(META_ACCOUNTS, search, { confirmed: !!args.confirm });
+            const { match: acctMatch, error: acctMatchErr } = resolveAccount(META_ACCOUNTS, search, { confirmed: args.confirm === true });
             if (!acctMatch) {
                 result = { error: acctMatchErr };
             } else {
@@ -9461,7 +9634,7 @@ async function handleToolCall(name, args = {}) {
 
     } else if (name === "create_meta_campaign") {
         const search  = (args.account_name || "").toLowerCase();
-        const confirm = !!args.confirm;
+        const confirm = args.confirm === true;
         const cbo     = args.cbo !== false;
 
         // Support "existing:<campaign_id>" in campaign_name to add ads to an existing campaign
@@ -9475,7 +9648,7 @@ async function handleToolCall(name, args = {}) {
         } else if (needsCampaignBudget && args.daily_budget < 1) {
             result = { error: "daily_budget must be at least $1.00 (Meta minimum)." };
         } else {
-            const { match: acctMatch, error: acctMatchErr } = resolveAccount(META_ACCOUNTS, search, { confirmed: !!args.confirm });
+            const { match: acctMatch, error: acctMatchErr } = resolveAccount(META_ACCOUNTS, search, { confirmed: args.confirm === true });
             if (!acctMatch) {
                 result = { error: acctMatchErr };
             } else {
@@ -10397,8 +10570,8 @@ async function handleToolCall(name, args = {}) {
     } else if (name === "manage_negative_lists") {
         const search  = (args.account_name || "").toLowerCase();
         const action  = args.action || "list";
-        const confirm = !!args.confirm;
-        const { match: match, error: matchErr } = resolveAccount(GOOGLE_ACCOUNTS, search, { confirmed: !!args.confirm });
+        const confirm = args.confirm === true;
+        const { match: match, error: matchErr } = resolveAccount(GOOGLE_ACCOUNTS, search, { confirmed: args.confirm === true });
         if (!match) {
             result = { error: matchErr };
         } else {
@@ -10431,7 +10604,7 @@ async function handleToolCall(name, args = {}) {
                         // view / add_keywords / attach need an existing list
                         const lists = await listSharedNegativeLists(token, cid, info.mcc);
                         const listSearch = (args.list_name || "").toLowerCase();
-                        const listSel = matchByName(lists, l => l.name, listSearch, { confirmed: !!args.confirm, label: "list" });
+                        const listSel = matchByName(lists, l => l.name, listSearch, { confirmed: args.confirm === true, label: "list" });
                         const list = listSel.item;
                         if (!list) {
                             if (listSel.error) {
@@ -10521,7 +10694,7 @@ async function handleToolCall(name, args = {}) {
         } else {
             const allFields = ["effective_status", "subscriptions", "creative_fatigue", "ad_recommendations", "in_process_ad_objects", "with_issues_ad_objects"];
             const fields = args.fields && args.fields.length ? args.fields : allFields;
-            const confirm = !!args.confirm;
+            const confirm = args.confirm === true;
             if (!confirm) {
                 result = {
                     dry_run: true,
@@ -10555,12 +10728,12 @@ async function handleToolCall(name, args = {}) {
 
     } else if (name === "connect_meta_webhooks") {
         const search = (args.account_name || "").toLowerCase();
-        const { match: acctMatch, error: acctMatchErr } = resolveAccount(META_ACCOUNTS, search, { confirmed: !!args.confirm });
+        const { match: acctMatch, error: acctMatchErr } = resolveAccount(META_ACCOUNTS, search, { confirmed: args.confirm === true });
         if (!acctMatch) {
             result = { error: acctMatchErr };
         } else {
             const [accountId, info] = acctMatch;
-            const confirm = !!args.confirm;
+            const confirm = args.confirm === true;
             if (!confirm) {
                 result = {
                     dry_run: true,
@@ -10592,12 +10765,12 @@ async function handleToolCall(name, args = {}) {
 
     } else if (name === "create_meta_subscription") {
         const search = (args.account_name || "").toLowerCase();
-        const { match: acctMatch, error: acctMatchErr } = resolveAccount(META_ACCOUNTS, search, { confirmed: !!args.confirm });
+        const { match: acctMatch, error: acctMatchErr } = resolveAccount(META_ACCOUNTS, search, { confirmed: args.confirm === true });
         if (!acctMatch) {
             result = { error: acctMatchErr };
         } else {
             const [accountId, info] = acctMatch;
-            const confirm = !!args.confirm;
+            const confirm = args.confirm === true;
             const body = { event_type: args.event_type, filters: args.filters };
             if (args.field)    body.field    = args.field;
             if (args.value)    body.value    = args.value;
@@ -10619,12 +10792,12 @@ async function handleToolCall(name, args = {}) {
 
     } else if (name === "update_meta_subscription") {
         const search = (args.account_name || "").toLowerCase();
-        const { match: acctMatch, error: acctMatchErr } = resolveAccount(META_ACCOUNTS, search, { confirmed: !!args.confirm });
+        const { match: acctMatch, error: acctMatchErr } = resolveAccount(META_ACCOUNTS, search, { confirmed: args.confirm === true });
         if (!acctMatch) {
             result = { error: acctMatchErr };
         } else {
             const [accountId, info] = acctMatch;
-            const confirm = !!args.confirm;
+            const confirm = args.confirm === true;
             if (!confirm) {
                 result = {
                     dry_run: true,
@@ -10643,12 +10816,12 @@ async function handleToolCall(name, args = {}) {
 
     } else if (name === "delete_meta_subscription") {
         const search = (args.account_name || "").toLowerCase();
-        const { match: acctMatch, error: acctMatchErr } = resolveAccount(META_ACCOUNTS, search, { confirmed: !!args.confirm });
+        const { match: acctMatch, error: acctMatchErr } = resolveAccount(META_ACCOUNTS, search, { confirmed: args.confirm === true });
         if (!acctMatch) {
             result = { error: acctMatchErr };
         } else {
             const [accountId, info] = acctMatch;
-            const confirm = !!args.confirm;
+            const confirm = args.confirm === true;
             if (!confirm) {
                 result = {
                     dry_run: true,
@@ -10667,12 +10840,12 @@ async function handleToolCall(name, args = {}) {
 
     } else if (name === "create_meta_audience") {
         const search = (args.account_name || "").toLowerCase();
-        const { match: acctMatch, error: acctMatchErr } = resolveAccount(META_ACCOUNTS, search, { confirmed: !!args.confirm });
+        const { match: acctMatch, error: acctMatchErr } = resolveAccount(META_ACCOUNTS, search, { confirmed: args.confirm === true });
         if (!acctMatch) {
             result = { error: acctMatchErr };
         } else {
             const [accountId, info] = acctMatch;
-            const confirm = !!args.confirm;
+            const confirm = args.confirm === true;
             try {
                 if (args.type === "custom") {
                     const body = {
@@ -10728,12 +10901,12 @@ async function handleToolCall(name, args = {}) {
 
     } else if (name === "manage_meta_audience_users") {
         const search = (args.account_name || "").toLowerCase();
-        const { match: acctMatch, error: acctMatchErr } = resolveAccount(META_ACCOUNTS, search, { confirmed: !!args.confirm });
+        const { match: acctMatch, error: acctMatchErr } = resolveAccount(META_ACCOUNTS, search, { confirmed: args.confirm === true });
         if (!acctMatch) {
             result = { error: acctMatchErr };
         } else {
             const [, info] = acctMatch;
-            const confirm = !!args.confirm;
+            const confirm = args.confirm === true;
             const schemaFields = args.schema || [];
             const dataRows = args.data || [];
             const noHashFields = new Set(["MADID", "EXTERN_ID"]);
@@ -10844,13 +11017,13 @@ async function handleToolCall(name, args = {}) {
 
     } else if (name === "manage_meta_ad_rules") {
         const search = (args.account_name || "").toLowerCase();
-        const { match: acctMatch, error: acctMatchErr } = resolveAccount(META_ACCOUNTS, search, { confirmed: !!args.confirm });
+        const { match: acctMatch, error: acctMatchErr } = resolveAccount(META_ACCOUNTS, search, { confirmed: args.confirm === true });
         if (!acctMatch) {
             result = { error: acctMatchErr };
         } else {
             const [accountId, info] = acctMatch;
             const action = args.action || "list";
-            const confirm = !!args.confirm;
+            const confirm = args.confirm === true;
             try {
                 if (action === "list") {
                     const rules = await metaGetAll(`${metaActId(accountId)}/adrules_library`, {
@@ -11147,12 +11320,12 @@ async function handleToolCall(name, args = {}) {
 
     } else if (name === "update_meta_object") {
         const search = (args.account_name || "").toLowerCase();
-        const { match: acctMatch, error: acctMatchErr } = resolveAccount(META_ACCOUNTS, search, { confirmed: !!args.confirm });
+        const { match: acctMatch, error: acctMatchErr } = resolveAccount(META_ACCOUNTS, search, { confirmed: args.confirm === true });
         if (!acctMatch) {
             result = { error: acctMatchErr };
         } else {
             const [, info] = acctMatch;
-            const confirm = !!args.confirm;
+            const confirm = args.confirm === true;
             const updates = args.updates || {};
             const body = { ...updates };
             const budgetFields = Object.keys(BUDGET_LIMITS);
@@ -11261,7 +11434,7 @@ async function handleToolCall(name, args = {}) {
                                     website_url: args.thank_you_page.website_url || followUpUrl,
                                 });
                             }
-                            if (args.confirm) {
+                            if (args.confirm === true) {
                                 const created = await metaPost(`${pageId}/leadgen_forms`, formBody);
                                 result = {
                                     account: info.name, page_id: pageId,
@@ -11291,22 +11464,18 @@ async function handleToolCall(name, args = {}) {
         result = { error: `Unknown tool: ${name}` };
     }
 
-    // Every mutation gates on confirm=true, so this catches all confirmed writes
-    if (args && args.confirm === true) logWriteAction(name, args, result);
-
-    // Record confirmed writes for duplicate detection; prune entries older than 60s
-    if (args && args.confirm === true) {
-        const key = name + JSON.stringify(Object.keys(args).sort().reduce((o, k) => { o[k] = args[k]; return o; }, {}));
-        RECENT_WRITES.set(key, { timestamp: Date.now(), error: result.error });
-        for (const [k, v] of RECENT_WRITES) {
-            if (Date.now() - v.timestamp > 60000) RECENT_WRITES.delete(k);
-        }
-    }
 
     return result;
 }
 
 async function main() {
+    try {
+        if (writeStore instanceof PostgresWriteStore) await writeStore.db();
+        else fs.mkdirSync(writeStore.directory, { recursive: true, mode: 0o700 });
+        writeStorageReady = true;
+    } catch (error) {
+        console.error("[write-state] initialization failed", { code: error.code || "WRITE_STATE_ERROR" });
+    }
     const PORT = process.env.PORT;
 
     if (PORT) {
@@ -11324,14 +11493,14 @@ async function main() {
         const isAuthorized = (req, url) => {
             if (!AUTH_TOKEN) return false;
             const header = req.headers["authorization"] || "";
-            if (header === `Bearer ${AUTH_TOKEN}`) return true;
-            if (url.searchParams.get("token") === AUTH_TOKEN) return true;
+            if (sameSecret(header, `Bearer ${AUTH_TOKEN}`)) return true;
+            if (sameSecret(url.searchParams.get("token"), AUTH_TOKEN)) return true;
             return false;
         };
 
         const transports = {};
 
-        const httpServer = http.createServer(async (req, res) => {
+        const httpServer = http.createServer(safeHttpHandler(async (req, res) => {
             const url = new URL(req.url, `http://localhost`);
 
             if (url.pathname === "/sse") {
@@ -11343,22 +11512,14 @@ async function main() {
                 const transport = new SSEServerTransport("/messages", res);
                 transports[transport.sessionId] = transport;
                 res.on("close", () => delete transports[transport.sessionId]);
-                await server.connect(transport);
+                const sseServer = makeServer();
+                await sseServer.connect(transport);
 
             } else if (url.pathname === "/messages") {
                 const sessionId = url.searchParams.get("sessionId");
                 const transport = transports[sessionId];
                 if (!transport) { res.writeHead(404); res.end("Session not found"); return; }
-                const chunks = [];
-                for await (const chunk of req) chunks.push(chunk);
-                let body;
-                try {
-                    body = JSON.parse(Buffer.concat(chunks).toString());
-                } catch {
-                    res.writeHead(400, { "Content-Type": "text/plain" });
-                    res.end("Invalid JSON body");
-                    return;
-                }
+                const body = await readJson(req);
                 await transport.handlePostMessage(req, res, body);
 
             } else if (url.pathname === "/digest/run") {
@@ -11377,7 +11538,7 @@ async function main() {
                 // The connector UI can't set headers, so the token may ride the
                 // query (?token=) or the path (/mcp/<token>).
                 const pathToken = url.pathname.startsWith("/mcp/") ? decodeURIComponent(url.pathname.slice(5)) : null;
-                if (!isAuthorized(req, url) && !(AUTH_TOKEN && pathToken === AUTH_TOKEN)) {
+                if (!isAuthorized(req, url) && !sameSecret(pathToken, AUTH_TOKEN)) {
                     res.writeHead(401, { "Content-Type": "text/plain" });
                     res.end(AUTH_TOKEN ? "Unauthorized" : "Server auth not configured (MCP_AUTH_TOKEN missing)");
                     return;
@@ -11387,21 +11548,18 @@ async function main() {
                     res.end("Method not allowed — stateless /mcp only supports POST.");
                     return;
                 }
-                const chunks = [];
-                for await (const chunk of req) chunks.push(chunk);
-                let body;
-                try {
-                    body = JSON.parse(Buffer.concat(chunks).toString());
-                } catch {
-                    res.writeHead(400, { "Content-Type": "text/plain" });
-                    res.end("Invalid JSON body");
-                    return;
-                }
+                const body = await readJson(req);
                 const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
                 res.on("close", () => transport.close());
                 const mcpServer = makeServer();
                 await mcpServer.connect(transport);
                 await transport.handleRequest(req, res, body);
+
+            } else if (url.pathname === "/healthz") {
+                const ready = writeStorageReady && !!AUTH_TOKEN;
+                res.writeHead(ready ? 200 : 503, { "Content-Type": "application/json" });
+                res.end(JSON.stringify({ status: ready ? "ready" : "not_ready",
+                    build_sha: process.env.RAILWAY_GIT_COMMIT_SHA || process.env.BUILD_SHA || "local" }));
 
             } else if (url.pathname === "/") {
                 res.writeHead(200, { "Content-Type": "text/plain" });
@@ -11414,7 +11572,9 @@ async function main() {
                 res.writeHead(404, { "Content-Type": "text/plain" });
                 res.end("Not found");
             }
-        });
+        }));
+        httpServer.requestTimeout = 30000;
+        httpServer.headersTimeout = 15000;
 
         httpServer.listen(parseInt(PORT), () => {
             console.error(`KayComm MCP running on port ${PORT} (SSE mode: /sse + /messages; Streamable HTTP: /mcp; auth ${AUTH_TOKEN ? "enabled" : "NOT CONFIGURED"})`);
@@ -11483,12 +11643,12 @@ async function main() {
 }
 
 module.exports = {
-    handleToolCall,
+    handleToolCall, makeServer, main,
     getPacingLabel, getFlightPacing, buildDailyBudgetRec, getDateInfo, getEffectiveBudget, pctChange,
     // Exported for tests
     clampTopN, shapeAgg, emptyAgg, addAgg, mergeAgg, listingCaseValueLabel, SHOPPING_GROUP_DIMENSIONS,
-    matchByName, skippedRow, partitionSkipped,
+    matchByName, skippedRow, partitionSkipped, reportingPeriod, selectDetailAccounts, fetchMetaDailyBudgets,
     resolveAccount,
 };
 
-if (!process.env.MCP_TEST) main().catch(console.error);
+if (require.main === module && !process.env.MCP_TEST) main().catch(console.error);

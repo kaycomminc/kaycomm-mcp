@@ -10,6 +10,8 @@ function getPool() {
       connectionString: url,
       ssl: url.includes("localhost") ? false : { rejectUnauthorized: false },
       max: 3,
+      connectionTimeoutMillis: 10000,
+      query_timeout: 15000,
     });
   }
   return pool;

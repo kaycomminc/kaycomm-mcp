@@ -188,3 +188,65 @@ would double-fund the account.
 When lifetime budgets are present, `daily_budget` carries `confidence: "reduced"`
 and a `REDUCED_CONFIDENCE` recommendation naming the shortfall without advising a
 change, rather than a confident RAISE beside a note that is easy to read past.
+
+## MCP hardening and client compatibility
+
+Node.js 22–24 is required. Every tool call is validated against its published
+JSON schema before any provider request: confirmation must be the boolean
+`true`, dates must be real and ordered, and financial inputs cannot be negative.
+Unknown arguments are rejected rather than silently ignored. Tool annotations
+are client hints, not a substitute for server-side validation or user approval.
+
+Known raw Meta object references are checked against the selected ad account;
+Google customer-qualified resource names must match the selected customer.
+Account and named-object matching protections from the earlier release remain.
+
+Confirmed operations reserve an atomic idempotency record **before** execution.
+The store uses Postgres when `DATABASE_URL` is configured; otherwise it uses
+`WRITE_STATE_DIR`, or `.mcp-write-state` beside `WRITE_LOG_FILE`. Use persistent
+storage in production. Initialization status is exposed by `health_check`.
+Never bypass a storage failure: writes fail closed. Postgres coordinates replicas;
+filesystem storage only coordinates processes sharing the same directory.
+
+- Reuse `idempotency_key` when retrying the same requested operation.
+- Without a key, the canonical tool arguments identify the operation.
+- Completed and uncertain operations do **not** automatically expire. A new
+  key means a deliberately new operation, not an automatic retry workaround.
+- A timeout or partial failure can mean the provider already applied some or
+  all changes. Reconcile the account before authorizing another operation.
+- This prevents concurrent/replayed calls with the same identity; it cannot
+  provide transactional rollback across multiple Google/Meta requests.
+
+New audit entries use an operational metadata allowlist and mode `0600`.
+Audience data, media uploads, webhook secrets, targeting payloads, creative copy,
+and provider error bodies are excluded. Existing historical logs are not erased
+by deployment and should be reviewed separately for older sensitive entries.
+
+Responses preserve existing data fields and add `_meta` with status, request ID,
+duration, build SHA, errors, and account coverage when applicable. The MCP result
+also includes `structuredContent` and sets `isError` for complete failures.
+Partial failures remain usable but must not be interpreted as complete coverage.
+
+HTTP bodies are capped at 10 MiB, malformed requests are contained, and legacy
+SSE sessions use separate server instances. Upstream calls default to 30 seconds
+(`MCP_UPSTREAM_TIMEOUT_MS`); a complete tool defaults to 150 seconds
+(`MCP_TOOL_TIMEOUT_MS`). Configure clients for at least 180 seconds. Slow or
+aborted confirmed writes must be reconciled, never blindly retried.
+
+Google/Meta pacing uses at most five concurrent accounts per platform, isolates
+row failures, and shares flight/monthly calculations with account detail.
+Meta daily-budget inputs follow every page; missing budget data is reported as
+`daily_budget_error` and never generates a RAISE recommendation. PMax listing
+groups expose parent IDs and distinguish hierarchical metrics from additive
+leaf totals. Search-term `wasted` fields are compatibility labels for review
+candidates, not automatic negative-keyword instructions.
+
+### Client credentials
+
+Prefer a token-free `/mcp` URL with `Authorization: Bearer …`. The local Codex
+plugin uses `bearer_token_env_var: "KAYCOMM_MCP_TOKEN"` and a 180-second timeout;
+no secret belongs in a distributable plugin. Legacy query/path authentication
+remains for existing Claude connectors. Removing a secret from a plugin does
+not revoke previously exposed copies: rotate the shared server token only after
+all connected clients have a coordinated migration path. Do not share old
+token-bearing plugin archives, logs, or conversation links.
