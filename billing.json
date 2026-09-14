@@ -163,6 +163,19 @@
       ],
       "notes": "V9 subcontract — uploaded to WorkSuite. First invoice Oct 2026 (for September)."
     },
+    "emri": {
+      "customer": "Volume Nine",
+      "billing_type": "recurring",
+      "active": true,
+      "line_items": [
+        {
+          "product_service": "Google Ads",
+          "description": "EMRI",
+          "rate": 900
+        }
+      ],
+      "notes": "V9 subcontract — uploaded to WorkSuite"
+    },
     "eye_associates": {
       "customer": "G Williams",
       "billing_type": "recurring",
