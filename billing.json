@@ -194,28 +194,16 @@
       "billing_type": "flighted",
       "active": true,
       "flight_start": "2026-08-18",
-      "flight_end": "2027-01-01",
+      "flight_end": "2026-11-26",
       "line_items": [
         {
           "product_service": "Facebook Ads",
           "description": "Florida State Guard",
-          "rate": 16250,
-          "prorate_partial": true
-        },
-        {
-          "product_service": "Google Ads",
-          "description": "Florida State Guard",
-          "rate": 9500,
-          "prorate_partial": true
-        },
-        {
-          "product_service": "LinkedIn Ads",
-          "description": "Florida State Guard",
-          "rate": 2250,
-          "prorate_partial": true
+          "rate": 20000,
+          "prorate_partial": false
         }
       ],
-      "notes": "Billed through Adele Creative. Amounts vary monthly — review before generating."
+      "notes": "Billed through Adele Creative. $20k flat Oct and Nov. Amounts vary — update rate before generating each month."
     },
     "phq_ads": {
       "customer": "Adele Creative",
