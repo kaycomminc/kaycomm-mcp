@@ -9481,378 +9481,378 @@ async function handleToolCall(name, args = {}) {
 
         // ── Google checks ────────────────────────────────────────────────
         if (platformFilter === "google" || platformFilter === "both") {
-            const { token, error: authErr } = await getGoogleAccessToken(cid);
-            if (authErr) {
-                errors.push(`Google auth failed: ${authErr}`);
-            } else {
-                for (const [cid, gAcct] of pickAccounts(GOOGLE_ACCOUNTS)) {
-                    const hc = getHealthConfig(gAcct);
-                    const { budget: monthlyBudget } = getEffectiveBudget(gAcct, today);
-                    const isFlight = !!(gAcct.flight_start && gAcct.flight_end);
-                    accountsChecked++;
+            for (const [cid, gAcct] of pickAccounts(GOOGLE_ACCOUNTS)) {
+                const { token, error: authErr } = await getGoogleAccessToken(cid);
+                if (authErr) {
+                    errors.push(`${gAcct.name} (Google): Auth: ${authErr}`);
+                    continue;
+                }
+                const hc = getHealthConfig(gAcct);
+                const { budget: monthlyBudget } = getEffectiveBudget(gAcct, today);
+                const isFlight = !!(gAcct.flight_start && gAcct.flight_end);
+                accountsChecked++;
 
-                    try {
-                        // Single batch query: campaign-level daily metrics for all daily checks
-                        const lookback = weekly ? daysAgo(30, yesterday) : daysAgo(8, yesterday);
-                        const batchRows = await googleSearch(token, cid, gAcct.mcc, `
-                            SELECT segments.date, campaign.name, campaign.status, campaign.advertising_channel_type,
-                                   metrics.cost_micros, metrics.impressions, metrics.clicks,
-                                   metrics.conversions, metrics.conversions_value,
-                                   metrics.ctr, metrics.search_impression_share,
-                                   metrics.search_budget_lost_impression_share
-                            FROM campaign
-                            WHERE segments.date BETWEEN '${lookback}' AND '${yesterday}'
-                              AND campaign.status = 'ENABLED'`);
+                try {
+                    // Single batch query: campaign-level daily metrics for all daily checks
+                    const lookback = weekly ? daysAgo(30, yesterday) : daysAgo(8, yesterday);
+                    const batchRows = await googleSearch(token, cid, gAcct.mcc, `
+                        SELECT segments.date, campaign.name, campaign.status, campaign.advertising_channel_type,
+                               metrics.cost_micros, metrics.impressions, metrics.clicks,
+                               metrics.conversions, metrics.conversions_value,
+                               metrics.ctr, metrics.search_impression_share,
+                               metrics.search_budget_lost_impression_share
+                        FROM campaign
+                        WHERE segments.date BETWEEN '${lookback}' AND '${yesterday}'
+                          AND campaign.status = 'ENABLED'`);
 
-                        // Aggregate by date for account-level metrics
-                        const dailySpend = {}, dailyConversions = {}, dailyConvValue = {};
-                        const dailyClicks = {}, dailyImpressions = {};
-                        // Campaign-level data for yesterday
-                        const campYesterday = [];
-                        // Campaign-level CTR: 7d and 30d windows
-                        const campCtr7d = {}, campCtr30d = {};
-                        // IS tracking per date
-                        const dailyIS = {};
+                    // Aggregate by date for account-level metrics
+                    const dailySpend = {}, dailyConversions = {}, dailyConvValue = {};
+                    const dailyClicks = {}, dailyImpressions = {};
+                    // Campaign-level data for yesterday
+                    const campYesterday = [];
+                    // Campaign-level CTR: 7d and 30d windows
+                    const campCtr7d = {}, campCtr30d = {};
+                    // IS tracking per date
+                    const dailyIS = {};
 
-                        for (const row of batchRows) {
-                            const dt = row.segments.date;
-                            const spend = parseInt(row.metrics?.costMicros || 0) / 1_000_000;
-                            const imps = parseInt(row.metrics?.impressions || 0);
-                            const clicks = parseInt(row.metrics?.clicks || 0);
-                            const convs = parseFloat(row.metrics?.conversions || 0);
-                            const convVal = parseFloat(row.metrics?.conversionsValue || 0);
+                    for (const row of batchRows) {
+                        const dt = row.segments.date;
+                        const spend = parseInt(row.metrics?.costMicros || 0) / 1_000_000;
+                        const imps = parseInt(row.metrics?.impressions || 0);
+                        const clicks = parseInt(row.metrics?.clicks || 0);
+                        const convs = parseFloat(row.metrics?.conversions || 0);
+                        const convVal = parseFloat(row.metrics?.conversionsValue || 0);
 
-                            dailySpend[dt] = (dailySpend[dt] || 0) + spend;
-                            dailyConversions[dt] = (dailyConversions[dt] || 0) + convs;
-                            dailyConvValue[dt] = (dailyConvValue[dt] || 0) + convVal;
-                            dailyClicks[dt] = (dailyClicks[dt] || 0) + clicks;
-                            dailyImpressions[dt] = (dailyImpressions[dt] || 0) + imps;
+                        dailySpend[dt] = (dailySpend[dt] || 0) + spend;
+                        dailyConversions[dt] = (dailyConversions[dt] || 0) + convs;
+                        dailyConvValue[dt] = (dailyConvValue[dt] || 0) + convVal;
+                        dailyClicks[dt] = (dailyClicks[dt] || 0) + clicks;
+                        dailyImpressions[dt] = (dailyImpressions[dt] || 0) + imps;
 
-                            if (dt === yesterday) {
-                                campYesterday.push({
-                                    name: row.campaign.name,
-                                    type: row.campaign.advertisingChannelType,
-                                    spend, imps, clicks, convs, convVal,
-                                    budgetLostIS: row.metrics?.searchBudgetLostImpressionShare ? parseFloat(row.metrics.searchBudgetLostImpressionShare) : null,
-                                    searchIS: row.metrics?.searchImpressionShare ? parseFloat(row.metrics.searchImpressionShare) : null,
-                                });
+                        if (dt === yesterday) {
+                            campYesterday.push({
+                                name: row.campaign.name,
+                                type: row.campaign.advertisingChannelType,
+                                spend, imps, clicks, convs, convVal,
+                                budgetLostIS: row.metrics?.searchBudgetLostImpressionShare ? parseFloat(row.metrics.searchBudgetLostImpressionShare) : null,
+                                searchIS: row.metrics?.searchImpressionShare ? parseFloat(row.metrics.searchImpressionShare) : null,
+                            });
+                        }
+
+                        // IS tracking
+                        if (row.metrics?.searchImpressionShare != null) {
+                            if (!dailyIS[dt]) dailyIS[dt] = { totalIS: 0, count: 0 };
+                            dailyIS[dt].totalIS += parseFloat(row.metrics.searchImpressionShare);
+                            dailyIS[dt].count++;
+                        }
+
+                        // CTR by campaign (Search only)
+                        if (row.campaign.advertisingChannelType === "SEARCH") {
+                            const cName = row.campaign.name;
+                            const dtObj = new Date(dt + "T00:00:00Z");
+                            const ydObj = new Date(yesterday + "T00:00:00Z");
+                            const diffDays = Math.round((ydObj - dtObj) / 86400000);
+                            if (diffDays < 7) {
+                                if (!campCtr7d[cName]) campCtr7d[cName] = { clicks: 0, imps: 0 };
+                                campCtr7d[cName].clicks += clicks;
+                                campCtr7d[cName].imps += imps;
                             }
+                            if (!campCtr30d[cName]) campCtr30d[cName] = { clicks: 0, imps: 0 };
+                            campCtr30d[cName].clicks += clicks;
+                            campCtr30d[cName].imps += imps;
+                        }
+                    }
 
-                            // IS tracking
-                            if (row.metrics?.searchImpressionShare != null) {
-                                if (!dailyIS[dt]) dailyIS[dt] = { totalIS: 0, count: 0 };
-                                dailyIS[dt].totalIS += parseFloat(row.metrics.searchImpressionShare);
-                                dailyIS[dt].count++;
+                    // ── Check 1: Pacing drift ── (flight accounts pace in get_full_pacing, not
+                    // monthly; skipped on the 1st — no complete days to project from yet)
+                    if (monthlyBudget > 0 && !isFlight && pace_dom > 0) {
+                        const effectiveBudget = monthlyBudget;
+                        // Sum MTD spend
+                        let mtdSpend = 0;
+                        for (const [dt, s] of Object.entries(dailySpend)) {
+                            if (dt >= month_start && dt <= yesterday) mtdSpend += s;
+                        }
+                        const projected = pace_dom > 0 ? Math.round((mtdSpend / pace_dom) * dim * 100) / 100 : mtdSpend;
+                        const deviationPct = effectiveBudget > 0 ? Math.round(((projected - effectiveBudget) / effectiveBudget) * 100 * 10) / 10 : 0;
+                        const tolerance = hc.pacing_tolerance_pct;
+                        if (Math.abs(deviationPct) > tolerance) {
+                            const sev = Math.abs(deviationPct) > 25 ? "critical" : "warning";
+                            const dir = deviationPct > 0 ? "over" : "under";
+                            addFinding(sev, "pacing_drift", gAcct.name, "google",
+                                `Projected $${projected.toLocaleString()} vs $${effectiveBudget.toLocaleString()} budget (${deviationPct > 0 ? "+" : ""}${deviationPct}%)`,
+                                { projected, budget: effectiveBudget, deviation_pct: deviationPct });
+                        }
+                    }
+
+                    // ── Check 2: Conversion dry spell ──
+                    if (monthlyBudget > 0 || gAcct.health?.conversion_dry_spell_hours != null) {
+                        const dryThreshold = hc.conversion_dry_spell_hours;
+                        // Find most recent date with conversions
+                        const sortedDates = Object.keys(dailyConversions).sort().reverse();
+                        let lastConvDate = null;
+                        for (const dt of sortedDates) {
+                            if (dailyConversions[dt] > 0) { lastConvDate = dt; break; }
+                        }
+                        if (lastConvDate) {
+                            const hoursSince = Math.round((new Date(yesterday + "T23:59:59Z") - new Date(lastConvDate + "T23:59:59Z")) / 3600000);
+                            if (hoursSince > dryThreshold) {
+                                addFinding("critical", "conversion_dry_spell", gAcct.name, "google",
+                                    `No conversions in ${hoursSince} hours (threshold: ${dryThreshold}h)`,
+                                    { last_conversion_date: lastConvDate, hours_since: hoursSince, threshold_hours: dryThreshold });
                             }
+                        } else if (monthlyBudget > 0) {
+                            addFinding("critical", "conversion_dry_spell", gAcct.name, "google",
+                                `No conversions in trailing 7+ days`,
+                                { last_conversion_date: null, threshold_hours: dryThreshold });
+                        }
+                    }
 
-                            // CTR by campaign (Search only)
-                            if (row.campaign.advertisingChannelType === "SEARCH") {
-                                const cName = row.campaign.name;
+                    // ── Check 3: CPA/ROAS threshold breach ──
+                    {
+                        let spend7d = 0, convs7d = 0, convVal7d = 0;
+                        for (let i = 0; i < 7; i++) {
+                            const dt = daysAgo(i, yesterday);
+                            spend7d += dailySpend[dt] || 0;
+                            convs7d += dailyConversions[dt] || 0;
+                            convVal7d += dailyConvValue[dt] || 0;
+                        }
+                        if (hc.cpa_target && convs7d > 0) {
+                            const cpa7d = Math.round((spend7d / convs7d) * 100) / 100;
+                            const tolerance = hc.cpa_tolerance_pct;
+                            const breachPct = Math.round(((cpa7d - hc.cpa_target) / hc.cpa_target) * 100);
+                            if (breachPct > tolerance) {
+                                addFinding("warning", "cpa_roas_breach", gAcct.name, "google",
+                                    `7-day CPA $${cpa7d} exceeds target $${hc.cpa_target} (+${breachPct}%)`,
+                                    { metric: "cpa", actual: cpa7d, target: hc.cpa_target, breach_pct: breachPct });
+                            }
+                        }
+                        if (hc.roas_target && spend7d > 0) {
+                            const roas7d = Math.round((convVal7d / spend7d) * 100) / 100;
+                            const tolerance = hc.roas_tolerance_pct;
+                            const breachPct = Math.round(((hc.roas_target - roas7d) / hc.roas_target) * 100);
+                            if (breachPct > tolerance) {
+                                addFinding("warning", "cpa_roas_breach", gAcct.name, "google",
+                                    `7-day ROAS ${roas7d}x below target ${hc.roas_target}x (-${breachPct}%)`,
+                                    { metric: "roas", actual: roas7d, target: hc.roas_target, breach_pct: breachPct });
+                            }
+                        }
+                    }
+
+                    // ── Check 4: Spend spikes and drops ──
+                    {
+                        const anomaly = detectSpendAnomaly(dailySpend, yesterday);
+                        if (anomaly) {
+                            const sev = anomaly.type === "SPEND_SPIKE" && parseInt(anomaly.change) > 100 ? "critical" : "warning";
+                            addFinding(sev, "spend_anomaly", gAcct.name, "google",
+                                `${anomaly.type}: yesterday $${Math.round(anomaly.yesterday * 100) / 100} vs 7d avg $${anomaly.trailing_7d_avg} (${anomaly.change})`,
+                                anomaly);
+                        }
+                    }
+
+                    // ── Check 5: Zero-impression enabled campaigns ──
+                    {
+                        const zeroCamps = campYesterday.filter(c => c.imps === 0).map(c => c.name);
+                        if (zeroCamps.length) {
+                            addFinding("info", "zero_impressions", gAcct.name, "google",
+                                `${zeroCamps.length} enabled campaign(s) with 0 impressions yesterday`,
+                                { campaigns: zeroCamps });
+                        }
+                    }
+
+                    // ── Check 6: Budget exhaustion ──
+                    {
+                        const exhausted = campYesterday.filter(c =>
+                            c.budgetLostIS != null && c.budgetLostIS > (hc.budget_exhaustion_is_lost_pct || 20) / 100
+                        );
+                        if (exhausted.length) {
+                            addFinding("warning", "budget_exhaustion", gAcct.name, "google",
+                                `${exhausted.length} campaign(s) lost >20% impression share to budget yesterday`,
+                                { campaigns: exhausted.map(c => ({ campaign: c.name, budget_lost_is: Math.round(c.budgetLostIS * 10000) / 100 + "%" })) });
+                        }
+                    }
+
+                    // ── Weekly checks ──
+                    if (weekly) {
+                        // Check 7: Impression share decay
+                        if (hc.impression_share_floor != null) {
+                            const thisWeekDates = [], lastWeekDates = [];
+                            for (let i = 0; i < 7; i++) thisWeekDates.push(daysAgo(i, yesterday));
+                            for (let i = 7; i < 14; i++) lastWeekDates.push(daysAgo(i, yesterday));
+
+                            const avgIS = (dates) => {
+                                let total = 0, cnt = 0;
+                                for (const dt of dates) {
+                                    if (dailyIS[dt]) { total += dailyIS[dt].totalIS / dailyIS[dt].count; cnt++; }
+                                }
+                                return cnt > 0 ? Math.round((total / cnt) * 10000) / 100 : null;
+                            };
+                            const thisWeekIS = avgIS(thisWeekDates);
+                            const lastWeekIS = avgIS(lastWeekDates);
+
+                            if (thisWeekIS != null) {
+                                const floor = hc.impression_share_floor;
+                                if (thisWeekIS < floor) {
+                                    addFinding("warning", "impression_share_decay", gAcct.name, "google",
+                                        `Search IS ${thisWeekIS}% below floor of ${floor}%`,
+                                        { current_is: thisWeekIS, floor, prior_week_is: lastWeekIS });
+                                } else if (lastWeekIS != null && (lastWeekIS - thisWeekIS) >= 10) {
+                                    addFinding("warning", "impression_share_decay", gAcct.name, "google",
+                                        `Search IS dropped ${Math.round(lastWeekIS - thisWeekIS)} points WoW (${lastWeekIS}% → ${thisWeekIS}%)`,
+                                        { current_is: thisWeekIS, prior_week_is: lastWeekIS, drop: Math.round(lastWeekIS - thisWeekIS) });
+                                }
+                            }
+                        }
+
+                        // Check 8: CTR degradation (Search campaigns)
+                        for (const [cName, d7] of Object.entries(campCtr7d)) {
+                            const d30 = campCtr30d[cName];
+                            if (!d30 || d30.imps < 100 || d7.imps < 50) continue;
+                            const ctr7 = d7.clicks / d7.imps;
+                            const ctr30 = d30.clicks / d30.imps;
+                            if (ctr30 <= 0) continue;
+                            const pctChange = Math.round(((ctr7 - ctr30) / ctr30) * 100);
+                            const threshold = hc.ctr_degradation_pct || -20;
+                            if (pctChange < threshold) {
+                                addFinding("info", "ctr_degradation", gAcct.name, "google",
+                                    `${cName}: 7d CTR ${(ctr7 * 100).toFixed(2)}% vs 30d ${(ctr30 * 100).toFixed(2)}% (${pctChange}%)`,
+                                    { campaign: cName, ctr_7d: (ctr7 * 100).toFixed(2) + "%", ctr_30d: (ctr30 * 100).toFixed(2) + "%", change_pct: pctChange });
+                            }
+                        }
+
+                        // Check 10: Quality Score watch
+                        try {
+                            const kwRows = await googleSearch(token, cid, gAcct.mcc, `
+                                SELECT campaign.name, ad_group.name,
+                                       ad_group_criterion.keyword.text,
+                                       ad_group_criterion.keyword.match_type,
+                                       ad_group_criterion.quality_info.quality_score,
+                                       ad_group_criterion.status,
+                                       metrics.cost_micros
+                                FROM keyword_view
+                                WHERE segments.date BETWEEN '${daysAgo(30, yesterday)}' AND '${yesterday}'
+                                  AND metrics.impressions > 0
+                                  AND campaign.status = 'ENABLED'
+                                  AND ad_group_criterion.status = 'ENABLED'`);
+                            const qsFloor = hc.quality_score_floor || 5;
+                            // Aggregate spend per keyword
+                            const kwSpend = {};
+                            for (const r of kwRows) {
+                                const kw = r.adGroupCriterion?.keyword?.text;
+                                const qs = r.adGroupCriterion?.qualityInfo?.qualityScore;
+                                const spend = parseInt(r.metrics?.costMicros || 0) / 1_000_000;
+                                if (!kw || qs == null) continue;
+                                if (!kwSpend[kw]) kwSpend[kw] = { qs, spend: 0, campaign: r.campaign.name, ad_group: r.adGroup.name };
+                                kwSpend[kw].spend += spend;
+                            }
+                            const lowQS = Object.entries(kwSpend)
+                                .filter(([, d]) => d.qs < qsFloor && d.spend >= 10)
+                                .map(([kw, d]) => ({ keyword: kw, quality_score: d.qs, spend_30d: Math.round(d.spend * 100) / 100, campaign: d.campaign }));
+                            if (lowQS.length) {
+                                addFinding("info", "quality_score", gAcct.name, "google",
+                                    `${lowQS.length} keyword(s) with QS < ${qsFloor} and >$10 spend in 30d`,
+                                    { floor: qsFloor, keywords: lowQS.slice(0, 20) });
+                            }
+                        } catch (e) { errors.push(`${gAcct.name} QS check: ${e.message}`); }
+                    }
+
+                    // ── Structural checks ──
+                    if (structural) {
+                        // Check 11: Zero-spend enabled campaigns (7-day window)
+                        {
+                            const campSpend7d = {};
+                            for (const row of batchRows) {
+                                const dt = row.segments.date;
                                 const dtObj = new Date(dt + "T00:00:00Z");
                                 const ydObj = new Date(yesterday + "T00:00:00Z");
-                                const diffDays = Math.round((ydObj - dtObj) / 86400000);
-                                if (diffDays < 7) {
-                                    if (!campCtr7d[cName]) campCtr7d[cName] = { clicks: 0, imps: 0 };
-                                    campCtr7d[cName].clicks += clicks;
-                                    campCtr7d[cName].imps += imps;
-                                }
-                                if (!campCtr30d[cName]) campCtr30d[cName] = { clicks: 0, imps: 0 };
-                                campCtr30d[cName].clicks += clicks;
-                                campCtr30d[cName].imps += imps;
-                            }
-                        }
-
-                        // ── Check 1: Pacing drift ── (flight accounts pace in get_full_pacing, not
-                        // monthly; skipped on the 1st — no complete days to project from yet)
-                        if (monthlyBudget > 0 && !isFlight && pace_dom > 0) {
-                            const effectiveBudget = monthlyBudget;
-                            // Sum MTD spend
-                            let mtdSpend = 0;
-                            for (const [dt, s] of Object.entries(dailySpend)) {
-                                if (dt >= month_start && dt <= yesterday) mtdSpend += s;
-                            }
-                            const projected = pace_dom > 0 ? Math.round((mtdSpend / pace_dom) * dim * 100) / 100 : mtdSpend;
-                            const deviationPct = effectiveBudget > 0 ? Math.round(((projected - effectiveBudget) / effectiveBudget) * 100 * 10) / 10 : 0;
-                            const tolerance = hc.pacing_tolerance_pct;
-                            if (Math.abs(deviationPct) > tolerance) {
-                                const sev = Math.abs(deviationPct) > 25 ? "critical" : "warning";
-                                const dir = deviationPct > 0 ? "over" : "under";
-                                addFinding(sev, "pacing_drift", gAcct.name, "google",
-                                    `Projected $${projected.toLocaleString()} vs $${effectiveBudget.toLocaleString()} budget (${deviationPct > 0 ? "+" : ""}${deviationPct}%)`,
-                                    { projected, budget: effectiveBudget, deviation_pct: deviationPct });
-                            }
-                        }
-
-                        // ── Check 2: Conversion dry spell ──
-                        if (monthlyBudget > 0 || gAcct.health?.conversion_dry_spell_hours != null) {
-                            const dryThreshold = hc.conversion_dry_spell_hours;
-                            // Find most recent date with conversions
-                            const sortedDates = Object.keys(dailyConversions).sort().reverse();
-                            let lastConvDate = null;
-                            for (const dt of sortedDates) {
-                                if (dailyConversions[dt] > 0) { lastConvDate = dt; break; }
-                            }
-                            if (lastConvDate) {
-                                const hoursSince = Math.round((new Date(yesterday + "T23:59:59Z") - new Date(lastConvDate + "T23:59:59Z")) / 3600000);
-                                if (hoursSince > dryThreshold) {
-                                    addFinding("critical", "conversion_dry_spell", gAcct.name, "google",
-                                        `No conversions in ${hoursSince} hours (threshold: ${dryThreshold}h)`,
-                                        { last_conversion_date: lastConvDate, hours_since: hoursSince, threshold_hours: dryThreshold });
-                                }
-                            } else if (monthlyBudget > 0) {
-                                addFinding("critical", "conversion_dry_spell", gAcct.name, "google",
-                                    `No conversions in trailing 7+ days`,
-                                    { last_conversion_date: null, threshold_hours: dryThreshold });
-                            }
-                        }
-
-                        // ── Check 3: CPA/ROAS threshold breach ──
-                        {
-                            let spend7d = 0, convs7d = 0, convVal7d = 0;
-                            for (let i = 0; i < 7; i++) {
-                                const dt = daysAgo(i, yesterday);
-                                spend7d += dailySpend[dt] || 0;
-                                convs7d += dailyConversions[dt] || 0;
-                                convVal7d += dailyConvValue[dt] || 0;
-                            }
-                            if (hc.cpa_target && convs7d > 0) {
-                                const cpa7d = Math.round((spend7d / convs7d) * 100) / 100;
-                                const tolerance = hc.cpa_tolerance_pct;
-                                const breachPct = Math.round(((cpa7d - hc.cpa_target) / hc.cpa_target) * 100);
-                                if (breachPct > tolerance) {
-                                    addFinding("warning", "cpa_roas_breach", gAcct.name, "google",
-                                        `7-day CPA $${cpa7d} exceeds target $${hc.cpa_target} (+${breachPct}%)`,
-                                        { metric: "cpa", actual: cpa7d, target: hc.cpa_target, breach_pct: breachPct });
+                                if (Math.round((ydObj - dtObj) / 86400000) < 7) {
+                                    const cName = row.campaign.name;
+                                    campSpend7d[cName] = (campSpend7d[cName] || 0) + parseInt(row.metrics?.costMicros || 0) / 1_000_000;
                                 }
                             }
-                            if (hc.roas_target && spend7d > 0) {
-                                const roas7d = Math.round((convVal7d / spend7d) * 100) / 100;
-                                const tolerance = hc.roas_tolerance_pct;
-                                const breachPct = Math.round(((hc.roas_target - roas7d) / hc.roas_target) * 100);
-                                if (breachPct > tolerance) {
-                                    addFinding("warning", "cpa_roas_breach", gAcct.name, "google",
-                                        `7-day ROAS ${roas7d}x below target ${hc.roas_target}x (-${breachPct}%)`,
-                                        { metric: "roas", actual: roas7d, target: hc.roas_target, breach_pct: breachPct });
+                            // Also find enabled campaigns with NO rows at all in the last 7 days
+                            const allEnabledCamps = new Set();
+                            for (const row of batchRows) allEnabledCamps.add(row.campaign.name);
+                            const dormant = [...allEnabledCamps].filter(c => (campSpend7d[c] || 0) === 0);
+                            if (dormant.length) {
+                                addFinding("info", "zero_spend_7d", gAcct.name, "google",
+                                    `${dormant.length} enabled campaign(s) with $0 spend in last 7 days`,
+                                    { campaigns: dormant });
+                            }
+                        }
+
+                        // Check 12: Ad disapproval scan
+                        try {
+                            const ads = await fetchAdDisapprovals(token, cid, gAcct.mcc);
+                            if (ads.length) {
+                                const disapproved = ads.filter(a => a.approval_status === "DISAPPROVED");
+                                const limited = ads.filter(a => a.approval_status !== "DISAPPROVED");
+                                if (disapproved.length) {
+                                    addFinding("critical", "ad_disapprovals", gAcct.name, "google",
+                                        `${disapproved.length} ad(s) DISAPPROVED`,
+                                        { ads: disapproved.slice(0, 10) });
+                                }
+                                if (limited.length) {
+                                    addFinding("warning", "ad_disapprovals", gAcct.name, "google",
+                                        `${limited.length} ad(s) with limited serving`,
+                                        { ads: limited.slice(0, 10) });
                                 }
                             }
-                        }
+                        } catch (e) { errors.push(`${gAcct.name} ad disapprovals: ${e.message}`); }
 
-                        // ── Check 4: Spend spikes and drops ──
-                        {
-                            const anomaly = detectSpendAnomaly(dailySpend, yesterday);
-                            if (anomaly) {
-                                const sev = anomaly.type === "SPEND_SPIKE" && parseInt(anomaly.change) > 100 ? "critical" : "warning";
-                                addFinding(sev, "spend_anomaly", gAcct.name, "google",
-                                    `${anomaly.type}: yesterday $${Math.round(anomaly.yesterday * 100) / 100} vs 7d avg $${anomaly.trailing_7d_avg} (${anomaly.change})`,
-                                    anomaly);
-                            }
-                        }
+                        // Check 13: Negative keyword conflict detection
+                        try {
+                            // Pull active negative keywords (campaign-level)
+                            const negRows = await googleSearch(token, cid, gAcct.mcc, `
+                                SELECT campaign.name, campaign_criterion.keyword.text,
+                                       campaign_criterion.keyword.match_type, campaign_criterion.negative
+                                FROM campaign_criterion
+                                WHERE campaign.status = 'ENABLED'
+                                  AND campaign_criterion.negative = TRUE
+                                  AND campaign_criterion.type = 'KEYWORD'`);
+                            // Pull active positive keywords
+                            const posRows = await googleSearch(token, cid, gAcct.mcc, `
+                                SELECT campaign.name, ad_group_criterion.keyword.text,
+                                       ad_group_criterion.keyword.match_type
+                                FROM keyword_view
+                                WHERE campaign.status = 'ENABLED'
+                                  AND ad_group_criterion.status = 'ENABLED'`);
 
-                        // ── Check 5: Zero-impression enabled campaigns ──
-                        {
-                            const zeroCamps = campYesterday.filter(c => c.imps === 0).map(c => c.name);
-                            if (zeroCamps.length) {
-                                addFinding("info", "zero_impressions", gAcct.name, "google",
-                                    `${zeroCamps.length} enabled campaign(s) with 0 impressions yesterday`,
-                                    { campaigns: zeroCamps });
-                            }
-                        }
+                            const conflicts = [];
+                            for (const neg of negRows) {
+                                const negText = (neg.campaignCriterion?.keyword?.text || "").toLowerCase();
+                                const negMatch = neg.campaignCriterion?.keyword?.matchType;
+                                const negCamp = neg.campaign.name;
+                                if (!negText) continue;
 
-                        // ── Check 6: Budget exhaustion ──
-                        {
-                            const exhausted = campYesterday.filter(c =>
-                                c.budgetLostIS != null && c.budgetLostIS > (hc.budget_exhaustion_is_lost_pct || 20) / 100
-                            );
-                            if (exhausted.length) {
-                                addFinding("warning", "budget_exhaustion", gAcct.name, "google",
-                                    `${exhausted.length} campaign(s) lost >20% impression share to budget yesterday`,
-                                    { campaigns: exhausted.map(c => ({ campaign: c.name, budget_lost_is: Math.round(c.budgetLostIS * 10000) / 100 + "%" })) });
-                            }
-                        }
+                                for (const pos of posRows) {
+                                    if (pos.campaign.name !== negCamp) continue;
+                                    const posText = (pos.adGroupCriterion?.keyword?.text || "").toLowerCase();
+                                    if (!posText) continue;
 
-                        // ── Weekly checks ──
-                        if (weekly) {
-                            // Check 7: Impression share decay
-                            if (hc.impression_share_floor != null) {
-                                const thisWeekDates = [], lastWeekDates = [];
-                                for (let i = 0; i < 7; i++) thisWeekDates.push(daysAgo(i, yesterday));
-                                for (let i = 7; i < 14; i++) lastWeekDates.push(daysAgo(i, yesterday));
+                                    let blocked = false;
+                                    if (negMatch === "EXACT" && posText === negText) blocked = true;
+                                    else if ((negMatch === "PHRASE" || negMatch === "BROAD") && posText.includes(negText)) blocked = true;
 
-                                const avgIS = (dates) => {
-                                    let total = 0, cnt = 0;
-                                    for (const dt of dates) {
-                                        if (dailyIS[dt]) { total += dailyIS[dt].totalIS / dailyIS[dt].count; cnt++; }
-                                    }
-                                    return cnt > 0 ? Math.round((total / cnt) * 10000) / 100 : null;
-                                };
-                                const thisWeekIS = avgIS(thisWeekDates);
-                                const lastWeekIS = avgIS(lastWeekDates);
-
-                                if (thisWeekIS != null) {
-                                    const floor = hc.impression_share_floor;
-                                    if (thisWeekIS < floor) {
-                                        addFinding("warning", "impression_share_decay", gAcct.name, "google",
-                                            `Search IS ${thisWeekIS}% below floor of ${floor}%`,
-                                            { current_is: thisWeekIS, floor, prior_week_is: lastWeekIS });
-                                    } else if (lastWeekIS != null && (lastWeekIS - thisWeekIS) >= 10) {
-                                        addFinding("warning", "impression_share_decay", gAcct.name, "google",
-                                            `Search IS dropped ${Math.round(lastWeekIS - thisWeekIS)} points WoW (${lastWeekIS}% → ${thisWeekIS}%)`,
-                                            { current_is: thisWeekIS, prior_week_is: lastWeekIS, drop: Math.round(lastWeekIS - thisWeekIS) });
+                                    if (blocked) {
+                                        conflicts.push({
+                                            campaign: negCamp,
+                                            negative_keyword: negText,
+                                            negative_match: negMatch,
+                                            blocked_positive: posText,
+                                        });
                                     }
                                 }
                             }
-
-                            // Check 8: CTR degradation (Search campaigns)
-                            for (const [cName, d7] of Object.entries(campCtr7d)) {
-                                const d30 = campCtr30d[cName];
-                                if (!d30 || d30.imps < 100 || d7.imps < 50) continue;
-                                const ctr7 = d7.clicks / d7.imps;
-                                const ctr30 = d30.clicks / d30.imps;
-                                if (ctr30 <= 0) continue;
-                                const pctChange = Math.round(((ctr7 - ctr30) / ctr30) * 100);
-                                const threshold = hc.ctr_degradation_pct || -20;
-                                if (pctChange < threshold) {
-                                    addFinding("info", "ctr_degradation", gAcct.name, "google",
-                                        `${cName}: 7d CTR ${(ctr7 * 100).toFixed(2)}% vs 30d ${(ctr30 * 100).toFixed(2)}% (${pctChange}%)`,
-                                        { campaign: cName, ctr_7d: (ctr7 * 100).toFixed(2) + "%", ctr_30d: (ctr30 * 100).toFixed(2) + "%", change_pct: pctChange });
-                                }
+                            if (conflicts.length) {
+                                addFinding("critical", "negative_keyword_conflicts", gAcct.name, "google",
+                                    `${conflicts.length} negative keyword(s) blocking positive keywords`,
+                                    { conflicts: conflicts.slice(0, 20) });
                             }
-
-                            // Check 10: Quality Score watch
-                            try {
-                                const kwRows = await googleSearch(token, cid, gAcct.mcc, `
-                                    SELECT campaign.name, ad_group.name,
-                                           ad_group_criterion.keyword.text,
-                                           ad_group_criterion.keyword.match_type,
-                                           ad_group_criterion.quality_info.quality_score,
-                                           ad_group_criterion.status,
-                                           metrics.cost_micros
-                                    FROM keyword_view
-                                    WHERE segments.date BETWEEN '${daysAgo(30, yesterday)}' AND '${yesterday}'
-                                      AND metrics.impressions > 0
-                                      AND campaign.status = 'ENABLED'
-                                      AND ad_group_criterion.status = 'ENABLED'`);
-                                const qsFloor = hc.quality_score_floor || 5;
-                                // Aggregate spend per keyword
-                                const kwSpend = {};
-                                for (const r of kwRows) {
-                                    const kw = r.adGroupCriterion?.keyword?.text;
-                                    const qs = r.adGroupCriterion?.qualityInfo?.qualityScore;
-                                    const spend = parseInt(r.metrics?.costMicros || 0) / 1_000_000;
-                                    if (!kw || qs == null) continue;
-                                    if (!kwSpend[kw]) kwSpend[kw] = { qs, spend: 0, campaign: r.campaign.name, ad_group: r.adGroup.name };
-                                    kwSpend[kw].spend += spend;
-                                }
-                                const lowQS = Object.entries(kwSpend)
-                                    .filter(([, d]) => d.qs < qsFloor && d.spend >= 10)
-                                    .map(([kw, d]) => ({ keyword: kw, quality_score: d.qs, spend_30d: Math.round(d.spend * 100) / 100, campaign: d.campaign }));
-                                if (lowQS.length) {
-                                    addFinding("info", "quality_score", gAcct.name, "google",
-                                        `${lowQS.length} keyword(s) with QS < ${qsFloor} and >$10 spend in 30d`,
-                                        { floor: qsFloor, keywords: lowQS.slice(0, 20) });
-                                }
-                            } catch (e) { errors.push(`${gAcct.name} QS check: ${e.message}`); }
-                        }
-
-                        // ── Structural checks ──
-                        if (structural) {
-                            // Check 11: Zero-spend enabled campaigns (7-day window)
-                            {
-                                const campSpend7d = {};
-                                for (const row of batchRows) {
-                                    const dt = row.segments.date;
-                                    const dtObj = new Date(dt + "T00:00:00Z");
-                                    const ydObj = new Date(yesterday + "T00:00:00Z");
-                                    if (Math.round((ydObj - dtObj) / 86400000) < 7) {
-                                        const cName = row.campaign.name;
-                                        campSpend7d[cName] = (campSpend7d[cName] || 0) + parseInt(row.metrics?.costMicros || 0) / 1_000_000;
-                                    }
-                                }
-                                // Also find enabled campaigns with NO rows at all in the last 7 days
-                                const allEnabledCamps = new Set();
-                                for (const row of batchRows) allEnabledCamps.add(row.campaign.name);
-                                const dormant = [...allEnabledCamps].filter(c => (campSpend7d[c] || 0) === 0);
-                                if (dormant.length) {
-                                    addFinding("info", "zero_spend_7d", gAcct.name, "google",
-                                        `${dormant.length} enabled campaign(s) with $0 spend in last 7 days`,
-                                        { campaigns: dormant });
-                                }
-                            }
-
-                            // Check 12: Ad disapproval scan
-                            try {
-                                const ads = await fetchAdDisapprovals(token, cid, gAcct.mcc);
-                                if (ads.length) {
-                                    const disapproved = ads.filter(a => a.approval_status === "DISAPPROVED");
-                                    const limited = ads.filter(a => a.approval_status !== "DISAPPROVED");
-                                    if (disapproved.length) {
-                                        addFinding("critical", "ad_disapprovals", gAcct.name, "google",
-                                            `${disapproved.length} ad(s) DISAPPROVED`,
-                                            { ads: disapproved.slice(0, 10) });
-                                    }
-                                    if (limited.length) {
-                                        addFinding("warning", "ad_disapprovals", gAcct.name, "google",
-                                            `${limited.length} ad(s) with limited serving`,
-                                            { ads: limited.slice(0, 10) });
-                                    }
-                                }
-                            } catch (e) { errors.push(`${gAcct.name} ad disapprovals: ${e.message}`); }
-
-                            // Check 13: Negative keyword conflict detection
-                            try {
-                                // Pull active negative keywords (campaign-level)
-                                const negRows = await googleSearch(token, cid, gAcct.mcc, `
-                                    SELECT campaign.name, campaign_criterion.keyword.text,
-                                           campaign_criterion.keyword.match_type, campaign_criterion.negative
-                                    FROM campaign_criterion
-                                    WHERE campaign.status = 'ENABLED'
-                                      AND campaign_criterion.negative = TRUE
-                                      AND campaign_criterion.type = 'KEYWORD'`);
-                                // Pull active positive keywords
-                                const posRows = await googleSearch(token, cid, gAcct.mcc, `
-                                    SELECT campaign.name, ad_group_criterion.keyword.text,
-                                           ad_group_criterion.keyword.match_type
-                                    FROM keyword_view
-                                    WHERE campaign.status = 'ENABLED'
-                                      AND ad_group_criterion.status = 'ENABLED'`);
-
-                                const conflicts = [];
-                                for (const neg of negRows) {
-                                    const negText = (neg.campaignCriterion?.keyword?.text || "").toLowerCase();
-                                    const negMatch = neg.campaignCriterion?.keyword?.matchType;
-                                    const negCamp = neg.campaign.name;
-                                    if (!negText) continue;
-
-                                    for (const pos of posRows) {
-                                        if (pos.campaign.name !== negCamp) continue;
-                                        const posText = (pos.adGroupCriterion?.keyword?.text || "").toLowerCase();
-                                        if (!posText) continue;
-
-                                        let blocked = false;
-                                        if (negMatch === "EXACT" && posText === negText) blocked = true;
-                                        else if ((negMatch === "PHRASE" || negMatch === "BROAD") && posText.includes(negText)) blocked = true;
-
-                                        if (blocked) {
-                                            conflicts.push({
-                                                campaign: negCamp,
-                                                negative_keyword: negText,
-                                                negative_match: negMatch,
-                                                blocked_positive: posText,
-                                            });
-                                        }
-                                    }
-                                }
-                                if (conflicts.length) {
-                                    addFinding("critical", "negative_keyword_conflicts", gAcct.name, "google",
-                                        `${conflicts.length} negative keyword(s) blocking positive keywords`,
-                                        { conflicts: conflicts.slice(0, 20) });
-                                }
-                            } catch (e) { errors.push(`${gAcct.name} neg keyword check: ${e.message}`); }
-                        }
-
-                    } catch (e) {
-                        errors.push(`${gAcct.name} (Google): ${e.message}`);
+                        } catch (e) { errors.push(`${gAcct.name} neg keyword check: ${e.message}`); }
                     }
+
+                } catch (e) {
+                    errors.push(`${gAcct.name} (Google): ${e.message}`);
                 }
             }
         }
