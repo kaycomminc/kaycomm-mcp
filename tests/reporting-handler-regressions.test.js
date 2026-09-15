@@ -2,6 +2,11 @@ process.env.MCP_TEST = "1";
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
+// Fixture expectations describe a specific point inside the flight. Freeze
+// Date, not network timers, so this remains valid after midnight/flight end.
+test.mock.timers.enable({ apis: ["Date"], now: Date.UTC(2026, 8, 14, 16) });
+test.after(() => test.mock.timers.reset());
+
 const realFetch = global.fetch;
 const calls = [];
 let failMetaSpend = false;
