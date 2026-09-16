@@ -31,7 +31,7 @@ const fetchFn = (url, options = {}) => {
 };
 
 // ── Credentials — loaded from environment variables ───────────────────────────
-// Set these in Railway → Variables, and in claude_desktop_config.json env block for local use
+// Set these in Railway → Variables, and in ./.env for local scripts (see local-env.js)
 const GOOGLE_DEVELOPER_TOKEN = process.env.GOOGLE_DEVELOPER_TOKEN;
 const GOOGLE_CLIENT_ID       = process.env.GOOGLE_CLIENT_ID;
 const GOOGLE_CLIENT_SECRET   = process.env.GOOGLE_CLIENT_SECRET;

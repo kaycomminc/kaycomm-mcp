@@ -6,11 +6,11 @@
  *
  * Exchanges the current META_ACCESS_TOKEN for a fresh ~60-day token
  * (grant_type=fb_exchange_token), verifies the new token works, writes it
- * into Claude Desktop's config, and pushes it to Railway automatically.
+ * into ./.env, and pushes it to Railway automatically.
  *
  * Needs META_APP_ID and META_APP_SECRET (Meta app → Settings → Basic) in
  * addition to the existing credentials — set them as env vars or add them
- * to the kaycomm-pacing env block in claude_desktop_config.json.
+ * to ./.env.
  *
  * IMPORTANT: Meta anchors a token's 60-day window to when the user last
  * AUTHENTICATED — exchanging a long-lived token re-issues it with the
@@ -25,23 +25,14 @@
  * updates Claude Desktop's config, and pushes the new token to Railway.
  * health_check warns 14 days before expiry.
  */
-const os   = require("os");
 const fs   = require("fs");
 const path = require("path");
 const { execFileSync } = require("child_process");
 
-const CONFIG_PATH = path.join(os.homedir(), "Library", "Application Support", "Claude", "claude_desktop_config.json");
+const { ENV_PATH, loadLocalEnv, writeEnvVar } = require("./local-env");
 
-// Pull creds from claude_desktop_config.json when not already in the environment
-if (["META_ACCESS_TOKEN", "META_APP_ID", "META_APP_SECRET"].some(k => !process.env[k])) {
-    try {
-        const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"));
-        const env = cfg?.mcpServers?.["kaycomm-pacing"]?.env || {};
-        for (const [k, v] of Object.entries(env)) {
-            if (!process.env[k]) process.env[k] = v;
-        }
-    } catch (_) { /* fall through — missing creds reported below */ }
-}
+// Pull creds from ./.env when not already in the environment
+loadLocalEnv();
 
 // A freshly generated token (Graph API Explorer) can be passed as the first
 // argument — that's what actually resets the 60-day clock. Without it, the
@@ -57,7 +48,7 @@ if (!TOKEN || !APP_ID || !SECRET) {
     if (!TOKEN)  console.error("  META_ACCESS_TOKEN — the current (still-valid) token, or pass a fresh one as an argument");
     if (!APP_ID) console.error("  META_APP_ID      — Meta app → Settings → Basic → App ID");
     if (!SECRET) console.error("  META_APP_SECRET  — Meta app → Settings → Basic → App Secret (click Show)");
-    console.error(`\nAdd the missing keys to the kaycomm-pacing env block in:\n  ${CONFIG_PATH}\nthen re-run: node refresh-meta-token.js`);
+    console.error(`\nAdd the missing keys to:\n  ${ENV_PATH}\nthen re-run: node refresh-meta-token.js`);
     process.exit(1);
 }
 
@@ -98,18 +89,9 @@ async function main() {
     const expStr = exp === 0 ? "never" : exp ? new Date(exp * 1000).toISOString().split("T")[0] : "unknown";
     console.log(`New token verified — authenticated as ${me.name}, expires: ${expStr}`);
 
-    // 3. Write it into Claude Desktop's config (backup first)
-    const raw = fs.readFileSync(CONFIG_PATH, "utf8");
-    const cfg = JSON.parse(raw);
-    const env = cfg?.mcpServers?.["kaycomm-pacing"]?.env;
-    if (env) {
-        fs.writeFileSync(CONFIG_PATH + ".bak", raw);
-        env.META_ACCESS_TOKEN = newToken;
-        fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2) + "\n");
-        console.log(`Updated ${CONFIG_PATH} (backup at .bak) — restart Claude Desktop to pick it up.`);
-    } else {
-        console.log("Could not find the kaycomm-pacing env block in Claude Desktop's config — update META_ACCESS_TOKEN there manually.");
-    }
+    // 3. Save it to the local .env
+    writeEnvVar("META_ACCESS_TOKEN", newToken);
+    console.log(`Updated META_ACCESS_TOKEN in ${ENV_PATH}`);
 
     // 4. Push to Railway automatically
     await syncToRailway({ META_ACCESS_TOKEN: newToken });

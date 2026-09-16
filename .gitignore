@@ -1,3 +1,5 @@
 node_modules/
+.env
+.env.*
 write-log.jsonl
 .mcp-write-state/
