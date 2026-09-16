@@ -1138,7 +1138,7 @@ async function getMetaPixels(accountId) {
 async function getMetaCreativeDetails(creativeIds) {
     const results = [];
     for (const cid of creativeIds) {
-        const data = await metaGet(cid, { fields: "id,name,object_story_id,object_story_spec,call_to_action_type,url_tags,asset_feed_spec" });
+        const data = await metaGet(cid, { fields: "id,name,object_story_id,object_story_spec,call_to_action_type,url_tags,asset_feed_spec,degrees_of_freedom_spec,image_crops,image_url,thumbnail_url,effective_object_story_id" });
         results.push({
             id: data.id,
             name: data.name,
@@ -1147,6 +1147,12 @@ async function getMetaCreativeDetails(creativeIds) {
             url_tags: data.url_tags || null,
             object_story_spec: data.object_story_spec || null,
             asset_feed_spec: data.asset_feed_spec || null,
+            degrees_of_freedom_spec: data.degrees_of_freedom_spec ?? null,
+            image_crops: data.image_crops ?? null,
+            image_url: data.image_url ?? null,
+            thumbnail_url: data.thumbnail_url ?? null,
+            effective_object_story_id: data.effective_object_story_id ?? null,
+            enhancement_note: "Missing features are unspecified, not necessarily disabled. Enrollment does not guarantee delivery or a crop-free image.",
         });
     }
     return results;
@@ -5173,15 +5179,15 @@ function makeServer() {
             name: "manage_meta",
             description: "View and manage Meta Ads campaigns, ad sets, and ads — list, pause, resume, archive, update budgets, or duplicate. " +
                 "Dry run by default. Set confirm=true to apply changes. " +
-                "Actions: list_campaigns, list_adsets, list_ads, get_creative_details, pause, resume, archive, set_daily_budget, duplicate.",
+                "Actions: list_campaigns, list_adsets, list_ads, list_creatives, get_creative_details, pause, resume, archive, set_daily_budget, duplicate.",
             inputSchema: {
                 type: "object",
                 properties: {
                     account_name: { type: "string", description: "Meta account name (partial match ok)" },
                     action: {
                         type: "string",
-                        description: "list_campaigns | list_adsets | list_ads | get_creative_details | pause | resume | archive | set_daily_budget | duplicate",
-                        enum: ["list_campaigns", "list_adsets", "list_ads", "get_creative_details", "pause", "resume", "archive", "set_daily_budget", "duplicate"],
+                        description: "list_campaigns | list_adsets | list_ads | list_creatives | get_creative_details | pause | resume | archive | set_daily_budget | duplicate",
+                        enum: ["list_campaigns", "list_adsets", "list_ads", "list_creatives", "get_creative_details", "pause", "resume", "archive", "set_daily_budget", "duplicate"],
                     },
                     target: { type: "string", description: "Campaign, ad set, or ad name to target (partial match ok). Required for pause/resume/archive/set_daily_budget/duplicate." },
                     level: {
@@ -6375,6 +6381,51 @@ function makeServer() {
                 },
                 required: ["account_name", "ad_sets"],
             },
+        },
+        {
+            name: "prepare_meta_placement_images",
+            description: "Resize a single-image creative into separate images for individual placements, upload them and prepare an unattached placement-customized creative. Defaults to contain (preserve full artwork with padding), with optional cover cropping, background color and safe-area padding. Dry run by default. Confirm creates media/creative only; preview before attaching with update_meta_object. Supports unpublished single-image link creatives with headline and primary text; rejects existing-post, video, carousel and existing placement-asset creatives. Unspecified placements retain the original image; image_auto_crop is opted out. Partial uploads are returned for reconciliation.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    account_name: { type: "string" },
+                    creative_id: { type: "string", pattern: "^[0-9]+$" },
+                    variants: { type: "array", minItems: 1, maxItems: 6, items: {
+                        type: "object", properties: {
+                            image_hash: { type: "string", pattern: "^[a-fA-F0-9]{32}$", description: "Reuse an existing account image of these exact dimensions instead of uploading again; useful for reconciliation." },
+                            width: { type: "integer", minimum: 100, maximum: 4096 },
+                            height: { type: "integer", minimum: 100, maximum: 4096 },
+                            placements: { type: "array", minItems: 1, uniqueItems: true, items: { type: "string", enum: Object.keys(require('./src/meta-placement-images').PLACEMENTS) } },
+                            fit: { type: "string", enum: ["contain", "cover"], description: "contain preserves all content; cover crops from the center." },
+                            background: { type: "string", pattern: "^#[0-9a-fA-F]{6}$" },
+                            padding: { type: "integer", minimum: 0, description: "Inset all artwork by this many output pixels on every edge." }
+                        }, required: ["width", "height", "placements"]
+                    } },
+                    confirm: { type: "boolean" }
+                }, required: ["account_name", "creative_id", "variants"]
+            }
+        },
+        {
+            name: "prepare_meta_image_enhancements",
+            description: "Prepare a replacement single-image creative with selected Meta image enhancements. Dry run by default; confirm=true creates an unattached creative, never changes a live ad. Preserves source copy and existing enhancement settings. Preview the returned creative_id with preview_meta_ad, then attach using update_meta_object. Existing-post, video, carousel and placement-asset creatives are rejected rather than flattened. Missing settings mean unspecified, not disabled. Meta eligibility and rendered results vary.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    account_name: { type: "string" },
+                    creative_id: { type: "string", pattern: "^[0-9]+$" },
+                    enhancements: {
+                        type: "object", minProperties: 1,
+                        properties: {
+                            image_auto_crop: { type: "string", enum: ["OPT_IN", "OPT_OUT"] },
+                            image_touchups: { type: "string", enum: ["OPT_IN", "OPT_OUT"] },
+                            image_uncrop: { type: "string", enum: ["OPT_IN", "OPT_OUT"] },
+                            image_brightness_and_contrast: { type: "string", enum: ["OPT_IN", "OPT_OUT"] }
+                        }
+                    },
+                    confirm: { type: "boolean" }
+                },
+                required: ["account_name", "creative_id", "enhancements"]
+            }
         },
         {
             name: "preview_meta_ad",
@@ -7787,6 +7838,10 @@ async function dispatchToolCall(name, args = {}) {
                         }
                     }
                     result = { account: acctInfo.name, filter: target, ads };
+
+                } else if (action === "list_creatives") {
+                    const creatives = await metaGetAll(`${metaActId(accountId)}/adcreatives`, { fields: "id,name,status", limit: 100 });
+                    result = { account: acctInfo.name, creatives: args.target ? creatives.filter(c => (c.name || '').toLowerCase().includes(args.target.toLowerCase())) : creatives };
 
                 } else if (action === "get_creative_details") {
                     if (!args.creative_ids || !Array.isArray(args.creative_ids) || args.creative_ids.length === 0) {
@@ -10661,6 +10716,38 @@ async function dispatchToolCall(name, args = {}) {
                         }
                     }
                 } catch (e) { result = { error: e.message }; }
+            }
+        }
+
+    } else if (name === "prepare_meta_placement_images") {
+        const { match, error } = resolveAccount(META_ACCOUNTS, args.account_name.toLowerCase(), { confirmed: args.confirm === true });
+        if (!match) result = { error };
+        else {
+            const [accountId, info] = match;
+            const { preparePlacementImages } = require('./src/meta-placement-images');
+            result = { account: info.name, ...await preparePlacementImages(args, { accountId: metaActId(accountId), get: metaGet, post: metaPost, fetch: fetchFn }) };
+        }
+
+    } else if (name === "prepare_meta_image_enhancements") {
+        const { match, error } = resolveAccount(META_ACCOUNTS, args.account_name.toLowerCase(), { confirmed: args.confirm === true });
+        if (!match) result = { error };
+        else {
+            const [accountId, info] = match;
+            const source = await metaGet(args.creative_id, { fields: "id,name,object_story_id,object_story_spec,asset_feed_spec,url_tags,degrees_of_freedom_spec,image_crops,authorization_category,applink_treatment,link_deep_link_url,object_type,product_set_id" });
+            const { buildImageEnhancementCreative, verifyImageEnhancements } = require('./src/meta-image-enhancements');
+            const creative = buildImageEnhancementCreative(source, args.enhancements);
+            if (!args.confirm) result = { dry_run: true, account: info.name, source_creative_id: source.id, creative, live_ads_changed: false };
+            else {
+                const created = await metaPost(`${metaActId(accountId)}/adcreatives`, creative);
+                if (!created.id) throw new Error("Meta did not return a creative ID; reconcile before retrying.");
+                result = { account: info.name, source_creative_id: source.id, creative_id: created.id, live_ads_changed: false };
+                try {
+                    const [readback] = await getMetaCreativeDetails([created.id]);
+                    result.creative = readback;
+                    result.verification = verifyImageEnhancements(readback, args.enhancements);
+                } catch (_) {
+                    result.verification = { verified: false, message: "Creative created, but readback failed. Inspect this creative_id before attaching or retrying." };
+                }
             }
         }
 

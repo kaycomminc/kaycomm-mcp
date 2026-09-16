@@ -15,7 +15,7 @@ const META_TOOLS = new Set([
   'create_meta_subscription', 'update_meta_subscription',
   'delete_meta_subscription', 'create_meta_audience',
   'manage_meta_audience_users', 'manage_meta_ad_rules', 'update_meta_object',
-  'manage_meta_leads',
+  'manage_meta_leads', 'prepare_meta_image_enhancements', 'prepare_meta_placement_images',
 ]);
 
 const GOOGLE_TOOLS = new Set([
@@ -285,7 +285,9 @@ function invalidMetaUpdateShape(toolName, args) {
 
 function metaChecks(name, args) {
   const checks = [];
-  if (name === 'update_meta_object') {
+  if (name === 'prepare_meta_image_enhancements' || name === 'prepare_meta_placement_images') {
+    addMetaCheck(checks, args.creative_id, 'adcreatives', 'Creative ID');
+  } else if (name === 'update_meta_object') {
     addMetaCheck(checks, args.object_id, { campaign: 'campaigns', adset: 'adsets', ad: 'ads' }[args.level], `${args.level || 'Meta object'} ID`);
     // The server passes updates through to Meta.  The documented reusable ad
     // creative shape is { creative: { creative_id } }; guard that concrete

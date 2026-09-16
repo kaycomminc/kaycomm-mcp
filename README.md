@@ -250,3 +250,85 @@ remains for existing Claude connectors. Removing a secret from a plugin does
 not revoke previously exposed copies: rotate the shared server token only after
 all connected clients have a coordinated migration path. Do not share old
 token-bearing plugin archives, logs, or conversation links.
+
+### Meta image enhancement workflow
+
+`manage_meta` → `get_creative_details` now returns `degrees_of_freedom_spec`,
+`image_crops`, image/thumbnail URLs, and effective post identity alongside existing
+placement asset rules. A missing enhancement is **unspecified**, not disabled.
+
+`prepare_meta_image_enhancements` takes an account, a source `creative_id`, and
+an `enhancements` map. Supported features are `image_uncrop` (image expansion),
+`image_auto_crop`, `image_touchups`, and `image_brightness_and_contrast`, each
+with `OPT_IN` or `OPT_OUT`. Omit `confirm` for a read-only payload preview.
+`confirm=true` creates an **unattached replacement creative** and reads its
+settings back; it never changes a live ad. Keep the returned ID if readback fails,
+and reconcile rather than repeating creation. Confirmed retries are protected
+by the existing persistent idempotency guard.
+
+Preview the replacement with `preview_meta_ad` for each relevant placement.
+Only after visual review, use `update_meta_object` at ad level with
+`updates: {creative: {creative_id: "replacement ID"}}` to attach it. Retain the
+original creative ID for rollback. Replacing a creative can create a new post
+identity and trigger Meta review. Enrollment alone cannot guarantee that Meta
+will generate an expanded image or that text/logos will fit every placement.
+
+Preparation currently supports unpublished single-image link creatives only.
+Video, existing-post, catalog, carousel and placement-asset creatives are rejected
+rather than flattened. Their settings can still be inspected. This tool controls
+Meta rendering enhancements; it does not export AI-edited bitmap files.
+
+API references: [Meta image expansion example](https://www.postman.com/meta/facebook-marketing-api/request/f4q2498/8-creating-single-image-ad-with-image-uncrop)
+and [Meta feature schema](https://github.com/facebook/facebook-python-business-sdk/blob/main/facebook_business/adobjects/adcreativefeaturesspec.py).
+
+### Resize artwork for individual Meta placements
+
+`prepare_meta_placement_images` creates real resized PNG assets, uploads them to
+the selected account, and builds a new unattached creative with explicit
+`asset_customization_rules`. Example dry-run arguments:
+
+```json
+{
+  "account_name": "Summit Express",
+  "creative_id": "SOURCE_CREATIVE_ID",
+  "variants": [
+    { "width": 1080, "height": 1350, "placements": ["instagram_feed", "facebook_feed"], "padding": 50 },
+    { "width": 1080, "height": 1080, "placements": ["instagram_explore", "facebook_right_column"] },
+    { "width": 1080, "height": 1920, "placements": ["instagram_stories", "instagram_reels", "facebook_stories", "facebook_reels"], "padding": 100 }
+  ]
+}
+```
+
+Each variant supports `fit: "contain"` (default; preserves all artwork) or
+`fit: "cover"` (explicit center crop), a six-digit hex `background` (default
+white), and optional pixel `padding` on all edges. Sizes are configurable from
+100 to 4096 pixels per side. Placement names cannot overlap across variants.
+The selected ad set must already allow the placements; this tool does not
+change targeting. Story/Reel UI overlays still require visual safe-area review.
+
+Unspecified placements use the original image. Automatic image cropping is
+explicitly opted out on the new creative. Other enhancement settings are
+preserved; their rendering effects should be reviewed in previews. The source
+must be an unpublished single-image link creative with a headline and primary
+text. Specialized CTA destinations, existing placement-asset creatives and
+unsupported link fields fail closed rather than silently losing content.
+
+`confirm=true` uploads the rendered assets and creates an unattached creative;
+returned `verified` checks the image labels, placement routing, and auto-crop
+opt-out returned by Meta. A partial failure includes uploaded image hashes and
+any known creative ID for reconciliation. Do not blindly retry a failed write.
+Use `preview_meta_ad` before attaching through `update_meta_object`; keep the
+original creative ID for rollback. No live ad is modified by preparation.
+
+The server downloads only HTTPS Meta CDN image URLs obtained from the account's
+media library, rejects redirects and oversized downloads, limits decoded pixels,
+and accepts only still JPEG/PNG/WebP source images. Resizing uses Sharp; it does
+not invent missing text, logos or photographic content.
+
+For recovery, a variant may include `image_hash` to reuse an existing image from
+this account instead of resizing/uploading again. Its stored dimensions must
+match the variant. `manage_meta` → `list_creatives` with optional `target` name
+filter finds unattached creatives for reconciliation. The retired
+`standard_enhancements` bundle is omitted when Meta returns individual feature
+settings alongside it; those individual settings are retained. Bundle-only
+legacy creatives require explicit migration.

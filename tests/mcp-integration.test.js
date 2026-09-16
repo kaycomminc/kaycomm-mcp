@@ -59,6 +59,8 @@ global.fetch = async (input, options = {}) => {
 
   if (method === 'GET') {
     const id = url.pathname.split('/').filter(Boolean).at(-1);
+    if (id === 'adcreatives') return response({data:[]});
+    if (id === '901' || id === '902') return response({ id, account_id: 'act_a', name: 'Fixture image', object_story_spec: { page_id: '1', link_data: { image_hash: 'fixture', link: 'https://example.com', message: 'Original' } }, degrees_of_freedom_spec: { creative_features_spec: { image_uncrop: { enroll_status: id === '902' ? 'OPT_IN' : 'OPT_OUT' } } } });
     const accountId = id === 'synthetic_other' ? 'act_b' : 'act_a';
     return response({ id, account_id: accountId });
   }
@@ -75,6 +77,7 @@ global.fetch = async (input, options = {}) => {
       failNextPost = false;
       throw new Error('synthetic upstream connection failure');
     }
+    if (url.pathname.endsWith('/adcreatives')) return response({ id: '902' });
     if (url.pathname.endsWith('/adimages')) return response({ images: { uploaded: { hash: 'synthetic-image-hash' } } });
     return response({ success: true, num_received: 1, num_invalid_entries: 0 });
   }
@@ -150,9 +153,9 @@ async function flushHttp() {
   await new Promise(resolve => setImmediate(resolve));
 }
 
-test('registered catalog contains 78 tools with annotations and output schemas', async () => {
+test('registered catalog contains 80 tools with annotations and output schemas', async () => {
   const listed = await listHandler({ method: 'tools/list', params: {} }, {});
-  assert.equal(listed.tools.length, 78);
+  assert.equal(listed.tools.length, 80);
   for (const tool of listed.tools) {
     assert.ok(tool.annotations, `${tool.name} is missing annotations`);
     assert.equal(typeof tool.annotations.readOnlyHint, 'boolean');
@@ -331,4 +334,36 @@ test.after(() => {
     else process.env[name] = value;
   }
   fs.rmSync(tempDir, { recursive: true, force: true });
+});
+
+
+test('image enhancements dry run reads source without POST', async () => {
+  resetFetches();
+  const result = await invoke('prepare_meta_image_enhancements', { account_name: 'Audit Client A', creative_id: '901', enhancements: { image_uncrop: 'OPT_IN' } });
+  assert.equal(result.value.dry_run, true);
+  assert.equal(result.value.creative.object_story_spec.link_data.message, 'Original');
+  assert.equal(fetches.filter(x => x.method === 'POST').length, 0);
+});
+test('image enhancements create an unattached creative and verify readback; retry blocked', async () => {
+  resetFetches();
+  const args = { account_name: 'Audit Client A', creative_id: '901', enhancements: { image_uncrop: 'OPT_IN' }, confirm: true, idempotency_key: 'fixture-image-creation' };
+  const result = await invoke('prepare_meta_image_enhancements', args);
+  assert.equal(result.value.creative_id, '902');
+  assert.equal(result.value.verification.verified, true);
+  assert.equal(result.value.live_ads_changed, false);
+  assert.equal(fetches.filter(x => x.method === 'POST').length, 1);
+  assert.ok(fetches.find(x => x.method === 'POST').path.endsWith('/act_a/adcreatives'));
+  const retry = await invoke('prepare_meta_image_enhancements', args);
+  assert.equal(retry.value._meta.errors[0].code, 'DUPLICATE_WRITE_BLOCKED');
+  assert.equal(fetches.filter(x => x.method === 'POST').length, 1);
+});
+test('creative detail read exposes enhancement and crop fields', async () => {
+  const result = await invoke('manage_meta', { account_name: 'Audit Client A', action: 'get_creative_details', creative_ids: ['901'] });
+  assert.equal(result.value.creatives[0].degrees_of_freedom_spec.creative_features_spec.image_uncrop.enroll_status, 'OPT_OUT');
+  assert.equal(result.value.creatives[0].image_crops, null);
+});
+test('creative listing supports reconciliation without requiring an ad attachment', async () => {
+  const result = await invoke('manage_meta', { account_name:'Audit Client A', action:'list_creatives', target:'placement sizes' });
+  assert.equal(result.value.error, undefined);
+  assert.deepEqual(result.value.creatives, []);
 });
