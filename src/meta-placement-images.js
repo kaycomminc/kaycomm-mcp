@@ -85,6 +85,7 @@ function placementCreative(source, variants, hashes) {
     link_urls: [{ website_url: link.link, ...(link.caption ? { display_url: link.caption } : {}) }],
     call_to_action_types: [cta.type], asset_customization_rules: rules,
   };
+  creative.contextual_multi_ads = { enroll_status: 'OPT_OUT' };
   creative.name = `${source.name || source.id} - placement sizes`.slice(0, 255);
   return creative;
 }
@@ -123,14 +124,14 @@ async function preparePlacementImages(args, deps) {
     const created = await deps.post(`${deps.accountId}/adcreatives`, placementCreative(source, variants, result.uploaded_images.map(x => x.hash)));
     if (!created.id) throw new Error('Creative creation returned no ID.');
     result.creative_id = created.id;
-    const readback = await deps.get(created.id, { fields: 'id,asset_feed_spec,degrees_of_freedom_spec' });
+    const readback = await deps.get(created.id, { fields: 'id,asset_feed_spec,degrees_of_freedom_spec,contextual_multi_ads' });
     result.creative = readback;
     const observed = readback.asset_feed_spec;
     result.verified = variants.every((v, i) => {
       const image = observed?.images?.find(x => x.hash === result.uploaded_images[i].hash);
       const rule = observed?.asset_customization_rules?.find(x => x.image_label?.name === v.label);
       return image?.adlabels?.some(x => x.name === v.label) && rule && v.placements.every(p => { const [platform, position] = PLACEMENTS[p]; return rule.customization_spec?.publisher_platforms?.includes(platform) && rule.customization_spec?.[platform + '_positions']?.includes(position); });
-    }) && readback.degrees_of_freedom_spec?.creative_features_spec?.image_auto_crop?.enroll_status === 'OPT_OUT';
+    }) && readback.degrees_of_freedom_spec?.creative_features_spec?.image_auto_crop?.enroll_status === 'OPT_OUT' && readback.contextual_multi_ads?.enroll_status === 'OPT_OUT';
     result.note = 'Preview all requested placements before attaching. Platform overlays can still cover text; padding can reserve space.';
   } catch (error) {
     result.error = error.message;

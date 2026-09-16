@@ -37,6 +37,7 @@ test('placement rules preserve identity, copy, destination, CTA and tracking wit
   assert.deepEqual(creative.asset_feed_spec.asset_customization_rules[0].customization_spec, { publisher_platforms:['instagram','facebook'], instagram_positions:['stream'], facebook_positions:['feed'] });
   assert.equal(creative.asset_feed_spec.asset_customization_rules.at(-1).image_label.name, 'placement_original');
   assert.equal(creative.degrees_of_freedom_spec.creative_features_spec.image_auto_crop.enroll_status,'OPT_OUT');
+  assert.equal(creative.contextual_multi_ads.enroll_status, 'OPT_OUT');
   assert.equal(source.degrees_of_freedom_spec, undefined);
 });
 test('unsupported copy fields fail before conversion and duplicate hashes combine labels', () => {
