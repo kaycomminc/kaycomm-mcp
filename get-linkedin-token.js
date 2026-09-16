@@ -69,7 +69,7 @@ const server = http.createServer(async (req, res) => {
             console.log("\n=== LinkedIn Access Token ===");
             console.log(data.access_token);
             console.log(`\nExpires in: ${expiresDays} days (${expiresIn} seconds)`);
-            console.log("\nAdd this to your claude_desktop_config.json env block as LINKEDIN_ACCESS_TOKEN");
+            console.log("\nAdd this to ./.env as LINKEDIN_ACCESS_TOKEN, then run: node sync-to-railway.js LINKEDIN_ACCESS_TOKEN");
 
             res.writeHead(200, { "Content-Type": "text/html" });
             res.end("<h2>Success!</h2><p>Access token printed to terminal. You can close this tab.</p>");

@@ -6,26 +6,13 @@
  *   node test.js get_google_pacing
  *   node test.js get_account_detail '{"account_name":"Spartan"}'
  *
- * Credentials: uses env vars if set, otherwise reads the env block from
- * Claude Desktop's config so it Just Works on this machine.
+ * Credentials: uses env vars if set, otherwise reads ./.env so it Just Works
+ * on this machine.
  */
 process.env.MCP_TEST = "1";
 
-// Pull creds from claude_desktop_config.json when not already in the environment
-const REQUIRED = ["GOOGLE_DEVELOPER_TOKEN", "GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "GOOGLE_REFRESH_TOKEN", "META_ACCESS_TOKEN"];
-if (REQUIRED.some(k => !process.env[k])) {
-    try {
-        const os = require("os");
-        const path = require("path");
-        const fs = require("fs");
-        const cfgPath = path.join(os.homedir(), "Library", "Application Support", "Claude", "claude_desktop_config.json");
-        const cfg = JSON.parse(fs.readFileSync(cfgPath, "utf8"));
-        const env = cfg?.mcpServers?.["kaycomm-pacing"]?.env || {};
-        for (const [k, v] of Object.entries(env)) {
-            if (!process.env[k]) process.env[k] = v;
-        }
-    } catch (_) { /* fall through — server will report auth errors */ }
-}
+// Pull creds from ./.env when not already in the environment
+require("./local-env").loadLocalEnv();
 
 const { handleToolCall } = require("./server.js");
 

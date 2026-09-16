@@ -1,21 +1,17 @@
 #!/usr/bin/env node
 /**
- * Sync kaycomm-pacing env vars from Claude Desktop config → Railway.
+ * Sync kaycomm-pacing env vars from ./.env → Railway.
  *
  *   node sync-to-railway.js                  # sync all token/secret vars
  *   node sync-to-railway.js META_ACCESS_TOKEN LINKEDIN_ACCESS_TOKEN   # sync specific vars
  *   node sync-to-railway.js --dry-run        # show what would be synced without changing Railway
  *
- * Reads the kaycomm-pacing env block from claude_desktop_config.json and
- * pushes each variable to Railway using the CLI. The Railway project must
- * be linked in this directory (run `railway link` if not).
+ * Reads ./.env and pushes each variable to Railway using the CLI. The Railway
+ * project must be linked in this directory (run `railway link` if not).
  */
-const os   = require("os");
 const fs   = require("fs");
-const path = require("path");
 const { execFileSync } = require("child_process");
-
-const CONFIG_PATH = path.join(os.homedir(), "Library", "Application Support", "Claude", "claude_desktop_config.json");
+const { ENV_PATH, readEnvFile } = require("./local-env");
 
 const SYNCABLE_KEYS = [
     "GOOGLE_DEVELOPER_TOKEN",
@@ -36,12 +32,9 @@ const dryRun = args.includes("--dry-run");
 const requestedKeys = args.filter(a => !a.startsWith("--"));
 
 // Load local config
-let localEnv;
-try {
-    const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"));
-    localEnv = cfg?.mcpServers?.["kaycomm-pacing"]?.env || {};
-} catch (e) {
-    console.error(`Cannot read ${CONFIG_PATH}: ${e.message}`);
+const localEnv = readEnvFile();
+if (Object.keys(localEnv).length === 0) {
+    console.error(`No credentials found in ${ENV_PATH}`);
     process.exit(1);
 }
 

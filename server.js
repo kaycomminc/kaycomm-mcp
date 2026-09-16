@@ -31,7 +31,7 @@ const fetchFn = (url, options = {}) => {
 };
 
 // ── Credentials — loaded from environment variables ───────────────────────────
-// Set these in Railway → Variables, and in claude_desktop_config.json env block for local use
+// Set these in Railway → Variables, and in ./.env for local scripts (see local-env.js)
 const GOOGLE_DEVELOPER_TOKEN = process.env.GOOGLE_DEVELOPER_TOKEN;
 const GOOGLE_CLIENT_ID       = process.env.GOOGLE_CLIENT_ID;
 const GOOGLE_CLIENT_SECRET   = process.env.GOOGLE_CLIENT_SECRET;
@@ -4369,7 +4369,9 @@ async function fetchBiddingStrategies(token, customerId, mccId, campaignSearch) 
 async function fetchChangeHistory(token, customerId, mccId, days, resourceType) {
     const { today, yesterday } = getDateInfo();
     const lookbackDays = Math.min(days || 14, 30);
-    const startDate = daysAgo(lookbackDays, today);
+    // Google's 30-day limit is measured from now, so a midnight start date exactly
+    // 30 days back is rejected (START_DATE_TOO_OLD). Stay one day inside the limit.
+    const startDate = daysAgo(Math.min(lookbackDays, 29), today);
     let where = `change_event.change_date_time BETWEEN '${startDate}' AND '${today}'`;
     if (resourceType) where += ` AND change_event.change_resource_type = '${resourceType}'`;
     const rows = await googleSearch(token, customerId, mccId, `
