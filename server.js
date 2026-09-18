@@ -6676,13 +6676,35 @@ function makeServer() {
         {
             name: "get_meta_ad_issues",
             description: "Find Meta ads with delivery issues — disapproved, in review, or with policy violations. " +
-                "Checks effective_status and ad_review_feedback for all ads in the account.",
+                "Checks effective_status, issues_info (delivery error code and summary) and ad_review_feedback " +
+                "(policy rejections) for all ads in the account. Both are reported as null when Meta returns nothing, " +
+                "which points at the ad set or campaign rather than the ad.",
             inputSchema: {
                 type: "object",
                 properties: {
                     account_name: { type: "string", description: "Meta account name (partial match ok). Omit to check all Meta accounts." },
                 },
                 required: [],
+            },
+        },
+        {
+            name: "retag_meta_ad",
+            description: "Set or replace the UTM tracking (url_tags) on a live Meta ad. Meta freezes url_tags on a creative " +
+                "once it is attached to an ad, so this rebuilds the creative with the new tracking and repoints the ad at the " +
+                "copy — the same thing Ads Manager does behind its URL parameters field. Ad ID, ad set, targeting, budget and " +
+                "delivery history are unchanged; learning is not reset. Dry run by default — set confirm=true to apply. " +
+                "Refuses ads promoting an existing Page post (rebuilding would drop the post's engagement) and catalog creatives. " +
+                "Warns when the destination URL already carries the same parameters, since Meta appends url_tags rather than merging.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    account_name: { type: "string", description: "Meta account name (partial match ok)" },
+                    ad_id: { type: "string", description: "The ad to retag. Its current creative is used as the source." },
+                    url_tags: { type: "string", description: "UTM query string, no leading '?'. Supports Meta macros, e.g. 'utm_source=Facebook&utm_medium=PPC&utm_campaign={{campaign.name}}&utm_content={{placement}}'." },
+                    allow_duplicate_params: { type: "boolean", description: "Proceed even though the destination URL already carries parameters that url_tags also sets. Meta appends rather than merges, so the click URL will contain each one twice. Default false." },
+                    confirm: { type: "boolean", description: "Set true to apply. Omit for dry-run preview." },
+                },
+                required: ["account_name", "ad_id", "url_tags"],
             },
         },
         {
@@ -10753,6 +10775,65 @@ async function dispatchToolCall(name, args = {}) {
             }
         }
 
+    } else if (name === "retag_meta_ad") {
+        const { match, error } = resolveAccount(META_ACCOUNTS, (args.account_name || "").toLowerCase(), { confirmed: args.confirm === true });
+        if (!match) result = { error };
+        else {
+            const [accountId, info] = match;
+            const {
+                buildRetaggedCreative, paramConflicts, verifyRetag, CREATIVE_READ_FIELDS,
+            } = require('./src/meta-url-tags');
+            const ad = await metaGet(args.ad_id, { fields: "id,name,status,effective_status,creative{id}" });
+            const sourceCreativeId = ad.creative?.id;
+            if (!sourceCreativeId) {
+                result = { error: "This ad has no creative to retag." };
+            } else {
+                const source = await metaGet(sourceCreativeId, { fields: CREATIVE_READ_FIELDS });
+                const creative = buildRetaggedCreative(source, args.url_tags);
+                const conflicts = paramConflicts(source, creative.url_tags);
+                const base = {
+                    account: info.name,
+                    ad: { id: ad.id, name: ad.name, status: ad.status, effective_status: ad.effective_status },
+                    source_creative_id: sourceCreativeId,
+                    current_url_tags: source.url_tags ?? null,
+                    new_url_tags: creative.url_tags,
+                    ...(conflicts.length ? { duplicate_param_warning: conflicts } : {}),
+                };
+                if (conflicts.length && args.allow_duplicate_params !== true) {
+                    result = {
+                        ...base, live_ads_changed: false,
+                        error: "The destination URL already sets parameter(s) that url_tags also sets. Meta appends url_tags to the URL instead of merging, so each would appear twice in one click URL. Remove the inline parameters from the creative's URL, or pass allow_duplicate_params=true to proceed anyway.",
+                        code: "DUPLICATE_URL_PARAMS",
+                    };
+                } else if (!args.confirm) {
+                    result = {
+                        ...base, dry_run: true, live_ads_changed: false, creative,
+                        message: "DRY RUN — set confirm=true to apply",
+                        note: "Confirming creates a new creative and repoints this ad at it. The ad ID, ad set, targeting and delivery history are unchanged. The old creative is left in place, unattached.",
+                    };
+                } else {
+                    const created = await metaPost(`${metaActId(accountId)}/adcreatives`, creative);
+                    if (!created.id) throw new Error("Meta did not return a creative ID; reconcile this ad before retrying.");
+                    result = { ...base, creative_id: created.id, live_ads_changed: false };
+                    try {
+                        await metaPost(args.ad_id, { creative: { creative_id: created.id } });
+                        result.live_ads_changed = true;
+                    } catch (e) {
+                        result.error = `Creative ${created.id} was created with the new tracking, but attaching it to the ad failed: ${e.message}. The ad still serves its original creative; attach the new creative or discard it before retrying.`;
+                        result.code = "ATTACH_FAILED";
+                    }
+                    if (result.live_ads_changed) {
+                        try {
+                            const readback = await metaGet(created.id, { fields: "id,url_tags" });
+                            result.verification = verifyRetag(readback, creative.url_tags, created.id);
+                        } catch (_) {
+                            result.verification = { verified: false, message: "Creative created and attached, but readback failed. Confirm the tracking on this creative_id before relying on it." };
+                        }
+                    }
+                }
+            }
+        }
+
     } else if (name === "preview_meta_ad") {
         const search = (args.account_name || "").toLowerCase();
         const acctMatch = Object.entries(META_ACCOUNTS).find(([, info]) => info.name.toLowerCase().includes(search));
@@ -11216,7 +11297,7 @@ async function dispatchToolCall(name, args = {}) {
             for (const [accountId, info] of targets) {
                 try {
                     const ads = await metaGetAll(`${metaActId(accountId)}/ads`, {
-                        fields: "id,name,status,effective_status,ad_review_feedback,campaign{name},adset{effective_status}",
+                        fields: "id,name,status,effective_status,ad_review_feedback,issues_info,campaign{name},adset{effective_status}",
                         filtering: JSON.stringify([{ field: "effective_status", operator: "IN", value: ["DISAPPROVED", "PENDING_REVIEW", "WITH_ISSUES"] }]),
                     });
                     const activeAds = ads.filter(a => a.adset?.effective_status === "ACTIVE");
@@ -11225,12 +11306,27 @@ async function dispatchToolCall(name, args = {}) {
                         accounts.push({
                             account: info.name,
                             issue_count: activeAds.length,
-                            ads: activeAds.map(a => ({
-                                id: a.id, name: a.name, status: a.status,
-                                effective_status: a.effective_status,
-                                campaign: a.campaign?.name,
-                                review_feedback: a.ad_review_feedback,
-                            })),
+                            ads: activeAds.map(a => {
+                                // issues_info carries the delivery error (code + summary);
+                                // ad_review_feedback carries policy rejections. They are
+                                // distinct, and an ad can be flagged with neither — report
+                                // absence explicitly so a silent field is not read as "fine".
+                                const issues = (a.issues_info || []).map(i => ({
+                                    level: i.level, error_code: i.error_code,
+                                    summary: i.error_summary, message: i.error_message,
+                                    type: i.error_type,
+                                }));
+                                return {
+                                    id: a.id, name: a.name, status: a.status,
+                                    effective_status: a.effective_status,
+                                    campaign: a.campaign?.name,
+                                    review_feedback: a.ad_review_feedback ?? null,
+                                    issues: issues.length ? issues : null,
+                                    ...(issues.length || a.ad_review_feedback ? {} : {
+                                        diagnosis: "Meta reported neither a delivery error nor policy feedback for this ad. That usually points at the ad set or campaign (conversion event, audience size, schedule or budget) rather than the ad itself.",
+                                    }),
+                                };
+                            }),
                         });
                     }
                 } catch (e) { errorCount++; accounts.push({ account: info.name, error: e.message }); }

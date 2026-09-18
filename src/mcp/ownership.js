@@ -16,6 +16,7 @@ const META_TOOLS = new Set([
   'delete_meta_subscription', 'create_meta_audience',
   'manage_meta_audience_users', 'manage_meta_ad_rules', 'update_meta_object',
   'manage_meta_leads', 'prepare_meta_image_enhancements', 'prepare_meta_placement_images',
+  'retag_meta_ad',
 ]);
 
 const GOOGLE_TOOLS = new Set([
@@ -287,6 +288,10 @@ function metaChecks(name, args) {
   const checks = [];
   if (name === 'prepare_meta_image_enhancements' || name === 'prepare_meta_placement_images') {
     addMetaCheck(checks, args.creative_id, 'adcreatives', 'Creative ID');
+  } else if (name === 'retag_meta_ad') {
+    // The source creative is read from the ad itself, so the ad is the only
+    // caller-supplied identifier that can point outside the selected account.
+    addMetaCheck(checks, args.ad_id, 'ads', 'Ad ID');
   } else if (name === 'update_meta_object') {
     addMetaCheck(checks, args.object_id, { campaign: 'campaigns', adset: 'adsets', ad: 'ads' }[args.level], `${args.level || 'Meta object'} ID`);
     // The server passes updates through to Meta.  The documented reusable ad
