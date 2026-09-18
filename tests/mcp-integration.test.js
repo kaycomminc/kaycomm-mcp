@@ -61,6 +61,9 @@ global.fetch = async (input, options = {}) => {
     const id = url.pathname.split('/').filter(Boolean).at(-1);
     if (id === 'adcreatives') return response({data:[]});
     if (id === '901' || id === '902') return response({ id, account_id: 'act_a', name: 'Fixture image', object_story_spec: { page_id: '1', link_data: { image_hash: 'fixture', link: 'https://example.com', message: 'Original' } }, degrees_of_freedom_spec: { creative_features_spec: { image_uncrop: { enroll_status: id === '902' ? 'OPT_IN' : 'OPT_OUT' } } } });
+    // Ads for retag_meta_ad: one with a clean destination, one already carrying inline UTMs.
+    if (id === 'synthetic_ad' || id === 'synthetic_ad_inline') return response({ id, account_id: 'act_a', name: 'Fixture ad', status: 'ACTIVE', effective_status: 'ACTIVE', creative: { id: id === 'synthetic_ad_inline' ? '903' : '901' } });
+    if (id === '903') return response({ id, account_id: 'act_a', name: 'Inline tagged', asset_feed_spec: { link_urls: [{ website_url: 'https://example.com/r/?utm_source=facebook&utm_medium=paidsocial' }] } });
     const accountId = id === 'synthetic_other' ? 'act_b' : 'act_a';
     return response({ id, account_id: accountId });
   }
@@ -153,9 +156,9 @@ async function flushHttp() {
   await new Promise(resolve => setImmediate(resolve));
 }
 
-test('registered catalog contains 80 tools with annotations and output schemas', async () => {
+test('registered catalog contains 81 tools with annotations and output schemas', async () => {
   const listed = await listHandler({ method: 'tools/list', params: {} }, {});
-  assert.equal(listed.tools.length, 80);
+  assert.equal(listed.tools.length, 81);
   for (const tool of listed.tools) {
     assert.ok(tool.annotations, `${tool.name} is missing annotations`);
     assert.equal(typeof tool.annotations.readOnlyHint, 'boolean');
@@ -366,4 +369,60 @@ test('creative listing supports reconciliation without requiring an ad attachmen
   const result = await invoke('manage_meta', { account_name:'Audit Client A', action:'list_creatives', target:'placement sizes' });
   assert.equal(result.value.error, undefined);
   assert.deepEqual(result.value.creatives, []);
+});
+
+const RETAG_TAGS = 'utm_source=Facebook&utm_medium=PPC&utm_campaign={{campaign.name}}&utm_content={{placement}}';
+
+test('retag dry run plans the new tracking without writing to the provider', async () => {
+  resetFetches();
+  const { value } = await invoke('retag_meta_ad', {
+    account_name: 'Audit Client A', ad_id: 'synthetic_ad', url_tags: RETAG_TAGS,
+  });
+  assert.equal(value.dry_run, true);
+  assert.equal(value.live_ads_changed, false);
+  assert.equal(value.creative.url_tags, RETAG_TAGS);
+  assert.equal(value.new_url_tags, RETAG_TAGS);
+  assert.equal(value.source_creative_id, '901');
+  // The planned creative carries the source content forward, minus its identity.
+  assert.equal(value.creative.object_story_spec.link_data.message, 'Original');
+  assert.equal(value.creative.id, undefined);
+  assert.equal(fetches.filter(f => f.method === 'POST').length, 0, 'dry run must not POST');
+});
+
+test('retag refuses to double-tag a URL that already carries the same parameters', async () => {
+  resetFetches();
+  const { value } = await invoke('retag_meta_ad', {
+    account_name: 'Audit Client A', ad_id: 'synthetic_ad_inline', url_tags: RETAG_TAGS, confirm: true,
+  });
+  assert.equal(value.code, 'DUPLICATE_URL_PARAMS');
+  assert.equal(value.live_ads_changed, false);
+  assert.deepEqual(value.duplicate_param_warning[0].duplicate_params.sort(), ['utm_medium', 'utm_source']);
+  assert.equal(fetches.filter(f => f.method === 'POST').length, 0, 'a blocked retag must not POST');
+});
+
+test('confirmed retag creates a tagged creative and repoints the ad at it', async () => {
+  resetFetches();
+  const { value } = await invoke('retag_meta_ad', {
+    account_name: 'Audit Client A', ad_id: 'synthetic_ad', url_tags: RETAG_TAGS, confirm: true,
+  });
+  assert.equal(value.creative_id, '902');
+  assert.equal(value.live_ads_changed, true);
+
+  const posts = fetches.filter(f => f.method === 'POST');
+  const create = posts.find(f => f.path.endsWith('/adcreatives'));
+  assert.ok(create, 'expected a creative to be created');
+  assert.equal(create.body.url_tags, RETAG_TAGS);
+
+  const attach = posts.find(f => f.path.endsWith('/synthetic_ad'));
+  assert.ok(attach, 'expected the ad to be repointed');
+  assert.deepEqual(attach.body.creative, { creative_id: '902' });
+});
+
+test('retag rejects an ad outside the selected account before any write', async () => {
+  resetFetches();
+  const { value } = await invoke('retag_meta_ad', {
+    account_name: 'Audit Client A', ad_id: 'synthetic_other', url_tags: RETAG_TAGS, confirm: true,
+  });
+  assert.equal(value._meta.errors[0].code, 'TARGET_ACCOUNT_MISMATCH');
+  assert.equal(fetches.filter(f => f.method === 'POST').length, 0);
 });

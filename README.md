@@ -332,3 +332,49 @@ filter finds unattached creatives for reconciliation. The retired
 `standard_enhancements` bundle is omitted when Meta returns individual feature
 settings alongside it; those individual settings are retained. Bundle-only
 legacy creatives require explicit migration.
+
+### Set or replace UTM tracking on a live Meta ad
+
+`retag_meta_ad` sets the `url_tags` (UTM) tracking on an ad that is already
+running. Meta freezes `url_tags` once a creative is attached to an ad — POSTing
+to the creative returns *"Please specify name, status or associated adlabels for
+updating the creative"* (code 100, subcode 1815573). The tool therefore rebuilds
+the creative with the new tracking and repoints the ad at the copy, which is
+what Ads Manager does silently behind its URL parameters field. The ad ID, ad
+set, targeting, budget and delivery history are unchanged, so learning is not
+reset. Example dry-run arguments:
+
+```json
+{
+  "account_name": "Summit Express",
+  "ad_id": "AD_ID",
+  "url_tags": "utm_source=Facebook&utm_medium=PPC&utm_campaign={{campaign.name}}&utm_content={{placement}}"
+}
+```
+
+`url_tags` is validated before any provider call: it must be `key=value` pairs
+joined by `&`, with no leading `?`, no whitespace and no repeated keys. Meta
+macros such as `{{campaign.name}}` and `{{placement}}` pass through.
+
+Meta **appends** `url_tags` to the destination rather than merging, so a
+parameter baked into the creative's URL and also present in `url_tags` ships
+twice in one click URL. The tool inspects every destination it can carry — link,
+CTA, carousel child attachments and `asset_feed_spec.link_urls` — and fails with
+`DUPLICATE_URL_PARAMS`, naming each colliding parameter and where it lives,
+rather than producing a double-tagged URL. Pass `allow_duplicate_params: true`
+only when that is genuinely intended; the better fix is removing the inline
+parameters from the creative.
+
+Ads promoting an existing Page post are refused: rebuilding would create a new
+post and drop the original's likes, comments and shares. Catalog and dynamic
+product creatives are refused for the same fail-closed reason. Ad label and
+asset-customization label IDs are stripped so the copy matches labels by name,
+read-only `asset_feed_spec` keys are dropped, and the retired
+`standard_enhancements` bundle is handled as elsewhere.
+
+`confirm=true` creates the creative and attaches it. If creation succeeds but
+attachment fails, the result carries `ATTACH_FAILED` with the orphaned
+`creative_id`; the ad keeps serving its original creative, so reconcile rather
+than blindly retrying. On success, `verification` re-reads the creative and
+compares the stored tracking. The previous creative is left in place, unattached,
+for rollback via `update_meta_object`.
