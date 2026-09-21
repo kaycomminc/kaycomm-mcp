@@ -132,29 +132,12 @@
         "impression_share_floor": 60
       }
     },
-    "6754409854": {
-      "name": "Axis Office",
-      "budget": 10000,
-      "mcc": "7631184147",
-      "health": false,
-      "inactive": "CUSTOMER_NOT_ENABLED — account disabled in Google Ads"
-    },
     "7539940999": {
       "name": "Digital Practice Growth",
       "budget": 1250,
       "refresh_token_env": "GOOGLE_REFRESH_TOKEN_2",
       "health": false,
       "mcc": "7539940999"
-    },
-    "4344985288": {
-      "name": "Florida State Guard",
-      "budget": 11500,
-      "flight_start": "2026-08-18",
-      "flight_end": "2027-01-01",
-      "mcc": "8621281595",
-      "health": {
-        "conversion_type": "lead"
-      }
     },
     "7681141633": {
       "name": "PHQ",
@@ -188,31 +171,12 @@
       "flight_end": "2026-09-30",
       "page_id": "626075927259136"
     },
-    "act_2983430398459267": {
-      "name": "Florida State Guard",
-      "budget": 19720,
-      "page_id": "112608548505996",
-      "flight_start": "2026-08-18",
-      "flight_end": "2027-01-01",
-      "health": {
-        "frequency_cap": 3
-      }
-    },
     "act_547352620606461": {
       "name": "PHQ",
       "budget": 510,
       "page_id": "513620928749165"
     }
   },
-  "linkedin": {
-    "513144628": {
-      "name": "Florida State Guard",
-      "budget": 2750,
-      "flight_start": "2026-08-18",
-      "flight_end": "2027-01-01",
-      "health": {
-        "conversion_type": "lead"
-      }
-    }
-  }
+  "stackadapt": {},
+  "linkedin": {}
 }
