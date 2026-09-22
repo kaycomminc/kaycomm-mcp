@@ -66,3 +66,34 @@ test("resolveAccount: case insensitive matching", () => {
     assert.ok(match);
     assert.equal(match[0], "id1");
 });
+
+const { buildAccountContext, addDays } = require("../server.js");
+
+test("addDays: crosses month boundary", () => {
+    assert.equal(addDays("2026-09-22", 30), "2026-10-22");
+    assert.equal(addDays("2026-01-31", 1), "2026-02-01");
+});
+
+test("buildAccountContext: groups by name and splits live vs expired notes", () => {
+    const stores = {
+        google: {
+            "111": { name: "Soap Co", budget: 3000, budget_schedule: [{ from: "2026-09-01", budget: 5500 }],
+                notes: [
+                    { text: "Meta budget redirected to Google", added: "2026-09-01", expires: "2026-10-01" },
+                    { text: "Old permission issue", added: "2026-07-01", expires: "2026-08-01" },
+                ] },
+            "222": { name: "Gone Co", budget: 100, inactive: "CUSTOMER_NOT_ENABLED", health: false },
+        },
+        meta: { act_1: { name: "Soap Co", budget: 0 } },
+    };
+    const ctx = buildAccountContext(stores, "2026-09-22");
+    const soap = ctx.accounts.find(a => a.name === "Soap Co");
+    assert.equal(soap.platforms.length, 2);
+    assert.equal(soap.platforms[0].budget, 5500);
+    assert.deepEqual(soap.notes.map(n => n.text), ["Meta budget redirected to Google"]);
+    assert.deepEqual(soap.expired_notes.map(n => n.text), ["Old permission issue"]);
+    const gone = ctx.accounts.find(a => a.name === "Gone Co");
+    assert.equal(gone.platforms[0].inactive, "CUSTOMER_NOT_ENABLED");
+    assert.equal(gone.platforms[0].health_check, "excluded");
+    assert.equal(gone.notes, undefined);
+});

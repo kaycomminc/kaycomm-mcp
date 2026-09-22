@@ -46,7 +46,14 @@
       "mcc": "7631184147",
       "health": {
         "conversion_type": "sale"
-      }
+      },
+      "notes": [
+        {
+          "text": "Google API access fixed 2026-09-17 (MCC corrected to 7631184147), so permission errors are now real failures. $5,500 budget = $3K Google base + $2.5K redirected from Meta while the Meta account is disabled (per Liza Hammon, 2026-07-29); revert to $3K when Meta is restored.",
+          "added": "2026-09-22",
+          "expires": "2026-10-31"
+        }
+      ]
     },
     "3340507097": {
       "name": "FAMU Online",
@@ -162,7 +169,14 @@
       "budget": 0,
       "health": {
         "frequency_cap": 3
-      }
+      },
+      "notes": [
+        {
+          "text": "Meta reports conversions with $0.00 conversion value (known, not a new tracking break).",
+          "added": "2026-09-22",
+          "expires": "2026-12-31"
+        }
+      ]
     },
     "act_1172134603935325": {
       "name": "FAMU Online",

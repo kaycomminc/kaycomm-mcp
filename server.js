@@ -62,6 +62,9 @@ const API_VERSION_INFO = {
 //                budget_schedule? [{from, budget, nc_budget?}], flight_start?, flight_end?,
 //                health? (object of threshold overrides, or false to exclude from health checks)
 // Meta fields:   name, budget, budget_schedule?, flight_start?, flight_end?, health?
+// Both:          inactive? ("<reason>" skips API calls), notes? [{text, added, expires?}]
+//                — notes are the shared "known context" every routine reads via
+//                manage_accounts action=context, so status lives here, not in prompts.
 // Health thresholds default from top-level health_defaults; accounts without a
 // health key are checked with defaults, so new clients are monitored automatically.
 // Edit via the manage_accounts tool — changes persist to accounts.json.
@@ -94,7 +97,7 @@ const BUILTIN_HEALTH_DEFAULTS = {
 const KNOWN_ACCOUNT_KEYS = new Set([
     "name", "budget", "mcc", "nc_budget", "ga4", "health", "refresh_token_env",
     "flight_start", "flight_end", "budget_schedule",
-    "page_id", "instagram_account_id", "inactive",
+    "page_id", "instagram_account_id", "inactive", "notes",
 ]);
 
 // Per-account health overrides beyond BUILTIN_HEALTH_DEFAULTS that
@@ -129,6 +132,9 @@ function validateAccounts(data) {
                     }
                 }
             }
+            if (info.notes !== undefined && (!Array.isArray(info.notes) || info.notes.some(n => !n || typeof n.text !== "string"))) {
+                warn(id, `"notes" must be an array of {text, added, expires?}`);
+            }
             for (const key of Object.keys(info)) {
                 if (!KNOWN_ACCOUNT_KEYS.has(key)) {
                     warn(id, `unknown top-level key "${key}"`);
@@ -162,6 +168,49 @@ function saveAccounts() {
 function getHealthConfig(info) {
     if (info.health === false) return null;
     return { ...HEALTH_DEFAULTS, ...(info.health || {}) };
+}
+
+// Account notes default to a 30-day life so "known issue" context can't go
+// stale silently: once expired, action=context reports it as needing review.
+const NOTE_DEFAULT_TTL_DAYS = 30;
+
+function addDays(ymd, days) {
+    const [y, m, d] = ymd.split("-").map(Number);
+    return new Date(Date.UTC(y, m - 1, d + days)).toISOString().split("T")[0];
+}
+
+// Compact, name-grouped snapshot of accounts.json for scheduled routines:
+// what's tracked, current budgets, inactive flags, and live/expired notes.
+function buildAccountContext(stores, today) {
+    const byName = {};
+    for (const [platform, store] of Object.entries(stores)) {
+        for (const [id, info] of Object.entries(store || {})) {
+            const entry = byName[info.name] ||= { name: info.name, platforms: [], notes: [], expired_notes: [] };
+            const row = { platform, id };
+            if (info.budget != null) row.budget = getEffectiveBudget(info, today).budget;
+            if (info.flight_start) row.flight = `${info.flight_start} → ${info.flight_end || "?"}`;
+            if (info.inactive) row.inactive = typeof info.inactive === "string" ? info.inactive : true;
+            if (info.health === false) row.health_check = "excluded";
+            entry.platforms.push(row);
+            for (const n of info.notes || []) {
+                const note = { platform, ...n };
+                (n.expires && n.expires < today ? entry.expired_notes : entry.notes).push(note);
+            }
+        }
+    }
+    const accounts = Object.values(byName).map(a => {
+        if (!a.notes.length) delete a.notes;
+        if (!a.expired_notes.length) delete a.expired_notes;
+        return a;
+    });
+    return {
+        as_of: today,
+        build_sha: process.env.RAILWAY_GIT_COMMIT_SHA || process.env.BUILD_SHA || "local",
+        how_to_use: "Ground truth for account status. Only accounts listed here are tracked. Treat notes as known context " +
+            "(don't re-report them as new). An account without an inactive flag or note is expected to be working — " +
+            "report its errors as real. expired_notes need Jason to confirm or clear them; mention them once, briefly.",
+        accounts,
+    };
 }
 
 loadAccounts();
@@ -5457,7 +5506,7 @@ function makeServer() {
             inputSchema: {
                 type: "object",
                 properties: {
-                    action:   { type: "string", enum: ["list", "add", "update", "remove"], description: "What to do (default: list)" },
+                    action:   { type: "string", enum: ["list", "context", "add", "update", "remove"], description: "What to do (default: list). context = compact name-grouped snapshot (budgets, inactive flags, notes) that scheduled routines read first." },
                     platform: { type: "string", enum: ["google", "meta", "stackadapt", "linkedin"], description: "Which platform the account belongs to. Required for add/update/remove." },
                     id:       { type: "string", description: "Account ID — Google customer ID (10 digits), Meta act_XXX, or StackAdapt advertiser ID. Required for add/update/remove." },
                     name:     { type: "string", description: "Client display name (required for add)" },
@@ -5476,6 +5525,10 @@ function makeServer() {
                         description: "Health-check threshold overrides for run_health_check, e.g. {cpa_target: 75, conversion_dry_spell_hours: 48, impression_share_floor: 50, frequency_cap: 3.0, pacing_tolerance_pct: 10}. " +
                             "Pass false to exclude the account from health checks entirely. Omit to monitor with health_defaults.",
                     },
+                    inactive: { description: "Mark the account inactive with a reason string (API calls skipped, shown as skipped in pacing). Pass false to clear it." },
+                    add_note: { type: "string", description: "Append a known-context note all routines will see (e.g. 'Meta disabled; $2.5K redirected to Google until restored')." },
+                    note_expires: { type: "string", description: "YYYY-MM-DD the add_note should be re-reviewed (default: 30 days out)." },
+                    clear_notes: { type: "boolean", description: "Remove all notes on this account (applied before add_note)." },
                     confirm: { type: "boolean", description: "Set true to write accounts.json. Omit for dry run." },
                 },
                 required: [],
@@ -8405,6 +8458,8 @@ async function dispatchToolCall(name, args = {}) {
                 stackadapt: Object.entries(STACKADAPT_ADVERTISERS).map(([id, a]) => ({ id, ...a })),
                 linkedin:   Object.entries(LINKEDIN_ACCOUNTS).map(([id, a]) => ({ id, ...a })),
             };
+        } else if (action === "context") {
+            result = buildAccountContext(stores, getDateInfo().today);
         } else if (!platform || !stores[platform]) {
             result = { error: "platform (google | meta | stackadapt | linkedin) is required for add/update/remove." };
         } else if (!args.id) {
@@ -8441,12 +8496,20 @@ async function dispatchToolCall(name, args = {}) {
                     for (const f of ["name", "budget", "mcc", "ga4", "nc_budget", "flight_start", "flight_end", "budget_schedule", "health", "page_id"]) {
                         if (args[f] != null) changes[f] = args[f];
                     }
+                    if (args.inactive != null) changes.inactive = args.inactive || null;
+                    if (args.clear_notes || args.add_note) {
+                        const today = getDateInfo().today;
+                        const notes = args.clear_notes ? [] : [...(store[id].notes || [])];
+                        if (args.add_note) notes.push({ text: args.add_note, added: today, expires: args.note_expires || addDays(today, NOTE_DEFAULT_TTL_DAYS) });
+                        changes.notes = notes.length ? notes : null;
+                    }
                     if (!Object.keys(changes).length) {
-                        result = { error: "No fields to update. Provide name, budget, mcc, ga4, nc_budget, flight_start, flight_end, budget_schedule, health, or page_id." };
+                        result = { error: "No fields to update. Provide name, budget, mcc, ga4, nc_budget, flight_start, flight_end, budget_schedule, health, page_id, inactive, add_note, or clear_notes." };
                     } else if (!confirm) {
                         result = { dry_run: true, message: "DRY RUN — set confirm=true to save", platform, id, current: store[id], changes };
                     } else {
                         Object.assign(store[id], changes);
+                        for (const [k, v] of Object.entries(changes)) if (v === null) delete store[id][k];
                         saveAccounts();
                         result = { success: true, platform, id, account: store[id], note: "Saved to accounts.json. Commit + push to git so Railway picks it up." };
                         if (process.env.PORT) result.ephemeral_warning = "⚠️ This server runs on Railway with an ephemeral filesystem — this change will be LOST on the next deploy. Make account changes from the Mac (local server) and commit accounts.json to git.";
@@ -11833,7 +11896,7 @@ module.exports = {
     // Exported for tests
     clampTopN, shapeAgg, emptyAgg, addAgg, mergeAgg, listingCaseValueLabel, SHOPPING_GROUP_DIMENSIONS,
     matchByName, skippedRow, partitionSkipped, reportingPeriod, selectDetailAccounts, fetchMetaDailyBudgets,
-    resolveAccount,
+    resolveAccount, buildAccountContext, addDays,
 };
 
 if (require.main === module && !process.env.MCP_TEST) main().catch(console.error);

@@ -40,23 +40,22 @@ function buildAccountsFromConfig() {
         },
     };
 
-    const EXCLUDE = new Set(['Warrior Advocates', 'Axis Office']);
-
     // Collect all unique account names and their platforms
     const accountsByName = {};
     for (const [platform, accounts] of Object.entries(accountsData).filter(([k]) => k === 'google' || k === 'meta')) {
         for (const [, info] of Object.entries(accounts || {})) {
             if (!accountsByName[info.name]) {
-                accountsByName[info.name] = { platforms: new Set(), flight_start: info.flight_start, flight_end: info.flight_end };
+                accountsByName[info.name] = { platforms: new Set(), flight_start: info.flight_start, flight_end: info.flight_end, inactive: true };
             }
+            if (!info.inactive) accountsByName[info.name].inactive = false;
             accountsByName[info.name].platforms.add(platform);
         }
     }
 
-    // Build account entries, excluding those that are in EXCLUDE or past flight_end
+    // Build account entries, excluding inactive accounts (inactive on every platform) and expired flights
     const accounts = [];
     for (const [name, data] of Object.entries(accountsByName)) {
-        if (EXCLUDE.has(name)) continue;
+        if (data.inactive) continue;
         if (data.flight_end && data.flight_end < today) continue;  // Exclude expired flights
 
         const entry = {
