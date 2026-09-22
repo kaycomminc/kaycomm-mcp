@@ -163,6 +163,19 @@
       "health": {
         "conversion_type": "lead"
       }
+    },
+    "6754409854": {
+      "name": "Axis Office",
+      "budget": 10000,
+      "mcc": "7631184147",
+      "inactive": "Not launched yet: starts 2026-10-01 (Google account currently disabled, CUSTOMER_NOT_ENABLED)",
+      "notes": [
+        {
+          "text": "Launching 2026-10-01. On/after 10/1: clear the inactive flag, confirm the $10,000 monthly budget, and expect the account to be re-enabled. Mgmt fee $1,500/mo billed via V9 from October.",
+          "added": "2026-09-22",
+          "expires": "2026-10-02"
+        }
+      ]
     }
   },
   "meta": {

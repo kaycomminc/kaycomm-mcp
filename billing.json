@@ -1,0 +1,238 @@
+{
+  "settings": {
+    "company": "Kay Communications, LLC",
+    "default_payment_terms": "Net 15",
+    "default_invoice_day": 1,
+    "source": "kaycomm-mcp/billing.json is the source of truth; this page embeds a copy.",
+    "setup_fee_format": "Optional per client: setup_fee {amount, month: YYYY-MM, description?}. Pre-fills the Setup column in that month; can also be typed in for any client on the page."
+  },
+  "clients": {
+    "blvd_carroll": {
+      "customer": "Volume Nine",
+      "billing_type": "recurring",
+      "active": true,
+      "line_items": [
+        {
+          "product_service": "Google Ads",
+          "description": "BLVD Carroll",
+          "rate": 600
+        }
+      ]
+    },
+    "alderwood": {
+      "customer": "Volume Nine",
+      "billing_type": "recurring",
+      "active": true,
+      "line_items": [
+        {
+          "product_service": "Google Ads",
+          "description": "Alderwood Pyschological Management",
+          "rate": 400
+        }
+      ]
+    },
+    "ctc": {
+      "customer": "Volume Nine",
+      "billing_type": "recurring",
+      "active": true,
+      "line_items": [
+        {
+          "product_service": "Google Ads",
+          "description": "CTC Paid Search Management",
+          "rate": 400
+        }
+      ]
+    },
+    "enzoic": {
+      "customer": "Volume Nine",
+      "billing_type": "recurring",
+      "active": true,
+      "line_items": [
+        {
+          "product_service": "Enzoic Google Ads",
+          "description": "Enzoic Google Ads",
+          "rate": 800
+        }
+      ]
+    },
+    "nationwide_sw": {
+      "customer": "Volume Nine",
+      "billing_type": "recurring",
+      "active": true,
+      "line_items": [
+        {
+          "product_service": "Google Ads & Meta Management",
+          "description": "Nationwide Southwest",
+          "rate": 650
+        }
+      ]
+    },
+    "otb": {
+      "customer": "Volume Nine",
+      "billing_type": "recurring",
+      "active": true,
+      "line_items": [
+        {
+          "product_service": "OTB",
+          "description": "OTB",
+          "rate": 150
+        }
+      ]
+    },
+    "summit_express": {
+      "customer": "Volume Nine",
+      "billing_type": "recurring",
+      "active": true,
+      "line_items": [
+        {
+          "product_service": "Google Ads & Meta Management",
+          "description": "Summit Express Management",
+          "rate": 2000
+        }
+      ]
+    },
+    "woca": {
+      "customer": "Volume Nine",
+      "billing_type": "recurring",
+      "active": true,
+      "line_items": [
+        {
+          "product_service": "WOCA Woodcare",
+          "description": "WOCA Woodcare",
+          "rate": 400
+        }
+      ]
+    },
+    "la_loma": {
+      "customer": "Volume Nine",
+      "billing_type": "recurring",
+      "active": true,
+      "line_items": [
+        {
+          "product_service": "Google Ads",
+          "description": "La Loma",
+          "rate": 600
+        }
+      ]
+    },
+    "charlies_soap": {
+      "customer": "Volume Nine",
+      "billing_type": "recurring",
+      "active": true,
+      "line_items": [
+        {
+          "product_service": "Google Ads",
+          "description": "Charlie's Soap",
+          "rate": 1000
+        }
+      ]
+    },
+    "v9_ads": {
+      "customer": "Volume Nine",
+      "billing_type": "recurring",
+      "active": true,
+      "line_items": [
+        {
+          "product_service": "Google Ads + ChatGPT Ads",
+          "description": "V9 Ads",
+          "rate": 350
+        }
+      ]
+    },
+    "axis_office": {
+      "customer": "Volume Nine",
+      "billing_type": "recurring",
+      "active": true,
+      "line_items": [
+        {
+          "product_service": "Google Ads",
+          "description": "Axis Office",
+          "rate": 1500
+        }
+      ],
+      "notes": "Starts 2026-10-01 (WorkSuite: AO Monthly Ads Management - Recurring, $1,500). One-time $500 setup was July 2026.",
+      "start_date": "2026-10-01",
+      "setup_fee": {
+        "amount": 500,
+        "month": "2026-07",
+        "description": "AO: One-Time Setup - July 2026"
+      }
+    },
+    "emri": {
+      "customer": "Volume Nine",
+      "billing_type": "recurring",
+      "active": true,
+      "line_items": [
+        {
+          "product_service": "Google Ads",
+          "description": "EMRI",
+          "rate": 900
+        }
+      ]
+    },
+    "eye_associates": {
+      "customer": "G Williams",
+      "billing_type": "recurring",
+      "active": true,
+      "line_items": [
+        {
+          "product_service": "Google Ads",
+          "description": "Eye Associates of NF",
+          "rate": 500
+        }
+      ]
+    },
+    "gulf_coast": {
+      "customer": "G Williams",
+      "billing_type": "recurring",
+      "active": false,
+      "line_items": [
+        {
+          "product_service": "Facebook Ads",
+          "description": "Gulf Coast Land Sales",
+          "rate": 4000
+        }
+      ],
+      "notes": "Inactive: engagement ended 2026-09-15."
+    },
+    "florida_state_guard": {
+      "customer": "Adele Creative",
+      "billing_type": "flighted",
+      "active": false,
+      "flight_start": "2026-08-18",
+      "flight_end": "2026-11-26",
+      "line_items": [
+        {
+          "product_service": "Google Ads",
+          "description": "Florida State Guard",
+          "rate": 6786
+        },
+        {
+          "product_service": "Facebook Ads",
+          "description": "Florida State Guard",
+          "rate": 11607
+        },
+        {
+          "product_service": "LinkedIn Ads",
+          "description": "Florida State Guard",
+          "rate": 1607
+        }
+      ],
+      "notes": "Inactive since 2026-09-21: removed from tracking."
+    },
+    "phq_ads": {
+      "customer": "Adele Creative",
+      "billing_type": "flighted",
+      "active": true,
+      "flight_start": "2026-09-01",
+      "flight_end": "2027-05-01",
+      "line_items": [
+        {
+          "product_service": "Google Ads + Meta",
+          "description": "PHQ Ads",
+          "rate": 2550
+        }
+      ]
+    }
+  }
+}
