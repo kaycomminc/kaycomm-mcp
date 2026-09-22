@@ -4,7 +4,8 @@
     "default_payment_terms": "Net 15",
     "default_invoice_day": 1,
     "source": "kaycomm-mcp/billing.json is the source of truth; this page embeds a copy.",
-    "setup_fee_format": "Optional per client: setup_fee {amount, month: YYYY-MM, description?}. Pre-fills the Setup column in that month; can also be typed in for any client on the page."
+    "setup_fee_format": "Optional per client: setup_fee {amount, month: YYYY-MM, description?}. Pre-fills the Setup column in that month; can also be typed in for any client on the page.",
+    "bill_in_arrears_format": "Optional per client: bill_in_arrears true labels each invoice line with the previous month (service month), e.g. a November invoice reads \"October\"."
   },
   "clients": {
     "blvd_carroll": {
@@ -150,12 +151,12 @@
           "rate": 1500
         }
       ],
-      "notes": "Starts 2026-10-01 (WorkSuite: AO Monthly Ads Management - Recurring, $1,500). One-time $500 setup was July 2026.",
+      "notes": "Starts 2026-10-01 (WorkSuite: AO Monthly Ads Management - Recurring, $1,500). One-time $500 setup not yet charged: billed on the October 2026 invoice.",
       "start_date": "2026-10-01",
       "setup_fee": {
         "amount": 500,
-        "month": "2026-07",
-        "description": "AO: One-Time Setup - July 2026"
+        "month": "2026-10",
+        "description": "AO: One-Time Setup"
       }
     },
     "emri": {
@@ -168,7 +169,10 @@
           "description": "EMRI",
           "rate": 900
         }
-      ]
+      ],
+      "start_date": "2026-11-01",
+      "bill_in_arrears": true,
+      "notes": "Expected launch 2026-10-01. Billed in arrears: the November invoice covers October service."
     },
     "eye_associates": {
       "customer": "G Williams",
