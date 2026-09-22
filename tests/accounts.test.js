@@ -97,3 +97,13 @@ test("buildAccountContext: groups by name and splits live vs expired notes", () 
     assert.equal(gone.platforms[0].health_check, "excluded");
     assert.equal(gone.notes, undefined);
 });
+
+test("buildAccountContext: splits active vs expired routine_rules", () => {
+    const rules = [
+        { id: "r1", text: "Ignore paused ads", applies_to: ["all"], added: "2026-09-22" },
+        { id: "r2", text: "Old rule", applies_to: ["all"], added: "2026-08-01", expires: "2026-09-01" },
+    ];
+    const ctx = buildAccountContext({ google: {} }, "2026-09-22", rules);
+    assert.deepEqual(ctx.routine_rules.map(r => r.id), ["r1"]);
+    assert.deepEqual(ctx.expired_rules.map(r => r.id), ["r2"]);
+});

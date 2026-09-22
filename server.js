@@ -76,6 +76,9 @@ let META_ACCOUNTS = {};
 let STACKADAPT_ADVERTISERS = {};
 let LINKEDIN_ACCOUNTS = {};
 let HEALTH_DEFAULTS = {};
+// Top-level routine_rules: [{id, text, applies_to?, added, expires?}] — standing
+// instructions every scheduled routine receives via manage_accounts action=context.
+let ROUTINE_RULES = [];
 
 const BUILTIN_HEALTH_DEFAULTS = {
     pacing_tolerance_pct: 5,
@@ -111,6 +114,10 @@ const KNOWN_HEALTH_EXTRA_KEYS = new Set([
 // and the entry id so they're greppable in Railway logs.
 function validateAccounts(data) {
     const warn = (id, msg) => console.error(`accounts.json: ${id}: ${msg}`);
+
+    if (data.routine_rules !== undefined && (!Array.isArray(data.routine_rules) || data.routine_rules.some(r => !r || typeof r.text !== "string" || !r.id))) {
+        warn("routine_rules", "must be an array of {id, text, applies_to?, added, expires?}");
+    }
 
     for (const platform of ["google", "meta"]) {
         for (const [id, info] of Object.entries(data[platform] || {})) {
@@ -155,11 +162,12 @@ function loadAccounts() {
     STACKADAPT_ADVERTISERS = data.stackadapt || {};
     LINKEDIN_ACCOUNTS      = data.linkedin  || {};
     HEALTH_DEFAULTS        = { ...BUILTIN_HEALTH_DEFAULTS, ...(data.health_defaults || {}) };
+    ROUTINE_RULES          = Array.isArray(data.routine_rules) ? data.routine_rules : [];
 }
 
 function saveAccounts() {
     requestContext.getStore()?.controller.signal.throwIfAborted();
-    const data = { health_defaults: HEALTH_DEFAULTS, google: GOOGLE_ACCOUNTS, meta: META_ACCOUNTS, stackadapt: STACKADAPT_ADVERTISERS, linkedin: LINKEDIN_ACCOUNTS };
+    const data = { health_defaults: HEALTH_DEFAULTS, routine_rules: ROUTINE_RULES, google: GOOGLE_ACCOUNTS, meta: META_ACCOUNTS, stackadapt: STACKADAPT_ADVERTISERS, linkedin: LINKEDIN_ACCOUNTS };
     fs.writeFileSync(ACCOUNTS_FILE, JSON.stringify(data, null, 2) + "\n");
 }
 
@@ -181,7 +189,7 @@ function addDays(ymd, days) {
 
 // Compact, name-grouped snapshot of accounts.json for scheduled routines:
 // what's tracked, current budgets, inactive flags, and live/expired notes.
-function buildAccountContext(stores, today) {
+function buildAccountContext(stores, today, rules = []) {
     const byName = {};
     for (const [platform, store] of Object.entries(stores)) {
         for (const [id, info] of Object.entries(store || {})) {
@@ -208,7 +216,11 @@ function buildAccountContext(stores, today) {
         build_sha: process.env.RAILWAY_GIT_COMMIT_SHA || process.env.BUILD_SHA || "local",
         how_to_use: "Ground truth for account status. Only accounts listed here are tracked. Treat notes as known context " +
             "(don't re-report them as new). An account without an inactive flag or note is expected to be working — " +
-            "report its errors as real. expired_notes need Jason to confirm or clear them; mention them once, briefly.",
+            "report its errors as real. expired_notes need Jason to confirm or clear them; mention them once, briefly. " +
+            "routine_rules are Jason's standing instructions: follow every rule whose applies_to is \"all\" or names your routine, " +
+            "and let them override conflicting defaults in your own prompt. expired_rules: mention once as needing review, don't follow.",
+        routine_rules: rules.filter(r => !(r.expires && r.expires < today)),
+        expired_rules: rules.filter(r => r.expires && r.expires < today),
         accounts,
     };
 }
@@ -5506,7 +5518,7 @@ function makeServer() {
             inputSchema: {
                 type: "object",
                 properties: {
-                    action:   { type: "string", enum: ["list", "context", "add", "update", "remove"], description: "What to do (default: list). context = compact name-grouped snapshot (budgets, inactive flags, notes) that scheduled routines read first." },
+                    action:   { type: "string", enum: ["list", "context", "add", "update", "remove", "add_rule", "remove_rule"], description: "What to do (default: list). context = compact snapshot (budgets, inactive flags, notes, routine_rules) that scheduled routines read first. add_rule/remove_rule manage standing instructions for all routines." },
                     platform: { type: "string", enum: ["google", "meta", "stackadapt", "linkedin"], description: "Which platform the account belongs to. Required for add/update/remove." },
                     id:       { type: "string", description: "Account ID — Google customer ID (10 digits), Meta act_XXX, or StackAdapt advertiser ID. Required for add/update/remove." },
                     name:     { type: "string", description: "Client display name (required for add)" },
@@ -5529,6 +5541,10 @@ function makeServer() {
                     add_note: { type: "string", description: "Append a known-context note all routines will see (e.g. 'Meta disabled; $2.5K redirected to Google until restored')." },
                     note_expires: { type: "string", description: "YYYY-MM-DD the add_note should be re-reviewed (default: 30 days out)." },
                     clear_notes: { type: "boolean", description: "Remove all notes on this account (applied before add_note)." },
+                    rule: { type: "string", description: "add_rule: standing instruction text every routine will follow (e.g. 'Ignore problems on PAUSED ads')." },
+                    applies_to: { type: "array", items: { type: "string" }, description: "add_rule: routine names the rule is for (daily-watchdog, weekday-watchdog, weekly-optimization, launch-watch, morning-brief, optimization-tracker, billing-review). Default [\"all\"]." },
+                    rule_expires: { type: "string", description: "add_rule: optional YYYY-MM-DD after which the rule stops applying." },
+                    rule_id: { type: "string", description: "remove_rule: id of the rule to remove (e.g. r2)." },
                     confirm: { type: "boolean", description: "Set true to write accounts.json. Omit for dry run." },
                 },
                 required: [],
@@ -8458,8 +8474,31 @@ async function dispatchToolCall(name, args = {}) {
                 stackadapt: Object.entries(STACKADAPT_ADVERTISERS).map(([id, a]) => ({ id, ...a })),
                 linkedin:   Object.entries(LINKEDIN_ACCOUNTS).map(([id, a]) => ({ id, ...a })),
             };
+        } else if (action === "add_rule" || action === "remove_rule") {
+            if (action === "add_rule" && !args.rule) {
+                result = { error: "rule (the instruction text) is required for add_rule." };
+            } else if (action === "remove_rule" && !ROUTINE_RULES.some(r => r.id === args.rule_id)) {
+                result = { error: `rule_id not found.`, rules: ROUTINE_RULES };
+            } else {
+                let change;
+                if (action === "add_rule") {
+                    const next = Math.max(0, ...ROUTINE_RULES.map(r => parseInt(String(r.id).replace(/\D/g, ""), 10) || 0)) + 1;
+                    change = { id: `r${next}`, text: args.rule, applies_to: args.applies_to?.length ? args.applies_to : ["all"], added: getDateInfo().today };
+                    if (args.rule_expires) change.expires = args.rule_expires;
+                } else {
+                    change = ROUTINE_RULES.find(r => r.id === args.rule_id);
+                }
+                if (!confirm) {
+                    result = { dry_run: true, message: "DRY RUN — set confirm=true to save", action, rule: change, current_rules: ROUTINE_RULES };
+                } else {
+                    ROUTINE_RULES = action === "add_rule" ? [...ROUTINE_RULES, change] : ROUTINE_RULES.filter(r => r.id !== args.rule_id);
+                    saveAccounts();
+                    result = { success: true, action, rule: change, rules: ROUTINE_RULES, note: "Saved to accounts.json. Commit + push to git so Railway picks it up." };
+                    if (process.env.PORT) result.ephemeral_warning = "⚠️ This server runs on Railway with an ephemeral filesystem — this change will be LOST on the next deploy. Make changes from the Mac (local server) and commit accounts.json to git.";
+                }
+            }
         } else if (action === "context") {
-            result = buildAccountContext(stores, getDateInfo().today);
+            result = buildAccountContext(stores, getDateInfo().today, ROUTINE_RULES);
         } else if (!platform || !stores[platform]) {
             result = { error: "platform (google | meta | stackadapt | linkedin) is required for add/update/remove." };
         } else if (!args.id) {
