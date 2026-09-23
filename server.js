@@ -10113,11 +10113,12 @@ async function dispatchToolCall(name, args = {}) {
 
         // Health thresholds live in accounts.json: per-account `health` overrides
         // merged over health_defaults. Every tracked account is checked unless it
-        // sets health: false — so new clients are monitored the day they're added.
+        // sets health: false or is marked inactive (skipped, like get_full_pacing)
+        // — so new clients are monitored the day they're added.
         const excludedSet = new Set();
         const pickAccounts = store => Object.entries(store).filter(([, info]) => {
             if (accountFilter && !info.name.toLowerCase().includes(accountFilter)) return false;
-            if (getHealthConfig(info) === null) { excludedSet.add(info.name); return false; }
+            if (getHealthConfig(info) === null || info.inactive) { excludedSet.add(info.name); return false; }
             return true;
         });
 
@@ -10207,13 +10208,14 @@ async function dispatchToolCall(name, args = {}) {
 
                     // ── Check 1: Pacing drift ── (flight accounts pace in get_full_pacing, not
                     // monthly; skipped on the 1st — no complete days to project from yet)
-                    if (monthlyBudget > 0 && !isFlight && pace_dom > 0) {
+                    // MTD spend comes from its own query (same as get_full_pacing): batchRows
+                    // only reaches back 8 days and excludes paused/removed campaigns.
+                    const { spend: mtdSpend, error: mtdErr } = (monthlyBudget > 0 && !isFlight && pace_dom > 0)
+                        ? await fetchGoogleMTD(token, cid, gAcct.mcc, month_start, yesterday)
+                        : { spend: null, error: null };
+                    if (mtdErr) errors.push(`${gAcct.name} (Google) pacing: ${mtdErr}`);
+                    if (monthlyBudget > 0 && !isFlight && pace_dom > 0 && mtdSpend != null) {
                         const effectiveBudget = monthlyBudget;
-                        // Sum MTD spend
-                        let mtdSpend = 0;
-                        for (const [dt, s] of Object.entries(dailySpend)) {
-                            if (dt >= month_start && dt <= yesterday) mtdSpend += s;
-                        }
                         const projected = pace_dom > 0 ? Math.round((mtdSpend / pace_dom) * dim * 100) / 100 : mtdSpend;
                         const deviationPct = effectiveBudget > 0 ? Math.round(((projected - effectiveBudget) / effectiveBudget) * 100 * 10) / 10 : 0;
                         const tolerance = hc.pacing_tolerance_pct;
