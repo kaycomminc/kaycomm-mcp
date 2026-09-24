@@ -530,7 +530,11 @@ function googleAdsError(data) {
         const path = (e.location?.fieldPathElements || [])
             .map(p => p.fieldName + (p.index != null ? `[${p.index}]` : ""))
             .join(".");
-        return `${code}: ${e.message}${path ? ` (at ${path})` : ""}`;
+        const pv = e.details?.policyViolationDetails;
+        const policy = pv
+            ? ` [policy: ${pv.externalPolicyName || pv.key?.policyName}; text: "${pv.key?.violatingText ?? ""}"; ${pv.isExemptible ? "exemptible" : "not exemptible"}]`
+            : "";
+        return `${code}: ${e.message}${policy}${path ? ` (at ${path})` : ""}`;
     }).join("; ");
 }
 
@@ -3003,30 +3007,41 @@ async function getGoogleAccountSpend(token, customerId, mccId) {
 
 // googleAdsError is defined near the top of the Google Ads API section
 
-function extractPolicyViolationKeys(data) {
-    // Pull PolicyViolationKey objects from a Google Ads error response for retry with exemptions
-    // err.details is an object (not array) with shape { policyViolationDetails: { key: {...} } }
-    const keys = [];
+// Group the policy violations in a failed mutate response by operation index.
+// Healthcare terms (LASIK, surgery, …) come back as exemptible violations: resending
+// each flagged operation with its own keys in exemptPolicyViolationKeys submits an
+// exception request instead of failing. `retryable` is true only when every error in
+// the response is an exemptible policy violation, so a retry can't mask other failures.
+function collectPolicyViolations(data) {
+    const byOp = new Map();
+    let otherErrors = 0;
+    let nonExemptible = 0;
     const details = data?.error?.details || [];
     for (const detail of Array.isArray(details) ? details : []) {
         for (const err of (detail.errors || [])) {
-            const pvKey = err.details?.policyViolationDetails?.key;
-            if (pvKey) keys.push(pvKey);
+            const pv    = err.details?.policyViolationDetails;
+            const index = err.location?.fieldPathElements?.[0]?.index;
+            if (!pv?.key || index == null) { otherErrors++; continue; }
+            if (!pv.isExemptible) nonExemptible++;
+            const op = byOp.get(Number(index)) || { keys: [], policies: [] };
+            op.keys.push(pv.key);
+            op.policies.push(pv.externalPolicyName || pv.key.policyName);
+            byOp.set(Number(index), op);
         }
     }
-    return keys;
+    return { byOp, retryable: byOp.size > 0 && otherErrors === 0 && nonExemptible === 0 };
 }
 
 async function addKeywordsToAdGroup(token, customerId, mccId, adGroupResourceName, keywords) {
     // Use service-level adGroupCriteria:mutate endpoint
     // Auto-retries with policy exemption keys for healthcare/restricted keyword categories
-    const makeOps = (exemptKeys = []) => keywords.map(kw => ({
+    const makeOps = (exemptByOp = new Map()) => keywords.map((kw, i) => ({
         create: {
             adGroup: adGroupResourceName,
             status:  "ENABLED",
             keyword: { text: kw.text, matchType: (kw.match_type || "EXACT").toUpperCase() },
         },
-        ...(exemptKeys.length ? { exemptPolicyViolationKeys: exemptKeys } : {}),
+        ...(exemptByOp.has(i) ? { exemptPolicyViolationKeys: exemptByOp.get(i).keys } : {}),
     }));
 
     const doRequest = async (ops) => {
@@ -3049,10 +3064,10 @@ async function addKeywordsToAdGroup(token, customerId, mccId, adGroupResourceNam
     // First attempt
     let { resp, data } = await doRequest(makeOps());
     if (!resp.ok) {
-        const policyKeys = extractPolicyViolationKeys(data);
-        if (policyKeys.length) {
-            // Retry with exemptions for already-approved policy violations
-            ({ resp, data } = await doRequest(makeOps(policyKeys)));
+        const { byOp, retryable } = collectPolicyViolations(data);
+        if (retryable) {
+            // Retry with each flagged keyword's own exemption keys
+            ({ resp, data } = await doRequest(makeOps(byOp)));
         }
         if (!resp.ok) throw new Error(googleAdsError(data));
     }
@@ -3771,7 +3786,9 @@ async function createGoogleCampaignFull(token, customerId, mccId, config) {
         },
     });
 
-    // Ops 2+: Ad Groups + Keywords
+    // Ops 2+: Ad Groups + Keywords. keywordOps maps op index → keyword so policy
+    // violations (reported by op index) can be exempted and reported by name.
+    const keywordOps = new Map();
     let adGroupCounter = -3;
     for (const ag of (config.ad_groups || [])) {
         const agTempName = `customers/${customerId}/adGroups/${adGroupCounter}`;
@@ -3787,6 +3804,7 @@ async function createGoogleCampaignFull(token, customerId, mccId, config) {
             },
         });
         for (const kw of (ag.keywords || [])) {
+            keywordOps.set(mutateOperations.length, { ad_group: ag.name, text: kw.text, match_type: (kw.match_type || "BROAD").toUpperCase() });
             mutateOperations.push({
                 adGroupCriterionOperation: {
                     create: {
@@ -3821,21 +3839,39 @@ async function createGoogleCampaignFull(token, customerId, mccId, config) {
         });
     }
 
-    const resp = await fetchFn(
-        `https://googleads.googleapis.com/${GOOGLE_API_VERSION}/customers/${customerId}/googleAds:mutate`,
-        {
-            method: "POST",
-            headers: {
-                "Authorization":     `Bearer ${token}`,
-                "developer-token":   GOOGLE_DEVELOPER_TOKEN,
-                "login-customer-id": mccId,
-                "Content-Type":      "application/json",
-            },
-            body: JSON.stringify({ mutateOperations }),
+    const doMutate = async (ops) => {
+        const resp = await fetchFn(
+            `https://googleads.googleapis.com/${GOOGLE_API_VERSION}/customers/${customerId}/googleAds:mutate`,
+            {
+                method: "POST",
+                headers: {
+                    "Authorization":     `Bearer ${token}`,
+                    "developer-token":   GOOGLE_DEVELOPER_TOKEN,
+                    "login-customer-id": mccId,
+                    "Content-Type":      "application/json",
+                },
+                body: JSON.stringify({ mutateOperations: ops, ...(config.validate_only ? { validateOnly: true } : {}) }),
+            }
+        );
+        return { resp, data: await resp.json() };
+    };
+
+    // The mutate is atomic, so a policy-flagged keyword fails the whole campaign.
+    // When every error is an exemptible policy violation on a keyword, retry once
+    // with exemption requests on just those keywords.
+    let { resp, data } = await doMutate(mutateOperations);
+    let exemptions = [];
+    if (!resp.ok) {
+        const { byOp, retryable } = collectPolicyViolations(data);
+        if (retryable && [...byOp.keys()].every(i => keywordOps.has(i))) {
+            exemptions = [...byOp].map(([i, v]) => ({ ...keywordOps.get(i), policies: [...new Set(v.policies)] }));
+            const exemptOps = mutateOperations.map((op, i) => byOp.has(i)
+                ? { adGroupCriterionOperation: { ...op.adGroupCriterionOperation, exemptPolicyViolationKeys: byOp.get(i).keys } }
+                : op);
+            ({ resp, data } = await doMutate(exemptOps));
         }
-    );
-    const data = await resp.json();
-    if (!resp.ok) throw new Error(googleAdsError(data));
+        if (!resp.ok) throw new Error(googleAdsError(data));
+    }
 
     const results = data.mutateOperationResponses || [];
     return {
@@ -3843,6 +3879,7 @@ async function createGoogleCampaignFull(token, customerId, mccId, config) {
         budget_resource:   results[0]?.campaignBudgetResult?.resourceName,
         total_ops:         mutateOperations.length,
         results_count:     results.length,
+        policy_exemptions_requested: exemptions,
     };
 }
 
@@ -5718,7 +5755,8 @@ function makeServer() {
             description: "Create a new Google Ads Search campaign with ad groups and keywords in one step. " +
                 "Campaign is created in PAUSED status for review before launch. " +
                 "Use build_campaign_plan first to design the structure, then pass the result here. " +
-                "Dry run by default — set confirm=true to build it.",
+                "Policy-restricted keywords (e.g. healthcare terms like LASIK/surgery) are submitted with exception requests automatically. " +
+                "Dry run by default (validated with Google, nothing created) — set confirm=true to build it.",
             inputSchema: {
                 type: "object",
                 properties: {
@@ -8954,9 +8992,20 @@ async function dispatchToolCall(name, args = {}) {
                     };
 
                     if (!confirm) {
-                        // Dry run — summarize what would be created
+                        // Dry run — validate the full mutate with Google (validateOnly creates
+                        // nothing) so policy and field errors surface before confirm=true.
+                        let validation;
+                        try {
+                            const v = await createGoogleCampaignFull(token, cid, info.mcc, { ...config, validate_only: true });
+                            validation = v.policy_exemptions_requested.length
+                                ? { status: "PASSES_WITH_POLICY_EXEMPTIONS", note: "These keywords are policy-restricted. confirm=true will submit exception requests for them; they may show 'Under review' / 'Eligible (limited)' until Google approves.", policy_exemptions: v.policy_exemptions_requested }
+                                : { status: "PASSES" };
+                        } catch (e) {
+                            validation = { status: "FAILS", error: e.message };
+                        }
                         const totalKw = config.ad_groups.reduce((s, ag) => s + (ag.keywords?.length || 0), 0);
                         result = {
+                            validation,
                             dry_run: true,
                             message: "DRY RUN — set confirm=true to create. Campaign will start PAUSED.",
                             account: info.name,
@@ -8989,6 +9038,7 @@ async function dispatchToolCall(name, args = {}) {
                                 budget_resource:   res.budget_resource,
                                 total_ops:         res.total_ops,
                                 status:            "PAUSED — review in Google Ads before enabling",
+                                ...(res.policy_exemptions_requested.length ? { policy_exemptions_requested: res.policy_exemptions_requested } : {}),
                             };
                         } catch (e) { result = { error: e.message }; }
                     }
@@ -11938,6 +11988,7 @@ module.exports = {
     clampTopN, shapeAgg, emptyAgg, addAgg, mergeAgg, listingCaseValueLabel, SHOPPING_GROUP_DIMENSIONS,
     matchByName, skippedRow, partitionSkipped, reportingPeriod, selectDetailAccounts, fetchMetaDailyBudgets,
     resolveAccount, buildAccountContext, addDays,
+    collectPolicyViolations, googleAdsError, createGoogleCampaignFull, addKeywordsToAdGroup,
 };
 
 if (require.main === module && !process.env.MCP_TEST) main().catch(console.error);
