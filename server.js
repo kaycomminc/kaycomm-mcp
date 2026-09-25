@@ -18,6 +18,7 @@ const { randomUUID } = require("node:crypto");
 const { fault, decorateTool, validateArgs, writeIdentity, annotateResult } = require("./src/mcp/contracts");
 const { FileWriteStore, PostgresWriteStore, assertReserved } = require("./src/mcp/write-guard");
 const { sameSecret, readJson, safeHttpHandler } = require("./src/mcp/http");
+const { createAccountsSync, syncedWriteAllowed } = require("./src/accounts-github");
 const requestContext = new AsyncLocalStorage();
 const TOOL_TIMEOUT_MS = Number(process.env.MCP_TOOL_TIMEOUT_MS) || 150000;
 const UPSTREAM_TIMEOUT_MS = Number(process.env.MCP_UPSTREAM_TIMEOUT_MS) || 30000;
@@ -68,8 +69,9 @@ const API_VERSION_INFO = {
 // Health thresholds default from top-level health_defaults; accounts without a
 // health key are checked with defaults, so new clients are monitored automatically.
 // Edit via the manage_accounts tool — changes persist to accounts.json.
-// NOTE: on Railway the filesystem is ephemeral; commit accounts.json to git
-// so cloud deploys pick up account changes.
+// NOTE: on Railway the filesystem is ephemeral. With ACCOUNTS_GITHUB_TOKEN set,
+// Railway commits note/rule changes to git itself (see accountsSync below);
+// everything else is edited on the Mac and committed by hand.
 const ACCOUNTS_FILE = path.join(__dirname, "accounts.json");
 let GOOGLE_ACCOUNTS = {};
 let META_ACCOUNTS = {};
@@ -165,10 +167,173 @@ function loadAccounts() {
     ROUTINE_RULES          = Array.isArray(data.routine_rules) ? data.routine_rules : [];
 }
 
+function serializeAccounts() {
+    const data = { health_defaults: HEALTH_DEFAULTS, routine_rules: ROUTINE_RULES, google: GOOGLE_ACCOUNTS, meta: META_ACCOUNTS, stackadapt: STACKADAPT_ADVERTISERS, linkedin: LINKEDIN_ACCOUNTS };
+    return JSON.stringify(data, null, 2) + "\n";
+}
+
 function saveAccounts() {
     requestContext.getStore()?.controller.signal.throwIfAborted();
-    const data = { health_defaults: HEALTH_DEFAULTS, routine_rules: ROUTINE_RULES, google: GOOGLE_ACCOUNTS, meta: META_ACCOUNTS, stackadapt: STACKADAPT_ADVERTISERS, linkedin: LINKEDIN_ACCOUNTS };
-    fs.writeFileSync(ACCOUNTS_FILE, JSON.stringify(data, null, 2) + "\n");
+    fs.writeFileSync(ACCOUNTS_FILE, serializeAccounts());
+}
+
+// manage_accounts itself: validates args, mutates the in-memory stores and
+// calls saveAccounts() on confirm. Returns the tool result.
+function manageAccounts(args) {
+    let result;
+    const action   = args.action || "list";
+    const platform = args.platform;
+    const confirm  = args.confirm === true;
+    const stores   = { google: GOOGLE_ACCOUNTS, meta: META_ACCOUNTS, stackadapt: STACKADAPT_ADVERTISERS, linkedin: LINKEDIN_ACCOUNTS };
+
+    if (action === "list") {
+        result = {
+            accounts_file: ACCOUNTS_FILE,
+            google:     Object.entries(GOOGLE_ACCOUNTS).map(([id, a]) => ({ id, ...a })),
+            meta:       Object.entries(META_ACCOUNTS).map(([id, a]) => ({ id, ...a })),
+            stackadapt: Object.entries(STACKADAPT_ADVERTISERS).map(([id, a]) => ({ id, ...a })),
+            linkedin:   Object.entries(LINKEDIN_ACCOUNTS).map(([id, a]) => ({ id, ...a })),
+        };
+    } else if (action === "add_rule" || action === "remove_rule") {
+        if (action === "add_rule" && !args.rule) {
+            result = { error: "rule (the instruction text) is required for add_rule." };
+        } else if (action === "remove_rule" && !ROUTINE_RULES.some(r => r.id === args.rule_id)) {
+            result = { error: `rule_id not found.`, rules: ROUTINE_RULES };
+        } else {
+            let change;
+            if (action === "add_rule") {
+                const next = Math.max(0, ...ROUTINE_RULES.map(r => parseInt(String(r.id).replace(/\D/g, ""), 10) || 0)) + 1;
+                change = { id: `r${next}`, text: args.rule, applies_to: args.applies_to?.length ? args.applies_to : ["all"], added: getDateInfo().today };
+                if (args.rule_expires) change.expires = args.rule_expires;
+            } else {
+                change = ROUTINE_RULES.find(r => r.id === args.rule_id);
+            }
+            if (!confirm) {
+                result = { dry_run: true, message: "DRY RUN — set confirm=true to save", action, rule: change, current_rules: ROUTINE_RULES };
+            } else {
+                ROUTINE_RULES = action === "add_rule" ? [...ROUTINE_RULES, change] : ROUTINE_RULES.filter(r => r.id !== args.rule_id);
+                saveAccounts();
+                result = { success: true, action, rule: change, rules: ROUTINE_RULES, note: "Saved to accounts.json. Commit + push to git so Railway picks it up." };
+                if (process.env.PORT) result.ephemeral_warning = "⚠️ This server runs on Railway with an ephemeral filesystem — this change will be LOST on the next deploy. Make changes from the Mac (local server) and commit accounts.json to git.";
+            }
+        }
+    } else if (action === "context") {
+        result = buildAccountContext(stores, getDateInfo().today, ROUTINE_RULES);
+    } else if (!platform || !stores[platform]) {
+        result = { error: "platform (google | meta | stackadapt | linkedin) is required for add/update/remove." };
+    } else if (!args.id) {
+        result = { error: "id is required for add/update/remove." };
+    } else {
+        const store = stores[platform];
+        const id    = platform === "meta" && !args.id.startsWith("act_") ? `act_${args.id}` : args.id;
+
+        if (action === "add") {
+            if (store[id]) {
+                result = { error: `${id} already exists (${store[id].name}). Use action=update to modify it.` };
+            } else if (!args.name || args.budget == null) {
+                result = { error: "name and budget are required for add." };
+            } else {
+                const entry = { name: args.name, budget: args.budget };
+                if (platform === "google") entry.mcc = args.mcc || id;
+                for (const f of ["ga4", "nc_budget", "flight_start", "flight_end", "budget_schedule", "health", "page_id"]) {
+                    if (args[f] != null) entry[f] = args[f];
+                }
+                if (!confirm) {
+                    result = { dry_run: true, message: "DRY RUN — set confirm=true to save", platform, id, entry };
+                } else {
+                    store[id] = entry;
+                    saveAccounts();
+                    result = { success: true, platform, id, entry, note: "Saved to accounts.json. Commit + push to git so Railway picks it up." };
+                    if (process.env.PORT) result.ephemeral_warning = "⚠️ This server runs on Railway with an ephemeral filesystem — this change will be LOST on the next deploy. Make account changes from the Mac (local server) and commit accounts.json to git.";
+                }
+            }
+        } else if (action === "update") {
+            if (!store[id]) {
+                result = { error: `${id} not found in ${platform} accounts.`, available: Object.entries(store).map(([k, a]) => `${k} (${a.name})`) };
+            } else {
+                const changes = {};
+                for (const f of ["name", "budget", "mcc", "ga4", "nc_budget", "flight_start", "flight_end", "budget_schedule", "health", "page_id"]) {
+                    if (args[f] != null) changes[f] = args[f];
+                }
+                if (args.inactive != null) changes.inactive = args.inactive || null;
+                if (args.clear_notes || args.add_note) {
+                    const today = getDateInfo().today;
+                    const notes = args.clear_notes ? [] : [...(store[id].notes || [])];
+                    if (args.add_note) notes.push({ text: args.add_note, added: today, expires: args.note_expires || addDays(today, NOTE_DEFAULT_TTL_DAYS) });
+                    changes.notes = notes.length ? notes : null;
+                }
+                if (!Object.keys(changes).length) {
+                    result = { error: "No fields to update. Provide name, budget, mcc, ga4, nc_budget, flight_start, flight_end, budget_schedule, health, page_id, inactive, add_note, or clear_notes." };
+                } else if (!confirm) {
+                    result = { dry_run: true, message: "DRY RUN — set confirm=true to save", platform, id, current: store[id], changes };
+                } else {
+                    Object.assign(store[id], changes);
+                    for (const [k, v] of Object.entries(changes)) if (v === null) delete store[id][k];
+                    saveAccounts();
+                    result = { success: true, platform, id, account: store[id], note: "Saved to accounts.json. Commit + push to git so Railway picks it up." };
+                    if (process.env.PORT) result.ephemeral_warning = "⚠️ This server runs on Railway with an ephemeral filesystem — this change will be LOST on the next deploy. Make account changes from the Mac (local server) and commit accounts.json to git.";
+                }
+            }
+        } else if (action === "remove") {
+            if (!store[id]) {
+                result = { error: `${id} not found in ${platform} accounts.` };
+            } else if (!confirm) {
+                result = { dry_run: true, message: "DRY RUN — set confirm=true to remove", platform, id, account: store[id] };
+            } else {
+                const removed = store[id];
+                delete store[id];
+                saveAccounts();
+                result = { success: true, removed: { id, ...removed }, note: "Saved to accounts.json. Commit + push to git so Railway picks it up." };
+                if (process.env.PORT) result.ephemeral_warning = "⚠️ This server runs on Railway with an ephemeral filesystem — this change will be LOST on the next deploy. Make account changes from the Mac (local server) and commit accounts.json to git.";
+            }
+        }
+    }
+    return result;
+}
+
+// Replace the in-memory accounts with a file fetched from GitHub.
+function applyAccountsText(text) {
+    fs.writeFileSync(ACCOUNTS_FILE, text);
+    loadAccounts();
+}
+
+// GitHub sync (Railway): set ACCOUNTS_GITHUB_TOKEN (fine-grained, Contents
+// read/write on the repo only) so manage_accounts writes commit straight to git
+// and survive deploys. Unset (the Mac), accounts.json is edited in place and
+// committed by hand as before.
+const accountsSync = createAccountsSync({
+    token:  process.env.ACCOUNTS_GITHUB_TOKEN,
+    repo:   process.env.ACCOUNTS_GITHUB_REPO || "kaycomminc/kaycomm-mcp",
+    branch: process.env.ACCOUNTS_GITHUB_BRANCH || "main",
+    fetch:  (url, options) => fetchFn(url, options),
+});
+const ACCOUNTS_REFRESH_MS = (Number(process.env.ACCOUNTS_REFRESH_MINUTES) || 5) * 60000;
+
+// Pick up accounts.json changes pushed from the Mac. railway.json's
+// watchPatterns skip redeploys for accounts.json-only commits, so this is how
+// the running server sees them.
+function refreshAccountsFromGitHub() {
+    return accountsSync.exclusive(async () => {
+        const before = accountsSync.sha;
+        const { text, sha } = await accountsSync.pull();
+        if (sha !== before && text !== serializeAccounts()) {
+            applyAccountsText(text);
+            console.error(`[accounts-sync] loaded accounts.json ${sha.slice(0, 7)} from GitHub`);
+        }
+    }).catch(error => console.error("[accounts-sync] refresh failed", { code: error.code || "ACCOUNTS_SYNC_ERROR" }));
+}
+
+function describeAccountsChange(args) {
+    const action = args.action;
+    if (action === "add_rule") return `add routine rule: ${String(args.rule).slice(0, 60)}`;
+    if (action === "remove_rule") return `remove routine rule ${args.rule_id}`;
+    const store = { google: GOOGLE_ACCOUNTS, meta: META_ACCOUNTS, stackadapt: STACKADAPT_ADVERTISERS, linkedin: LINKEDIN_ACCOUNTS }[args.platform] || {};
+    const id = args.platform === "meta" && args.id && !args.id.startsWith("act_") ? `act_${args.id}` : args.id;
+    const who = store[id]?.name || id;
+    const parts = [];
+    if (args.clear_notes) parts.push("clear notes");
+    if (args.add_note) parts.push("add note");
+    return `${who}: ${parts.join(" + ") || action} (${args.platform} ${id})`;
 }
 
 // Effective health-check thresholds for an account: null = excluded (health: false),
@@ -8499,112 +8664,31 @@ async function dispatchToolCall(name, args = {}) {
         result = checks;
 
     } else if (name === "manage_accounts") {
-        const action   = args.action || "list";
-        const platform = args.platform;
-        const confirm  = args.confirm === true;
-        const stores   = { google: GOOGLE_ACCOUNTS, meta: META_ACCOUNTS, stackadapt: STACKADAPT_ADVERTISERS, linkedin: LINKEDIN_ACCOUNTS };
-
-        if (action === "list") {
-            result = {
-                accounts_file: ACCOUNTS_FILE,
-                google:     Object.entries(GOOGLE_ACCOUNTS).map(([id, a]) => ({ id, ...a })),
-                meta:       Object.entries(META_ACCOUNTS).map(([id, a]) => ({ id, ...a })),
-                stackadapt: Object.entries(STACKADAPT_ADVERTISERS).map(([id, a]) => ({ id, ...a })),
-                linkedin:   Object.entries(LINKEDIN_ACCOUNTS).map(([id, a]) => ({ id, ...a })),
-            };
-        } else if (action === "add_rule" || action === "remove_rule") {
-            if (action === "add_rule" && !args.rule) {
-                result = { error: "rule (the instruction text) is required for add_rule." };
-            } else if (action === "remove_rule" && !ROUTINE_RULES.some(r => r.id === args.rule_id)) {
-                result = { error: `rule_id not found.`, rules: ROUTINE_RULES };
-            } else {
-                let change;
-                if (action === "add_rule") {
-                    const next = Math.max(0, ...ROUTINE_RULES.map(r => parseInt(String(r.id).replace(/\D/g, ""), 10) || 0)) + 1;
-                    change = { id: `r${next}`, text: args.rule, applies_to: args.applies_to?.length ? args.applies_to : ["all"], added: getDateInfo().today };
-                    if (args.rule_expires) change.expires = args.rule_expires;
-                } else {
-                    change = ROUTINE_RULES.find(r => r.id === args.rule_id);
+        const action = args.action || "list";
+        const synced = accountsSync.enabled && !["list", "context"].includes(action);
+        const allowed = synced ? syncedWriteAllowed(args) : { ok: true };
+        if (!allowed.ok) {
+            result = { error: `This server only manages notes and routine rules (add_note, clear_notes, add_rule, remove_rule). ` +
+                `Change ${allowed.fields.join(", ")} from the Mac (local server) and commit accounts.json to git.` };
+        } else if (synced && args.confirm === true) {
+            result = await accountsSync.exclusive(async () => {
+                const base = await accountsSync.pull();
+                applyAccountsText(base.text);
+                const r = manageAccounts(args);
+                if (!r.success) return r;
+                try {
+                    const commit = await accountsSync.push(serializeAccounts(), `accounts: ${describeAccountsChange(args)} [via Railway]`);
+                    delete r.ephemeral_warning;
+                    r.note = `Committed to GitHub (${accountsSync.branch} ${commit.commit.slice(0, 7)}) — persists across deploys. git pull on the Mac before editing accounts.json there.`;
+                    r.github_commit = commit.url;
+                    return r;
+                } catch (error) {
+                    applyAccountsText(base.text);
+                    return { error: `Not saved: ${error.message}. Nothing changed — retry.`, code: error.code };
                 }
-                if (!confirm) {
-                    result = { dry_run: true, message: "DRY RUN — set confirm=true to save", action, rule: change, current_rules: ROUTINE_RULES };
-                } else {
-                    ROUTINE_RULES = action === "add_rule" ? [...ROUTINE_RULES, change] : ROUTINE_RULES.filter(r => r.id !== args.rule_id);
-                    saveAccounts();
-                    result = { success: true, action, rule: change, rules: ROUTINE_RULES, note: "Saved to accounts.json. Commit + push to git so Railway picks it up." };
-                    if (process.env.PORT) result.ephemeral_warning = "⚠️ This server runs on Railway with an ephemeral filesystem — this change will be LOST on the next deploy. Make changes from the Mac (local server) and commit accounts.json to git.";
-                }
-            }
-        } else if (action === "context") {
-            result = buildAccountContext(stores, getDateInfo().today, ROUTINE_RULES);
-        } else if (!platform || !stores[platform]) {
-            result = { error: "platform (google | meta | stackadapt | linkedin) is required for add/update/remove." };
-        } else if (!args.id) {
-            result = { error: "id is required for add/update/remove." };
+            }).catch(error => ({ error: `Not saved: couldn't read accounts.json from GitHub (${error.message}). Nothing changed.`, code: error.code }));
         } else {
-            const store = stores[platform];
-            const id    = platform === "meta" && !args.id.startsWith("act_") ? `act_${args.id}` : args.id;
-
-            if (action === "add") {
-                if (store[id]) {
-                    result = { error: `${id} already exists (${store[id].name}). Use action=update to modify it.` };
-                } else if (!args.name || args.budget == null) {
-                    result = { error: "name and budget are required for add." };
-                } else {
-                    const entry = { name: args.name, budget: args.budget };
-                    if (platform === "google") entry.mcc = args.mcc || id;
-                    for (const f of ["ga4", "nc_budget", "flight_start", "flight_end", "budget_schedule", "health", "page_id"]) {
-                        if (args[f] != null) entry[f] = args[f];
-                    }
-                    if (!confirm) {
-                        result = { dry_run: true, message: "DRY RUN — set confirm=true to save", platform, id, entry };
-                    } else {
-                        store[id] = entry;
-                        saveAccounts();
-                        result = { success: true, platform, id, entry, note: "Saved to accounts.json. Commit + push to git so Railway picks it up." };
-                        if (process.env.PORT) result.ephemeral_warning = "⚠️ This server runs on Railway with an ephemeral filesystem — this change will be LOST on the next deploy. Make account changes from the Mac (local server) and commit accounts.json to git.";
-                    }
-                }
-            } else if (action === "update") {
-                if (!store[id]) {
-                    result = { error: `${id} not found in ${platform} accounts.`, available: Object.entries(store).map(([k, a]) => `${k} (${a.name})`) };
-                } else {
-                    const changes = {};
-                    for (const f of ["name", "budget", "mcc", "ga4", "nc_budget", "flight_start", "flight_end", "budget_schedule", "health", "page_id"]) {
-                        if (args[f] != null) changes[f] = args[f];
-                    }
-                    if (args.inactive != null) changes.inactive = args.inactive || null;
-                    if (args.clear_notes || args.add_note) {
-                        const today = getDateInfo().today;
-                        const notes = args.clear_notes ? [] : [...(store[id].notes || [])];
-                        if (args.add_note) notes.push({ text: args.add_note, added: today, expires: args.note_expires || addDays(today, NOTE_DEFAULT_TTL_DAYS) });
-                        changes.notes = notes.length ? notes : null;
-                    }
-                    if (!Object.keys(changes).length) {
-                        result = { error: "No fields to update. Provide name, budget, mcc, ga4, nc_budget, flight_start, flight_end, budget_schedule, health, page_id, inactive, add_note, or clear_notes." };
-                    } else if (!confirm) {
-                        result = { dry_run: true, message: "DRY RUN — set confirm=true to save", platform, id, current: store[id], changes };
-                    } else {
-                        Object.assign(store[id], changes);
-                        for (const [k, v] of Object.entries(changes)) if (v === null) delete store[id][k];
-                        saveAccounts();
-                        result = { success: true, platform, id, account: store[id], note: "Saved to accounts.json. Commit + push to git so Railway picks it up." };
-                        if (process.env.PORT) result.ephemeral_warning = "⚠️ This server runs on Railway with an ephemeral filesystem — this change will be LOST on the next deploy. Make account changes from the Mac (local server) and commit accounts.json to git.";
-                    }
-                }
-            } else if (action === "remove") {
-                if (!store[id]) {
-                    result = { error: `${id} not found in ${platform} accounts.` };
-                } else if (!confirm) {
-                    result = { dry_run: true, message: "DRY RUN — set confirm=true to remove", platform, id, account: store[id] };
-                } else {
-                    const removed = store[id];
-                    delete store[id];
-                    saveAccounts();
-                    result = { success: true, removed: { id, ...removed }, note: "Saved to accounts.json. Commit + push to git so Railway picks it up." };
-                    if (process.env.PORT) result.ephemeral_warning = "⚠️ This server runs on Railway with an ephemeral filesystem — this change will be LOST on the next deploy. Make account changes from the Mac (local server) and commit accounts.json to git.";
-                }
-            }
+            result = manageAccounts(args);
         }
 
     } else if (name === "sync_accounts") {
@@ -11816,6 +11900,11 @@ async function main() {
         console.error("[write-state] initialization failed", { code: error.code || "WRITE_STATE_ERROR" });
     }
     const PORT = process.env.PORT;
+
+    if (PORT && accountsSync.enabled) {
+        await refreshAccountsFromGitHub();
+        setInterval(refreshAccountsFromGitHub, ACCOUNTS_REFRESH_MS).unref();
+    }
 
     if (PORT) {
         // ── HTTP/SSE mode (Railway) ──────────────────────────────────────────
