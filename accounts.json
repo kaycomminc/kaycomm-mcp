@@ -20,6 +20,14 @@
         "all"
       ],
       "added": "2026-09-22"
+    },
+    {
+      "id": "r2",
+      "text": "Sync test — ignore (will be removed immediately)",
+      "applies_to": [
+        "all"
+      ],
+      "added": "2026-09-25"
     }
   ],
   "google": {
