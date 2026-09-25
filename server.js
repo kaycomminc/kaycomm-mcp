@@ -5716,7 +5716,9 @@ function makeServer() {
             description: "List, add, update, or remove tracked client accounts (Google Ads, Meta, StackAdapt, LinkedIn) without code changes. " +
                 "Also manages per-account health-check thresholds via the health field (run_health_check monitors every account by default; set health=false to exclude one). " +
                 "Writes to accounts.json. Dry run by default — set confirm=true to save. " +
-                "After saving, commit accounts.json to git so Railway picks up the change.",
+                "On the cloud server, note and routine-rule changes are committed to git automatically — no follow-up needed; " +
+                "other changes (budgets, flights, inactive, add/remove) are refused there and must be made from the local server. " +
+                "The result's note says whether anything is left to do.",
             inputSchema: {
                 type: "object",
                 properties: {
