@@ -70,7 +70,14 @@
       "budget": 1250,
       "mcc": "8621281595",
       "flight_start": "2026-09-01",
-      "flight_end": "2026-10-31"
+      "flight_end": "2026-10-31",
+      "notes": [
+        {
+          "text": "FAMU Online is currently only running YouTube and Meta — no Search campaigns active.",
+          "added": "2026-09-25",
+          "expires": "2026-10-25"
+        }
+      ]
     },
     "4206275101": {
       "name": "La Loma",
