@@ -19,6 +19,8 @@ const { fault, decorateTool, validateArgs, writeIdentity, annotateResult } = req
 const { FileWriteStore, PostgresWriteStore, assertReserved } = require("./src/mcp/write-guard");
 const { sameSecret, readJson, safeHttpHandler } = require("./src/mcp/http");
 const { createAccountsSync, syncedWriteAllowed } = require("./src/accounts-github");
+const metaBuild = require("./src/meta-campaign-build");
+const metaMedia = require("./src/meta-media");
 const requestContext = new AsyncLocalStorage();
 const TOOL_TIMEOUT_MS = Number(process.env.MCP_TOOL_TIMEOUT_MS) || 150000;
 const UPSTREAM_TIMEOUT_MS = Number(process.env.MCP_UPSTREAM_TIMEOUT_MS) || 30000;
@@ -333,6 +335,7 @@ function describeAccountsChange(args) {
     const parts = [];
     if (args.clear_notes) parts.push("clear notes");
     if (args.add_note) parts.push("add note");
+    if (args.page_id) parts.push(`set page_id ${args.page_id}`);
     return `${who}: ${parts.join(" + ") || action} (${args.platform} ${id})`;
 }
 
@@ -1458,6 +1461,11 @@ async function metaSearchGeo(query) {
     return metaGet("search", { type: "adgeolocation", q: query, location_types: '["city"]' });
 }
 
+async function metaSearchGeoTyped(query, locationTypes) {
+    const data = await metaGet("search", { type: "adgeolocation", q: query, location_types: JSON.stringify(locationTypes), limit: "25" });
+    return data.data || [];
+}
+
 async function metaSearchInterests(query) {
     const data = await metaGet("search", { type: "adinterest", q: query });
     return (data.data || data || []).map(i => ({
@@ -1504,9 +1512,20 @@ async function resolveMetaBehaviorsByName(names) {
 async function buildMetaTargetingSpec(targeting) {
     const spec = {};
     const warnings = [];
+    const errors = [];
+    let geoResolution = null;
 
     // Geo targeting
-    if (targeting.geo_raw) {
+    if (targeting.geos?.length && (targeting.geo_raw || targeting.geo || targeting.countries?.length)) {
+        warnings.push("targeting.geos is set, so geo / geo_raw / countries are ignored.");
+    }
+    if (targeting.geos?.length) {
+        const geo = await metaBuild.resolveMetaGeos(targeting.geos, { searchGeo: metaSearchGeoTyped });
+        warnings.push(...geo.warnings);
+        errors.push(...geo.errors);
+        geoResolution = geo.resolved;
+        if (Object.keys(geo.geo_locations).length) spec.geo_locations = geo.geo_locations;
+    } else if (targeting.geo_raw) {
         spec.geo_locations = targeting.geo_raw;
     } else if (targeting.countries?.length) {
         spec.geo_locations = { countries: targeting.countries };
@@ -1530,6 +1549,7 @@ async function buildMetaTargetingSpec(targeting) {
     // Age
     if (targeting.age_min) spec.age_min = targeting.age_min;
     if (targeting.age_max) spec.age_max = targeting.age_max;
+    if (targeting.genders?.length) spec.genders = targeting.genders;
 
     // Interests + behaviors → flexible_spec
     const flexSpec = {};
@@ -1552,6 +1572,11 @@ async function buildMetaTargetingSpec(targeting) {
     if (targeting.excluded_audiences?.length) {
         spec.exclusions = { custom_audiences: targeting.excluded_audiences.map(id => ({ id })) };
     }
+    if (targeting.excluded_interests?.length) {
+        const { resolved, unresolved } = await resolveMetaInterestsByName(targeting.excluded_interests);
+        if (unresolved.length) warnings.push(`Could not resolve excluded interests: ${unresolved.join(", ")}`);
+        if (resolved.length) spec.exclusions = { ...spec.exclusions, interests: resolved };
+    }
 
     // Placements (omit for Advantage+)
     if (targeting.placements === "manual") {
@@ -1561,15 +1586,37 @@ async function buildMetaTargetingSpec(targeting) {
     }
 
     // Pass through any additional targeting fields not handled above
-    const handled = new Set(["geo", "geo_radius", "geo_raw", "countries", "age_min", "age_max",
-        "interests", "behaviors", "custom_audiences", "excluded_audiences",
+    const handled = new Set(["geo", "geo_radius", "geo_raw", "geos", "countries", "age_min", "age_max", "genders",
+        "interests", "behaviors", "custom_audiences", "excluded_audiences", "excluded_interests",
         "placements", "publisher_platforms", "facebook_positions", "instagram_positions"]);
     for (const [k, v] of Object.entries(targeting)) {
         if (!handled.has(k) && v != null) spec[k] = v;
     }
 
-    return { spec, warnings };
+    return { spec, warnings, errors, geo_resolution: geoResolution };
 }
+
+// Upload raw image bytes to the account's image library.
+async function metaUploadImageBuffer(accountId, buffer, name) {
+    const formData = new FormData();
+    formData.append("access_token", META_ACCESS_TOKEN);
+    formData.append("filename", new Blob([buffer]), name);
+    const resp = await fetchFn(`https://graph.facebook.com/${META_API_VERSION}/${accountId}/adimages`, { method: "POST", body: formData });
+    const data = await resp.json();
+    if (data.error) throw new Error(data.error.message);
+    const img = data.images ? Object.values(data.images)[0] : data;
+    return { hash: img.hash };
+}
+
+// Dimensions Meta recorded for an uploaded image (used when we never held the bytes).
+async function metaImageDimensions(accountId, hash) {
+    const res = await metaGet(`${accountId}/adimages`, { hashes: JSON.stringify([hash]), fields: "hash,name,width,height" });
+    const img = (res.data || [])[0];
+    return img ? { width: img.width ?? null, height: img.height ?? null } : { width: null, height: null };
+}
+
+// Staged chunked uploads for upload_meta_media_chunk (in-memory, 30-min TTL).
+const metaChunkUploads = metaMedia.createChunkStore();
 
 const DEFAULT_META_URL_TAGS = "utm_source=facebook&utm_medium=paid_social&utm_campaign={{campaign.name}}&utm_term={{adset.name}}&utm_content={{ad.name}}&placement={{placement}}";
 
@@ -1638,6 +1685,7 @@ async function createMetaCampaignFull(accountId, pageId, config, instagramAccoun
                 status: "PAUSED",
                 special_ad_categories: config.special_ad_categories || [],
             };
+            if (config.special_ad_category_country?.length) campaignBody.special_ad_category_country = config.special_ad_category_country;
             if (config.cbo) {
                 campaignBody.bid_strategy = config.campaign_bid_strategy || "LOWEST_COST_WITHOUT_CAP";
                 if (config.lifetime_budget) {
@@ -1659,13 +1707,12 @@ async function createMetaCampaignFull(accountId, pageId, config, instagramAccoun
     }
 
     // Step 2: Create ad sets + ads
-    for (const adSetDef of (config.ad_sets || [])) {
+    for (const [adSetIndex, adSetDef] of (config.ad_sets || []).entries()) {
         // Support "existing:<adset_id>" in name to add ads to an existing ad set
         const existingAdsetId = adSetDef.existing_adset_id || (adSetDef.name?.startsWith("existing:") ? adSetDef.name.split(":")[1] : null);
         let targetingSpec = {};
         if (!existingAdsetId) {
-            const built = await buildMetaTargetingSpec(adSetDef.targeting || {});
-            targetingSpec = built.spec;
+            targetingSpec = config.targeting_specs?.[adSetIndex] || (await buildMetaTargetingSpec(adSetDef.targeting || {})).spec;
         }
 
         const adSetBody = {
@@ -1725,7 +1772,13 @@ async function createMetaCampaignFull(accountId, pageId, config, instagramAccoun
         // Step 3: Create ads (creative + ad for each)
         for (const adDef of (adSetDef.ads || [])) {
             let storySpec;
-            if (adDef.video_id) {
+            let assetFeedSpec = null;
+            if (adDef.asset_feed_spec) {
+                // Dynamic creative / flexible format: assets and copy live in
+                // asset_feed_spec; object_story_spec only carries identity.
+                assetFeedSpec = metaBuild.buildAssetFeedSpec(adDef, { dynamicCreative: !!adSetDef.is_dynamic_creative });
+                storySpec = { page_id: pageId };
+            } else if (adDef.video_id) {
                 let videoThumbHash = adDef.image_hash || null;
                 if (!videoThumbHash) {
                     try {
@@ -1816,6 +1869,7 @@ async function createMetaCampaignFull(accountId, pageId, config, instagramAccoun
                 creative = adDef.object_story_id
                     ? { name: `${adDef.name} Creative`, object_story_id: adDef.object_story_id }
                     : { name: `${adDef.name} Creative`, object_story_spec: storySpec };
+                if (assetFeedSpec) creative.asset_feed_spec = assetFeedSpec;
                 creative.contextual_multi_ads = JSON.stringify({ enroll_status: "OPT_OUT" });
                 creative.url_tags = adDef.url_tags || adSetDef.url_tags || DEFAULT_META_URL_TAGS;
                 if (adDef.lead_gen_form_id) creative.lead_gen_form_id = adDef.lead_gen_form_id;
@@ -5716,7 +5770,7 @@ function makeServer() {
             description: "List, add, update, or remove tracked client accounts (Google Ads, Meta, StackAdapt, LinkedIn) without code changes. " +
                 "Also manages per-account health-check thresholds via the health field (run_health_check monitors every account by default; set health=false to exclude one). " +
                 "Writes to accounts.json. Dry run by default — set confirm=true to save. " +
-                "On the cloud server, note and routine-rule changes are committed to git automatically — no follow-up needed; " +
+                "On the cloud server, note, routine-rule and page_id changes are committed to git automatically — no follow-up needed; " +
                 "other changes (budgets, flights, inactive, add/remove) are refused there and must be made from the local server. " +
                 "The result's note says whether anything is left to do.",
             inputSchema: {
@@ -5729,6 +5783,7 @@ function makeServer() {
                     budget:   { type: "number", description: "Monthly budget in dollars (required for add; flights use total flight budget)" },
                     mcc:      { type: "string", description: "Google only: managing MCC login-customer-id (defaults to the account ID itself)" },
                     ga4:      { type: "string", description: "Google only: GA4 property ID" },
+                    page_id:  { type: "string", pattern: "^[0-9]+$", description: "Meta only: Facebook Page ID ads run as (used by create_meta_campaign and manage_meta_leads). Can be set from the cloud server." },
                     nc_budget: { type: "number", description: "Google only: NC sub-budget (Boulevard Carroll pattern)" },
                     flight_start: { type: "string", description: "YYYY-MM-DD — set with flight_end for flight-based pacing instead of monthly" },
                     flight_end:   { type: "string", description: "YYYY-MM-DD — last day of the flight" },
@@ -6495,7 +6550,8 @@ function makeServer() {
             name: "upload_meta_media",
             description: "Upload images or videos to a Meta ad account's Media Library. " +
                 "Returns image hashes or video IDs for use in create_meta_campaign. " +
-                "Supports local file paths, public URLs, and base64 data (for drag-and-drop into chat). " +
+                "Supports local file paths, public URLs, Google Drive / Dropbox share links (downloaded and content-type checked), and base64 data. " +
+                "For files too large for one base64 string (e.g. from Claude.ai's sandbox), use upload_meta_media_chunk. Returns image_hash, name, width and height for each image. " +
                 "Dry run by default — set confirm=true to upload.",
             inputSchema: {
                 type: "object",
@@ -6507,7 +6563,7 @@ function makeServer() {
                         items: {
                             type: "object",
                             properties: {
-                                source:      { type: "string", description: "Local file path or public URL. Images: jpg/jpeg/png/gif/bmp/tiff. Videos: mp4/mov/avi/wmv/flv/mkv/webm." },
+                                source:      { type: "string", description: "Server-local file path, public URL, or a Google Drive (drive.google.com/file/d/…/view) or Dropbox share link — share links must be 'Anyone with the link'. Images: jpg/jpeg/png/gif/bmp/tiff. Videos: mp4/mov/avi/wmv/flv/mkv/webm." },
                                 base64_data: { type: "string", description: "Base64-encoded file content. Use when a file is dragged into chat — Claude encodes it and passes it here. Must also provide name with extension." },
                                 name:        { type: "string", description: "Display name in Media Library (with extension). Required when using base64_data, optional for source." },
                             },
@@ -6516,6 +6572,26 @@ function makeServer() {
                     confirm: { type: "boolean", description: "Set true to upload. Omit for dry run (validates files and formats)." },
                 },
                 required: ["account_name", "files"],
+            },
+        },
+        {
+            name: "upload_meta_media_chunk",
+            description: "Upload a large image to a Meta ad account in base64 chunks (for files that can't be passed as one base64 string or reached by URL, e.g. Claude.ai sandbox files). " +
+                "Split the base64 text anywhere into total_chunks pieces and send each with the same upload_id (any order, retries of the same chunk are safe). " +
+                "Chunks are staged server-side and expire 30 minutes after the first one. When all chunks have arrived, the call previews the image (dry run) — " +
+                "then call once more with upload_id + confirm=true and no data to upload it, or send the final chunk with confirm=true. Returns image_hash, name, width and height.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    account_name: { type: "string", description: "Client name (partial match ok)" },
+                    upload_id:    { type: "string", pattern: "^[A-Za-z0-9_-]{1,64}$", description: "Caller-chosen ID shared by every chunk of one file (e.g. 'summit-hire-1')" },
+                    chunk_index:  { type: "integer", minimum: 0, description: "0-based index of this chunk. Omit (with data) on the finalize call." },
+                    total_chunks: { type: "integer", minimum: 1, maximum: 1000, description: "Total number of chunks for this file (same on every call)" },
+                    data:         { type: "string", description: "This chunk's base64 text. A data:image/...;base64, prefix on chunk 0 is stripped." },
+                    name:         { type: "string", description: "File name with extension, e.g. 'hiring-1080x1080.jpg' (send on the first chunk)" },
+                    confirm:      { type: "boolean", description: "Set true to upload once all chunks are staged. Omit for dry run." },
+                },
+                required: ["account_name", "upload_id"],
             },
         },
         {
@@ -6550,6 +6626,7 @@ function makeServer() {
                 type: "object",
                 properties: {
                     account_name:  { type: "string", description: "Client name (partial match ok)" },
+                    page_id: { type: "string", pattern: "^[0-9]+$", description: "Facebook Page ID to run ads as. Overrides accounts.json. If omitted and accounts.json has none, the ad account's promote_pages edge is used when it lists exactly one page." },
                     existing_campaign_id: { type: "string", description: "Existing campaign ID to add ad sets/ads into (skip campaign creation). When set, campaign_name/objective/budget are optional." },
                     campaign_name: { type: "string", description: "Name for the new campaign" },
                     objective: {
@@ -6564,7 +6641,8 @@ function makeServer() {
                         enum: ["LOWEST_COST_WITHOUT_CAP", "COST_CAP", "LOWEST_COST_WITH_BID_CAP", "LOWEST_COST_WITH_MIN_ROAS"],
                         description: "Campaign-level bid strategy for CBO. Default: LOWEST_COST_WITHOUT_CAP. COST_CAP/BID_CAP require bid_amount on ad sets.",
                     },
-                    special_ad_categories: { type: "array", items: { type: "string", enum: ["EMPLOYMENT", "HOUSING", "CREDIT", "ISSUES_ELECTIONS_POLITICS"] }, description: "Special ad categories (e.g. ['EMPLOYMENT']). Restricts targeting options per Meta policy." },
+                    special_ad_categories: { type: "array", items: { type: "string", enum: ["EMPLOYMENT", "HOUSING", "CREDIT", "ISSUES_ELECTIONS_POLITICS"] }, description: "Special ad categories (e.g. ['EMPLOYMENT']). Restricts targeting options per Meta policy — the dry run flags targeting Meta will reject or strip (age, gender, ZIPs, radius <15mi, detailed-targeting exclusions, lookalikes, interests/behaviors)." },
+                    special_ad_category_country: { type: "array", items: { type: "string", pattern: "^[A-Z]{2}$" }, description: "Countries the special ad category applies to (default ['US'] when special_ad_categories is set)." },
                     cbo: { type: "boolean", description: "Campaign Budget Optimization (default: true). When true, budget is at campaign level. When false, set budgets per ad set." },
                     ad_sets: {
                         type: "array",
@@ -6595,26 +6673,43 @@ function makeServer() {
                                 roas_control: { type: "number", description: "Minimum ROAS target (for LOWEST_COST_WITH_MIN_ROAS). E.g. 2.0 means $2 revenue per $1 spent." },
                                 daily_min_spend_target: { type: "number", description: "CBO only: minimum daily spend target for this ad set (dollars)" },
                                 daily_spend_cap: { type: "number", description: "CBO only: maximum daily spend cap for this ad set (dollars)" },
-                                is_dynamic_creative: { type: "boolean", description: "Enable Dynamic Creative — Meta auto-combines creative assets. When true, provide multiple images/videos/texts in the ad's asset_feed_spec." },
+                                is_dynamic_creative: { type: "boolean", description: "Enable Dynamic Creative — Meta auto-combines creative assets. When true, the ad set must contain exactly one ad, and that ad must use asset_feed_spec." },
                                 targeting: {
                                     type: "object",
-                                    description: "Simplified targeting spec. Fields: geo (string like 'Denver, CO'), geo_radius (miles, default 25), " +
+                                    description: "Simplified targeting spec. Fields: geos (array of {name, radius?, type?} — cities, counties like 'Summit County, CO', states, ZIPs; resolved keys are returned in the dry run), " +
+                                        "geo (single string like 'Denver, CO'), geo_radius (miles, default 25), " +
                                         "countries (array of country codes like ['US'] for broad reach), " +
                                         "age_min, age_max, interests (array of names), behaviors (array of names), " +
                                         "custom_audiences (array of IDs), excluded_audiences (array of IDs), " +
                                         "placements ('advantage_plus' or 'manual' — default: advantage_plus). " +
                                         "For manual placements, also provide publisher_platforms, facebook_positions, instagram_positions arrays.",
                                     properties: {
+                                        geos: {
+                                            type: "array",
+                                            description: "Multiple locations, each resolved via Meta's location search to an exact key (no guessing — ambiguous or unmatched names fail validation with Meta's suggestions). " +
+                                                "Include the state to disambiguate. Counties resolve to Meta medium_geo_area keys. Takes precedence over geo/geo_raw/countries.",
+                                            items: {
+                                                type: "object",
+                                                properties: {
+                                                    name:   { type: "string", description: "e.g. 'Frisco, CO', 'Summit County, CO', 'Colorado', '80443'" },
+                                                    radius: { type: "number", description: "Miles around a city (10-50, default 25). Ignored for counties/regions/ZIPs." },
+                                                    type:   { type: "string", enum: ["city", "county", "region", "state", "zip", "dma", "neighborhood", "subcity", "country"], description: "Optional: restrict the search to one location type." },
+                                                },
+                                                required: ["name"],
+                                            },
+                                        },
                                         geo:          { type: "string", description: "Location name to target (e.g. 'Denver, CO', 'Miami, FL')" },
                                         geo_radius:   { type: "number", description: "Radius in miles around geo location (default: 25)" },
                                         countries:    { type: "array", items: { type: "string" }, description: "Country codes for country-level targeting (e.g. ['US', 'CA', 'GB']). Use instead of geo for broad reach." },
                                         geo_raw:      { description: "Raw geo_locations spec — pass an object like {regions: [{key: '3852'}]} or {countries: ['US']}. Set directly as targeting.geo_locations." },
                                         age_min:      { type: "number", description: "Minimum age (default: 18)" },
                                         age_max:      { type: "number", description: "Maximum age (default: 65)" },
+                                        genders:      { type: "array", items: { type: "integer", enum: [1, 2] }, description: "1 = men, 2 = women. Omit for all. Not allowed with EMPLOYMENT/HOUSING/CREDIT." },
                                         interests:    { type: "array", items: { type: "string" }, description: "Interest names — resolved to IDs via search" },
                                         behaviors:    { type: "array", items: { type: "string" }, description: "Behavior names — resolved to IDs via search" },
                                         custom_audiences:  { type: "array", items: { type: "string" }, description: "Custom audience IDs for targeting" },
                                         excluded_audiences:{ type: "array", items: { type: "string" }, description: "Custom audience IDs to exclude" },
+                                        excluded_interests:{ type: "array", items: { type: "string" }, description: "Interest names to exclude (detailed-targeting exclusion). Not allowed with EMPLOYMENT/HOUSING/CREDIT." },
                                         placements:        { type: "string", enum: ["advantage_plus", "manual"], description: "Placement strategy (default: advantage_plus)" },
                                         publisher_platforms:  { type: "array", items: { type: "string" }, description: "For manual placements: ['facebook', 'instagram']" },
                                         facebook_positions:  { type: "array", items: { type: "string" }, description: "For manual placements: ['feed', 'story', 'reels', etc.]" },
@@ -6644,6 +6739,21 @@ function makeServer() {
                                             video_id:   { type: "string", description: "Video ID from Media Library (use list_meta_media to find)" },
                                             object_story_id: { type: "string", description: "Existing Page post ID (PAGE_ID_POST_ID) to promote as an ad. When set, primary_text/headline/url are not needed." },
                                             creative_id: { type: "string", description: "Existing creative ID to reuse. When set, no new creative is created — the ad references this creative directly." },
+                                            asset_feed_spec: {
+                                                type: "object",
+                                                description: "Dynamic creative / flexible format assets. Required when the ad set has is_dynamic_creative. " +
+                                                    "Replaces image_hash/video_id/primary_text/headline/description on this ad. Text is sent byte-for-byte (never trimmed or truncated); over-length copy only produces a warning.",
+                                                properties: {
+                                                    images:       { type: "array", items: { type: "string" }, description: "Image hashes (max 10)" },
+                                                    videos:       { type: "array", items: { type: "string" }, description: "Video IDs (max 10)" },
+                                                    bodies:       { type: "array", items: { type: "string" }, description: "Primary texts (max 5)" },
+                                                    titles:       { type: "array", items: { type: "string" }, description: "Headlines (max 5)" },
+                                                    descriptions: { type: "array", items: { type: "string" }, description: "Link descriptions (max 5)" },
+                                                    link_urls:    { type: "array", items: { type: "string" }, description: "Destination URLs (usually one). Defaults to the ad's url." },
+                                                    call_to_action_types: { type: "array", items: { type: "string", enum: ["LEARN_MORE", "SHOP_NOW", "SIGN_UP", "APPLY_NOW", "BUY_TICKETS", "BOOK_NOW", "CONTACT_US", "GET_OFFER", "GET_QUOTE", "SUBSCRIBE", "DOWNLOAD", "ORDER_NOW", "NO_BUTTON"] }, description: "CTA buttons (max 5). Defaults to the ad's cta." },
+                                                    ad_formats:   { type: "array", items: { type: "string", enum: metaBuild.AD_FORMATS }, description: "Default: SINGLE_IMAGE for images, SINGLE_VIDEO for videos, AUTOMATIC_FORMAT for both." },
+                                                },
+                                            },
                                             url_tags: { type: "string", description: "UTM query string appended to the destination URL, e.g. 'utm_source=facebook&utm_medium=paid_social&utm_campaign={{campaign.name}}&utm_content={{ad.name}}'. Falls back to the ad set's url_tags, then a default with {{campaign.name}}/{{adset.name}}/{{ad.name}}/{{placement}} macros." },
                                         },
                                         required: ["name"],
@@ -8670,7 +8780,7 @@ async function dispatchToolCall(name, args = {}) {
         const synced = accountsSync.enabled && !["list", "context"].includes(action);
         const allowed = synced ? syncedWriteAllowed(args) : { ok: true };
         if (!allowed.ok) {
-            result = { error: `This server only manages notes and routine rules (add_note, clear_notes, add_rule, remove_rule). ` +
+            result = { error: `This server only manages notes, routine rules and page_id (add_note, clear_notes, add_rule, remove_rule, page_id). ` +
                 `Change ${allowed.fields.join(", ")} from the Mac (local server) and commit accounts.json to git.` };
         } else if (synced && args.confirm === true) {
             result = await accountsSync.exclusive(async () => {
@@ -9779,6 +9889,27 @@ async function dispatchToolCall(name, args = {}) {
                             continue;
                         }
 
+                        // Google Drive / Dropbox share links: download now so content-type
+                        // (and image dimensions) are validated in the dry run too.
+                        const share = isUrl ? metaMedia.resolveShareLink(f.source) : null;
+                        if (share) {
+                            try {
+                                const dl = await metaMedia.downloadMedia(share.url, { fetch: fetchFn });
+                                const shareName = f.name || dl.filename || `${share.provider}-${share.file_id || "file"}.${metaMedia.extensionFor(dl.contentType)}`;
+                                const dims = dl.mediaType === "image" ? await metaMedia.describeImage(dl.buffer) : null;
+                                if (dl.mediaType === "image" && dl.buffer.length > metaMedia.MAX_IMAGE_BYTES) throw new Error(`Image is ${dl.buffer.length} bytes; Meta's limit is 30 MB`);
+                                fileMeta.push({
+                                    source: f.source, name: shareName, type: dl.mediaType, isUrl: false, isBase64: false,
+                                    buffer: dl.buffer, provider: share.provider, content_type: dl.contentType,
+                                    width: dims?.width ?? null, height: dims?.height ?? null,
+                                    size: dl.buffer.length, sizeLabel: dl.buffer.length > 1048576 ? `${(dl.buffer.length / 1048576).toFixed(1)} MB` : `${(dl.buffer.length / 1024).toFixed(0)} KB`,
+                                });
+                            } catch (e) {
+                                errors.push({ source: f.source, error: `${share.provider}: ${e.message}` });
+                            }
+                            continue;
+                        }
+
                         const nameSource = isBase64 ? f.name : f.source;
                         const ext = path.extname(nameSource).replace(".", "").toLowerCase();
                         const displayName = f.name || path.basename(f.source);
@@ -9802,6 +9933,18 @@ async function dispatchToolCall(name, args = {}) {
                             size = stat.size;
                         }
 
+                        let dims = null;
+                        if (mediaType === "image" && !isUrl) {
+                            try {
+                                const bytes = isBase64 ? Buffer.from(f.base64_data, "base64")
+                                    : fs.readFileSync(path.isAbsolute(f.source) ? f.source : path.resolve(f.source));
+                                dims = await metaMedia.describeImage(bytes);
+                            } catch (e) {
+                                errors.push({ source: nameSource, error: `Not a readable image: ${e.message}` });
+                                continue;
+                            }
+                        }
+
                         fileMeta.push({
                             source: f.source || "(base64)",
                             name: displayName,
@@ -9809,6 +9952,8 @@ async function dispatchToolCall(name, args = {}) {
                             isUrl,
                             isBase64,
                             base64_data: isBase64 ? f.base64_data : null,
+                            width: dims?.width ?? null,
+                            height: dims?.height ?? null,
                             size,
                             sizeLabel: size ? (size > 1048576 ? `${(size / 1048576).toFixed(1)} MB` : `${(size / 1024).toFixed(0)} KB`) : "(URL)",
                         });
@@ -9820,7 +9965,12 @@ async function dispatchToolCall(name, args = {}) {
                         result = {
                             dry_run: true,
                             account: acctInfo.name,
-                            files: fileMeta.map(f => ({ name: f.name, source: f.source, type: f.type, size: f.sizeLabel, status: "ready" })),
+                            files: fileMeta.map(f => ({
+                                name: f.name, source: f.source, type: f.type, size: f.sizeLabel,
+                                ...(f.type === "image" ? { width: f.width, height: f.height } : {}),
+                                ...(f.provider ? { provider: f.provider, content_type: f.content_type } : {}),
+                                status: "ready",
+                            })),
                             message: `${fileMeta.length} file(s) ready to upload. Set confirm=true to proceed.`,
                         };
                         if (errors.length) result.errors = errors;
@@ -9830,6 +9980,7 @@ async function dispatchToolCall(name, args = {}) {
 
                         // Helper: get a Buffer from base64, local path, or null (for URL uploads)
                         function getFileBuffer(f) {
+                            if (f.buffer) return f.buffer;
                             if (f.isBase64) return Buffer.from(f.base64_data, "base64");
                             if (!f.isUrl) {
                                 const resolved = path.isAbsolute(f.source) ? f.source : path.resolve(f.source);
@@ -9844,21 +9995,12 @@ async function dispatchToolCall(name, args = {}) {
                                     if (f.isUrl) {
                                         const res = await metaPost(`${accountId}/adimages`, { url: f.source });
                                         const imgData = res.images ? Object.values(res.images)[0] : res;
-                                        uploaded.push({ name: f.name, type: "image", image_hash: imgData.hash, status: "ready" });
+                                        let dims = { width: null, height: null };
+                                        try { dims = await metaImageDimensions(accountId, imgData.hash); } catch (_) { /* hash is what matters */ }
+                                        uploaded.push({ name: f.name, type: "image", image_hash: imgData.hash, width: dims.width, height: dims.height, status: "ready" });
                                     } else {
-                                        const fileBuffer = getFileBuffer(f);
-                                        const blob = new Blob([fileBuffer]);
-                                        const formData = new FormData();
-                                        formData.append("access_token", META_ACCESS_TOKEN);
-                                        formData.append("filename", blob, f.name);
-                                        const resp = await fetchFn(
-                                            `https://graph.facebook.com/${META_API_VERSION}/${accountId}/adimages`,
-                                            { method: "POST", body: formData }
-                                        );
-                                        const data = await resp.json();
-                                        if (data.error) throw new Error(data.error.message);
-                                        const imgData = data.images ? Object.values(data.images)[0] : data;
-                                        uploaded.push({ name: f.name, type: "image", image_hash: imgData.hash, status: "ready" });
+                                        const { hash } = await metaUploadImageBuffer(accountId, getFileBuffer(f), f.name);
+                                        uploaded.push({ name: f.name, type: "image", image_hash: hash, width: f.width, height: f.height, status: "ready" });
                                     }
                                 } else {
                                     let videoId;
@@ -9911,6 +10053,52 @@ async function dispatchToolCall(name, args = {}) {
                 } catch (e) {
                     result = { error: e.message };
                 }
+            }
+        }
+
+    } else if (name === "upload_meta_media_chunk") {
+        const { match: acctMatch, error: acctMatchErr } = resolveAccount(META_ACCOUNTS, (args.account_name || "").toLowerCase(), { confirmed: args.confirm === true });
+        if (!acctMatch) {
+            result = { error: acctMatchErr };
+        } else {
+            const [accountId, acctInfo] = acctMatch;
+            try {
+                let staged;
+                if (args.data != null) {
+                    if (args.chunk_index == null || args.total_chunks == null) throw new Error("chunk_index and total_chunks are required with data.");
+                    staged = metaChunkUploads.put({ upload_id: args.upload_id, account_id: accountId, chunk_index: args.chunk_index, total_chunks: args.total_chunks, data: args.data, name: args.name });
+                } else {
+                    staged = metaChunkUploads.status(args.upload_id, accountId);
+                    if (!staged) throw new Error(`No staged upload '${args.upload_id}' for ${acctInfo.name} (uploads expire 30 min after the first chunk).`);
+                }
+                if (!staged.complete) {
+                    result = { account: acctInfo.name, ...staged, status: "staged", message: `${staged.received}/${staged.total_chunks} chunks received.` };
+                } else {
+                    const { buffer, name: stagedName } = metaChunkUploads.assemble(args.upload_id, accountId);
+                    let dims;
+                    try { dims = await metaMedia.describeImage(buffer); }
+                    catch (e) { metaChunkUploads.discard(args.upload_id); throw new Error(`Reassembled data is not a readable image (${e.message}); upload discarded — resend all chunks.`); }
+                    const fileName = stagedName || `${args.upload_id}.${dims.format === "jpeg" ? "jpg" : dims.format}`;
+                    const size = buffer.length > 1048576 ? `${(buffer.length / 1048576).toFixed(1)} MB` : `${(buffer.length / 1024).toFixed(0)} KB`;
+                    if (args.confirm !== true) {
+                        result = {
+                            dry_run: true, account: acctInfo.name, upload_id: args.upload_id,
+                            file: { name: fileName, type: "image", format: dims.format, width: dims.width, height: dims.height, size },
+                            expires_at: staged.expires_at,
+                            message: "All chunks received. Call again with upload_id + confirm=true (no data) to upload.",
+                        };
+                    } else {
+                        const { hash } = await metaUploadImageBuffer(accountId, buffer, fileName);
+                        metaChunkUploads.discard(args.upload_id);
+                        result = {
+                            success: true, account: acctInfo.name,
+                            uploaded: [{ name: fileName, type: "image", image_hash: hash, width: dims.width, height: dims.height, size, status: "ready" }],
+                            summary: "Uploaded. Use image_hash in create_meta_campaign.",
+                        };
+                    }
+                }
+            } catch (e) {
+                result = { error: e.message };
             }
         }
 
@@ -9970,22 +10158,81 @@ async function dispatchToolCall(name, args = {}) {
                 result = { error: acctMatchErr };
             } else {
                 const [accountId, acctInfo] = acctMatch;
-                const pageId = acctInfo.page_id;
                 const allAdsUseCreativeId = (args.ad_sets || []).every(s => (s.ads || []).every(a => a.creative_id));
-                if (!pageId && !allAdsUseCreativeId) {
-                    result = { error: `No page_id configured for '${acctInfo.name}'. Add page_id to this account's entry in accounts.json.` };
+                const warnings = [];
+                let pageId = acctInfo.page_id || null;
+                let pageSource = pageId ? "accounts.json" : null;
+                let pageError = null;
+                if (args.page_id || !allAdsUseCreativeId) {
+                    const page = await metaBuild.resolveMetaPageId({
+                        accountId, accountName: acctInfo.name, explicit: args.page_id, configured: acctInfo.page_id, metaGet,
+                    });
+                    if (page.error) pageError = page;
+                    else { pageId = page.page_id; pageSource = page.source; warnings.push(...page.warnings); }
+                }
+                if (pageError) {
+                    result = { error: pageError.error, ...(pageError.pages ? { available_pages: pageError.pages } : {}) };
                 } else {
                     try {
-                        if (!confirm) {
-                            // Dry run — resolve targeting and build preview
-                            const adSetPreviews = [];
-                            const allWarnings = [];
-                            for (const adSetDef of args.ad_sets) {
-                                const { spec: targetingSpec, warnings } = await buildMetaTargetingSpec(adSetDef.targeting || {});
-                                allWarnings.push(...warnings);
+                        const restricted = (args.special_ad_categories || []).some(c => metaBuild.RESTRICTED_CATEGORIES.has(c));
+                        const sacCountry = args.special_ad_category_country || (args.special_ad_categories?.length ? ["US"] : undefined);
+
+                        // Resolve targeting and validate once — the dry run and the build share this plan.
+                        const plan = [];
+                        const validationErrors = [];
+                        for (const [i, adSetDef] of args.ad_sets.entries()) {
+                            const where = `ad_sets[${i}] '${adSetDef.name}'`;
+                            const creativeCheck = metaBuild.validateAdSetCreatives(adSetDef, i);
+                            validationErrors.push(...creativeCheck.errors);
+                            warnings.push(...creativeCheck.warnings);
+                            if (adSetDef.existing_adset_id || adSetDef.name?.startsWith("existing:")) {
+                                plan.push({ spec: null, geo_resolution: null, sac: null });
+                                continue;
+                            }
+                            const built = await buildMetaTargetingSpec(adSetDef.targeting || {});
+                            warnings.push(...built.warnings.map(w => `${where}: ${w}`));
+                            validationErrors.push(...built.errors.map(e => `${where}: ${e}`));
+                            const sac = restricted ? await metaBuild.reviewSpecialAdCategoryTargeting({
+                                categories: args.special_ad_categories, targeting: adSetDef.targeting || {}, spec: built.spec,
+                                getAudience: id => metaGet(id, { fields: "id,name,subtype" }),
+                            }) : null;
+                            if (sac) warnings.push(...sac.issues.map(x => `${where} [${sac.categories.join("/")}]: ${x.message}`));
+                            plan.push({ spec: built.spec, geo_resolution: built.geo_resolution, sac });
+                        }
+
+                        if (validationErrors.length) {
+                            result = {
+                                error: `Validation failed — nothing was ${confirm ? "created" : "planned"}. Fix validation_errors and retry.`,
+                                validation_errors: validationErrors,
+                                ...(warnings.length ? { warnings } : {}),
+                            };
+                        } else if (!confirm) {
+                            const adSetPreviews = args.ad_sets.map((adSetDef, i) => {
+                                const { spec: targetingSpec, geo_resolution: geoResolution, sac } = plan[i];
+                                const ads = (adSetDef.ads || []).map(ad => {
+                                    if (ad.asset_feed_spec) {
+                                        return {
+                                            name: ad.name,
+                                            creative_type: adSetDef.is_dynamic_creative ? "dynamic_creative" : "flexible_format",
+                                            asset_feed_spec: metaBuild.buildAssetFeedSpec(ad, { dynamicCreative: !!adSetDef.is_dynamic_creative }),
+                                            url_tags: ad.url_tags || adSetDef.url_tags || DEFAULT_META_URL_TAGS,
+                                        };
+                                    }
+                                    return {
+                                        name: ad.name,
+                                        headline: ad.headline,
+                                        cta: ad.cta || "LEARN_MORE",
+                                        creative_type: ad.video_id ? "video" : "image",
+                                        image_hash: ad.image_hash || null,
+                                        video_id: ad.video_id || null,
+                                    };
+                                });
+                                if (!targetingSpec) return { name: adSetDef.name, existing_adset_id: adSetDef.existing_adset_id || adSetDef.name.split(":")[1], ads };
 
                                 const targetingSummary = [];
-                                if (targetingSpec.geo_locations?.countries?.length) {
+                                if (geoResolution?.length) {
+                                    targetingSummary.push(geoResolution.map(r => `${r.name}${r.region ? `, ${r.region}` : ""} (${r.type} ${r.key}${r.radius ? ` +${r.radius}mi` : ""})`).join("; "));
+                                } else if (targetingSpec.geo_locations?.countries?.length) {
                                     targetingSummary.push(`countries: ${targetingSpec.geo_locations.countries.join(", ")}`);
                                 } else if (targetingSpec.geo_locations?.cities?.length) {
                                     const c = targetingSpec.geo_locations.cities[0];
@@ -10010,7 +10257,7 @@ async function dispatchToolCall(name, args = {}) {
                                     ? "Advantage+ (auto)" : "Manual";
                                 targetingSummary.push(`placements: ${placementNote}`);
 
-                                adSetPreviews.push({
+                                return {
                                     name: adSetDef.name,
                                     optimization_goal: adSetDef.optimization_goal || "LINK_CLICKS",
                                     daily_budget: !cbo && adSetDef.daily_budget ? `$${adSetDef.daily_budget.toFixed(2)}` : "(CBO)",
@@ -10018,56 +10265,62 @@ async function dispatchToolCall(name, args = {}) {
                                     bid_strategy: adSetDef.bid_strategy || "(campaign default)",
                                     bid_amount: adSetDef.bid_amount ? `$${adSetDef.bid_amount.toFixed(2)}` : null,
                                     roas_control: adSetDef.roas_control || null,
+                                    is_dynamic_creative: !!adSetDef.is_dynamic_creative,
                                     targeting_summary: targetingSummary.join(". ") + ".",
+                                    ...(geoResolution ? { geo_resolution: geoResolution } : {}),
+                                    targeting_spec: targetingSpec,
+                                    ...(sac ? { special_ad_category_review: sac } : {}),
                                     start_time: adSetDef.start_time || null,
                                     end_time: adSetDef.end_time || null,
-                                    ads: (adSetDef.ads || []).map(ad => ({
-                                        name: ad.name,
-                                        headline: ad.headline,
-                                        cta: ad.cta || "LEARN_MORE",
-                                        creative_type: ad.video_id ? "video" : "image",
-                                        image_hash: ad.image_hash || null,
-                                        video_id: ad.video_id || null,
-                                    })),
-                                });
-                            }
+                                    ads,
+                                };
+                            });
 
                             result = {
                                 dry_run: true,
                                 message: "DRY RUN. Set confirm=true to create. All objects will be PAUSED.",
                                 account: acctInfo.name,
                                 page_id: pageId,
+                                page_source: pageSource,
                                 planned: {
                                     campaign: existingCampaignId
                                         ? { existing_id: existingCampaignId, note: "Adding ads to existing campaign" }
                                         : {
                                             name: args.campaign_name,
                                             objective: args.objective,
+                                            special_ad_categories: args.special_ad_categories || [],
+                                            ...(sacCountry ? { special_ad_category_country: sacCountry } : {}),
                                             daily_budget: args.daily_budget ? `$${args.daily_budget.toFixed(2)}` : undefined,
                                             lifetime_budget: args.lifetime_budget ? `$${args.lifetime_budget.toFixed(2)}` : undefined,
                                             cbo,
+                                            bid_strategy: cbo ? (args.campaign_bid_strategy || "LOWEST_COST_WITHOUT_CAP") : undefined,
                                         },
                                     ad_sets: adSetPreviews,
                                 },
                             };
-                            if (allWarnings.length) result.warnings = allWarnings;
+                            if (warnings.length) result.warnings = warnings;
                         } else {
                             // Confirmed — create everything
                             const config = {
                                 existing_campaign_id: existingCampaignId,
                                 campaign_name: args.campaign_name,
                                 objective: args.objective,
+                                special_ad_categories: args.special_ad_categories || [],
+                                special_ad_category_country: sacCountry,
                                 daily_budget: args.daily_budget,
                                 lifetime_budget: args.lifetime_budget,
                                 campaign_bid_strategy: args.campaign_bid_strategy,
                                 cbo,
                                 ad_sets: args.ad_sets,
+                                targeting_specs: plan.map(p => p.spec),
                             };
                             const res = await createMetaCampaignFull(accountId, pageId, config, acctInfo.instagram_account_id);
                             const totalAds = res.ad_sets.reduce((s, as) => s + as.ads.length, 0);
                             result = {
                                 success: true,
                                 account: acctInfo.name,
+                                page_id: pageId,
+                                page_source: pageSource,
                                 campaign_id: res.campaign.id,
                                 campaign_name: res.campaign.name,
                                 ad_sets_created: res.ad_sets.length,
@@ -10075,6 +10328,7 @@ async function dispatchToolCall(name, args = {}) {
                                 status: "All objects PAUSED. Review in Ads Manager before enabling.",
                                 details: res.ad_sets,
                             };
+                            if (warnings.length) result.warnings = warnings;
                         }
                     } catch (e) {
                         result = { error: e.message };

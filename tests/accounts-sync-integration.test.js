@@ -27,7 +27,7 @@ delete process.env.PORT;
 const initial = JSON.stringify({
   routine_rules: [],
   google: { '111': { name: 'Client A', budget: 1000, mcc: '111' } },
-  meta: {},
+  meta: { act_9: { name: 'Meta Client', budget: 500 } },
 }, null, 2) + '\n';
 
 let localFile = initial;
@@ -99,10 +99,24 @@ test('synced add_rule commits to GitHub', async () => {
   assert.equal(JSON.parse(gh.text).routine_rules[0].text, 'Ignore paused ads');
 });
 
+test('synced page_id update commits to GitHub so it can be set from chat', async () => {
+  const result = await manage({ action: 'update', platform: 'meta', id: 'act_9', page_id: '180157065330926', confirm: true });
+  assert.equal(result.success, true);
+  assert.equal(gh.puts.at(-1).message, 'accounts: Meta Client: set page_id 180157065330926 (meta act_9) [via Railway]');
+  assert.equal(JSON.parse(gh.text).meta.act_9.page_id, '180157065330926');
+});
+
+test('synced page_id update cannot smuggle a budget change', async () => {
+  const before = gh.puts.length;
+  const result = await manage({ action: 'update', platform: 'meta', id: 'act_9', page_id: '1', budget: 1, confirm: true });
+  assert.match(result.error, /budget/);
+  assert.equal(gh.puts.length, before);
+});
+
 test('synced server refuses budget changes without calling GitHub', async () => {
   const before = gh.puts.length;
   const result = await manage({ action: 'update', platform: 'google', id: '111', budget: 9999, confirm: true });
-  assert.match(result.error, /only manages notes and routine rules/);
+  assert.match(result.error, /only manages notes, routine rules and page_id/);
   assert.match(result.error, /budget/);
   assert.equal(gh.puts.length, before);
   assert.equal(JSON.parse(gh.text).google['111'].budget, 1000);

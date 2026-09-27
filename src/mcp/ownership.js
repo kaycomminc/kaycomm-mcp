@@ -11,7 +11,7 @@
 
 const META_TOOLS = new Set([
   'manage_meta', 'pause_campaign', 'enable_campaign', 'update_budget',
-  'duplicate_meta_campaign', 'upload_meta_media', 'create_meta_campaign',
+  'duplicate_meta_campaign', 'upload_meta_media', 'upload_meta_media_chunk', 'create_meta_campaign',
   'create_meta_subscription', 'update_meta_subscription',
   'delete_meta_subscription', 'create_meta_audience',
   'manage_meta_audience_users', 'manage_meta_ad_rules', 'update_meta_object',

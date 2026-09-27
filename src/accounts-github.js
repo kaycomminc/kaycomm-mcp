@@ -64,9 +64,10 @@ function createAccountsSync({ token, repo, branch = "main", filePath = "accounts
     };
 }
 
-// On the synced server, routines may only manage notes and routine rules.
+// On the synced server, routines may only manage notes, routine rules and
+// page_id (non-financial config needed to build Meta campaigns from chat).
 // Budgets, flights, inactive flags and add/remove still come from the Mac.
-const NOTE_FIELDS = new Set(["add_note", "clear_notes", "note_expires"]);
+const NOTE_FIELDS = new Set(["add_note", "clear_notes", "note_expires", "page_id"]);
 const UPDATE_IGNORED = new Set(["action", "platform", "id", "confirm", "idempotency_key"]);
 
 function syncedWriteAllowed(args) {

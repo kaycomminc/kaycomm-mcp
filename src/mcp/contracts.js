@@ -116,6 +116,8 @@ function annotateResult(result, context) {
     }
   }
   scan(result);
+  // Top-level string warnings are mirrored into _meta so clients see them without parsing tool data.
+  const warnings = Array.isArray(result.warnings) ? result.warnings.filter(w => typeof w === 'string') : [];
   let status = result.error ? 'error' : errors.length ? 'partial_success' : 'success';
   const asRows = value => Array.isArray(value) ? value : [];
   const rows = result.accounts || result.results || (result.google || result.meta ? [...asRows(result.google), ...asRows(result.meta), ...asRows(result.stackadapt), ...asRows(result.linkedin)] : null);
@@ -129,7 +131,7 @@ function annotateResult(result, context) {
   return { ...result, _meta: { status, request_id: context.requestId || randomUUID(),
     duration_ms: Date.now() - context.started, timezone: process.env.REPORT_TIMEZONE || 'America/New_York',
     build_sha: process.env.RAILWAY_GIT_COMMIT_SHA || process.env.BUILD_SHA || 'local',
-    ...(coverage ? { coverage } : {}), errors } };
+    ...(coverage ? { coverage } : {}), ...(warnings.length ? { warnings } : {}), errors } };
 }
 
 module.exports = { fault, decorateTool, validateArgs, uniqueName, writeIdentity, annotateResult, validDate };
