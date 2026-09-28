@@ -100,3 +100,10 @@ test('recovery reuses account-owned images without downloading or uploading agai
   assert.ok(result.uploaded_images.every(x=>x.reused));
   await assert.rejects(preparePlacementImages({creative_id:'901',variants:[{...vs[0],width:1000}],confirm:true},deps),/match requested dimensions/);
 });
+test('Instagram identity returned as a top-level creative field is carried into object_story_spec', () => {
+  const { instagram_user_id, ...oss } = source.object_story_spec;
+  const graphShape = { ...source, instagram_user_id: '17841464743844550', object_story_spec: oss };
+  const creative = placementCreative(graphShape, validateVariants(variants), ['feed', 'story']);
+  assert.deepEqual(creative.object_story_spec, { page_id: '1', instagram_user_id: '17841464743844550' });
+  assert.equal(creative.instagram_user_id, undefined);
+});

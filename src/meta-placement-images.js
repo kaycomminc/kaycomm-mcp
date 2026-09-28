@@ -58,6 +58,9 @@ function placementCreative(source, variants, hashes) {
   if (cta.value && Object.keys(cta.value).some(k => k !== 'link') || cta.value?.link && cta.value.link !== link.link) throw new Error('Specialized CTA destinations must be handled separately.');
   const identity = structuredClone(source.object_story_spec);
   delete identity.link_data;
+  // Graph returns the Instagram identity as a top-level creative field, not
+  // inside object_story_spec; without it Meta refuses to attach the creative.
+  if (source.instagram_user_id && !identity.instagram_user_id) identity.instagram_user_id = source.instagram_user_id;
   creative.object_story_spec = identity;
   delete creative.image_crops;
   const images = [{ hash: link.image_hash, adlabels: [{ name: 'placement_original' }] }];
@@ -91,7 +94,7 @@ function placementCreative(source, variants, hashes) {
 }
 async function preparePlacementImages(args, deps) {
   const variants = validateVariants(args.variants);
-  const source = await deps.get(args.creative_id, { fields: 'id,name,object_story_id,object_story_spec,asset_feed_spec,url_tags,degrees_of_freedom_spec,image_crops,authorization_category,applink_treatment,link_deep_link_url,product_set_id' });
+  const source = await deps.get(args.creative_id, { fields: 'id,name,object_story_id,object_story_spec,instagram_user_id,asset_feed_spec,url_tags,degrees_of_freedom_spec,image_crops,authorization_category,applink_treatment,link_deep_link_url,product_set_id' });
   const plan = placementCreative(source, variants, variants.map(v => v.image_hash || `<new image: ${v.label}>`));
   const hash = source.object_story_spec.link_data.image_hash;
   const library = await deps.get(`${deps.accountId}/adimages`, { hashes: JSON.stringify([...new Set([hash, ...variants.map(v => v.image_hash).filter(Boolean)])]), fields: 'hash,url,width,height' });
