@@ -4919,6 +4919,204 @@ async function fetchProductServingCampaignSpend(token, customerId, mccId, dateCl
     };
 }
 
+// ── PMax channel performance ─────────────────────────────────────────────────
+// From v23, segments.ad_network_type on a PERFORMANCE_MAX campaign returns the
+// channel the ad served on instead of a blanket MIXED. Verified live on v24:
+//   SEARCH, SEARCH_PARTNERS, CONTENT (= Display), YOUTUBE, GMAIL, DISCOVER, MAPS.
+// Shopping is not a network value — Shopping ads are SEARCH rows with
+// segments.ad_using_product_data = true. Product ads on other networks (e.g.
+// dynamic product ads on Display) stay on their network and show up in
+// format_split instead. MIXED / UNKNOWN rows are treated as unattributed.
+// metrics.view_through_conversions cannot be selected with ad_using_product_data
+// or ad_using_video, so it comes from a second network-only query.
+const PMAX_CHANNEL_MIN_API_VERSION = 23;
+const PMAX_NETWORK_CHANNELS = {
+    SEARCH:                "Search",
+    SEARCH_PARTNERS:       "Search Partners",
+    CONTENT:               "Display",
+    YOUTUBE:               "YouTube",
+    GMAIL:                 "Gmail",
+    DISCOVER:              "Discover",
+    MAPS:                  "Maps",
+    GOOGLE_TV:             "Google TV",
+    GOOGLE_OWNED_CHANNELS: "Google Owned Channels",
+};
+const PMAX_UNATTRIBUTED = "Unattributed";
+
+function pmaxChannelName(network, usingProductData) {
+    if (network === "SEARCH" && usingProductData) return "Shopping";
+    return PMAX_NETWORK_CHANNELS[network] || PMAX_UNATTRIBUTED;
+}
+
+const roundMoney = n => Math.round(n * 100) / 100;
+const sharePct = (part, whole) => whole > 0 ? ((part / whole) * 100).toFixed(1) + "%" : "0.0%";
+
+// Pure aggregation over the three raw GAQL result sets, exported for tests.
+//   channelRows:  campaign × network × product × video, no VTC
+//   vtcRows:      campaign × network, with view_through_conversions (null if that query failed)
+//   campaignRows: campaign totals, unsegmented
+function buildPmaxChannelReport(channelRows, vtcRows, campaignRows, campaignFilter) {
+    const keep = name => !campaignFilter || name.toLowerCase().includes(campaignFilter.toLowerCase());
+    const campaigns = new Map();
+    const getCamp = name => {
+        if (!campaigns.has(name)) campaigns.set(name, { total: emptyAgg(), channels: new Map(), networks: new Set() });
+        return campaigns.get(name);
+    };
+    const getChan = (camp, channel) => {
+        if (!camp.channels.has(channel)) {
+            camp.channels.set(channel, { agg: emptyAgg(), vtc: vtcRows ? 0 : null, format: { product_ads: 0, video_ads: 0, other: 0 } });
+        }
+        return camp.channels.get(channel);
+    };
+
+    for (const r of campaignRows) {
+        const name = r.campaign?.name;
+        if (!name || !keep(name)) continue;
+        addAgg(getCamp(name).total, r);
+    }
+
+    for (const r of channelRows) {
+        const name = r.campaign?.name;
+        if (!name || !keep(name)) continue;
+        const network = r.segments?.adNetworkType || "UNSPECIFIED";
+        const product = !!r.segments?.adUsingProductData;
+        const video   = !!r.segments?.adUsingVideo;
+        const camp = getCamp(name);
+        camp.networks.add(network);
+        const chan = getChan(camp, pmaxChannelName(network, product));
+        addAgg(chan.agg, r);
+        const cost = parseInt(r.metrics?.costMicros || 0) / 1_000_000;
+        if (product) chan.format.product_ads += cost;
+        else if (video) chan.format.video_ads += cost;
+        else chan.format.other += cost;
+    }
+
+    // SEARCH VTC can't be split between Search and Shopping, so it lands on Search.
+    for (const r of vtcRows || []) {
+        const name = r.campaign?.name;
+        if (!name || !keep(name)) continue;
+        const vtc = parseFloat(r.metrics?.viewThroughConversions || 0);
+        if (!vtc) continue;
+        getChan(getCamp(name), pmaxChannelName(r.segments?.adNetworkType, false)).vtc += vtc;
+    }
+
+    const shapeChannel = (channel, c, campSpend, campConv) => ({
+        channel,
+        ...shapeAgg(c.agg),
+        view_through_conversions: c.vtc == null ? null : roundMoney(c.vtc),
+        share_of_spend:       sharePct(c.agg.spend, campSpend),
+        share_of_conversions: sharePct(c.agg.conversions, campConv),
+        format_split: {
+            product_ads: roundMoney(c.format.product_ads),
+            video_ads:   roundMoney(c.format.video_ads),
+            other:       roundMoney(c.format.other),
+        },
+    });
+
+    // Gap = campaign spend the segmented query never returned. It is unattributed
+    // too, alongside any MIXED/UNKNOWN rows the query did return.
+    const reconcile = (campAgg, chanMap) => {
+        const chanSpend = [...chanMap.values()].reduce((s, c) => s + c.agg.spend, 0);
+        const chanConv  = [...chanMap.values()].reduce((s, c) => s + c.agg.conversions, 0);
+        const unknownRows = chanMap.get(PMAX_UNATTRIBUTED)?.agg.spend || 0;
+        const gap = campAgg.spend - chanSpend;
+        const unattributed = roundMoney(unknownRows + gap) || 0;   // || 0 drops float -0
+        const flagged = Math.abs(unattributed) > Math.max(1, campAgg.spend * 0.005);
+        return {
+            campaign_spend:            roundMoney(campAgg.spend),
+            sum_of_channels_spend:     roundMoney(chanSpend),
+            difference:                roundMoney(gap),
+            unknown_channel_spend:     roundMoney(unknownRows),
+            total_unattributed_spend:  roundMoney(unattributed),
+            unattributed_share:        sharePct(unattributed, campAgg.spend),
+            campaign_conversions:      roundMoney(campAgg.conversions),
+            sum_of_channels_conversions: roundMoney(chanConv),
+            flagged,
+        };
+    };
+
+    const accountTotal = emptyAgg();
+    const accountChannels = new Map();
+    const campaignOut = [];
+    for (const [name, camp] of campaigns) {
+        if (camp.total.spend === 0 && camp.channels.size === 0) continue;
+        mergeAgg(accountTotal, camp.total);
+        for (const [channel, c] of camp.channels) {
+            if (!accountChannels.has(channel)) {
+                accountChannels.set(channel, { agg: emptyAgg(), vtc: vtcRows ? 0 : null, format: { product_ads: 0, video_ads: 0, other: 0 } });
+            }
+            const a = accountChannels.get(channel);
+            mergeAgg(a.agg, c.agg);
+            if (a.vtc != null) a.vtc += c.vtc || 0;
+            for (const k of Object.keys(a.format)) a.format[k] += c.format[k];
+        }
+        campaignOut.push({
+            campaign: name,
+            totals: shapeAgg(camp.total),
+            channels: [...camp.channels.entries()]
+                .sort((a, b) => b[1].agg.spend - a[1].agg.spend)
+                .map(([ch, c]) => shapeChannel(ch, c, camp.total.spend, camp.total.conversions)),
+            reconciliation: reconcile(camp.total, camp.channels),
+            _networks: camp.networks,
+        });
+    }
+    campaignOut.sort((a, b) => b.totals.spend - a.totals.spend);
+
+    const allNetworks = new Set(campaignOut.flatMap(c => [...c._networks]));
+    for (const c of campaignOut) delete c._networks;
+
+    const accountRollup = [...accountChannels.entries()]
+        .sort((a, b) => b[1].agg.spend - a[1].agg.spend)
+        .map(([ch, c]) => shapeChannel(ch, c, accountTotal.spend, accountTotal.conversions));
+
+    const display = accountRollup.find(c => c.channel === "Display");
+    const display_summary = display ? {
+        spend:                    display.spend,
+        conversions:              display.conversions,
+        conv_value:               display.conv_value,
+        view_through_conversions: display.view_through_conversions,
+        cpa:                      display.cpa,
+        roas:                     display.roas,
+        share_of_spend:           display.share_of_spend,
+        share_of_conversions:     display.share_of_conversions,
+        product_ad_spend:         display.format_split.product_ads,
+    } : { spend: 0, conversions: 0, conv_value: 0, roas: null, share_of_spend: "0.0%", share_of_conversions: "0.0%", note: "No Display (CONTENT) spend in this period." };
+
+    const unattributedOnly = allNetworks.size > 0 && [...allNetworks].every(n => !PMAX_NETWORK_CHANNELS[n]);
+
+    return {
+        campaigns: campaignOut,
+        account_rollup: { totals: shapeAgg(accountTotal), channels: accountRollup },
+        display_summary,
+        reconciliation: reconcile(accountTotal, accountChannels),
+        unattributed_only: unattributedOnly,
+        networks_seen: [...allNetworks].sort(),
+    };
+}
+
+async function fetchPmaxChannelPerformance(token, customerId, mccId, dateClause, campaignFilter) {
+    const where = `WHERE campaign.advertising_channel_type = 'PERFORMANCE_MAX' AND segments.date ${dateClause}`;
+    const [channelRows, campaignRows] = await Promise.all([
+        googleSearch(token, customerId, mccId, `
+            SELECT campaign.name, segments.ad_network_type,
+                   segments.ad_using_product_data, segments.ad_using_video,
+                   metrics.cost_micros, metrics.impressions, metrics.clicks,
+                   metrics.conversions, metrics.conversions_value
+            FROM campaign ${where}`),
+        googleSearch(token, customerId, mccId, `
+            SELECT campaign.name, metrics.cost_micros, metrics.impressions, metrics.clicks,
+                   metrics.conversions, metrics.conversions_value
+            FROM campaign ${where}`),
+    ]);
+    let vtcRows = null, vtcError = null;
+    try {
+        vtcRows = await googleSearch(token, customerId, mccId, `
+            SELECT campaign.name, segments.ad_network_type, metrics.view_through_conversions
+            FROM campaign ${where}`);
+    } catch (e) { vtcError = e.message; }
+    return { ...buildPmaxChannelReport(channelRows, vtcRows, campaignRows, campaignFilter), vtcError };
+}
+
 // ── PMax listing groups (product partitioning inside an asset group) ─────────
 // Structure lives on asset_group_listing_group_filter; metrics are only exposed
 // through asset_group_product_group_view, which joins back on the filter's
@@ -6418,6 +6616,29 @@ function makeServer() {
                     end_date:       { type: "string", description: "End date YYYY-MM-DD (only with CUSTOM)" },
                     include_assets: { type: "boolean", description: "Also return per-asset serving status (primary_status, policy approval) for enabled assets. Performance labels (BEST/GOOD/LOW) are no longer available from the API for PMax asset groups." },
                     top_n:          { type: "integer", description: "Max asset groups to return, sorted by spend descending (default 50, max 500)" },
+                },
+                required: ["account_name"],
+            },
+        },
+        {
+            name: "get_pmax_channel_performance",
+            description: "Performance Max performance broken down by channel — Search, Shopping, Search Partners, Display, YouTube, Gmail, Discover, Maps — per campaign plus an account-level rollup across all PMax campaigns. " +
+                "Returns spend, impressions, clicks, CTR, avg CPC, conversions, conv value, view-through conversions, CPA, ROAS, and each channel's share of campaign spend and conversions. " +
+                "Shopping = Search-network ads using product data; product ads on other networks stay on that network (see format_split). " +
+                "Includes a reconciliation block (sum of channels vs campaign spend, unattributed/MIXED spend flagged) and a display_summary for a quick read on whether Display earns its spend. " +
+                "Requires Google Ads API v23+.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    account_name:  { type: "string", description: "Client name (partial match ok)" },
+                    campaign_name: { type: "string", description: "PMax campaign name filter (partial match ok). Omit for all PMax campaigns." },
+                    date_range: {
+                        type: "string",
+                        description: "LAST_90_DAYS (default), THIS_MONTH, LAST_7_DAYS, LAST_30_DAYS, LAST_MONTH, YEAR_TO_DATE, or CUSTOM (requires start_date + end_date)",
+                        enum: ["THIS_MONTH", "LAST_7_DAYS", "LAST_30_DAYS", "LAST_90_DAYS", "LAST_MONTH", "YEAR_TO_DATE", "CUSTOM"],
+                    },
+                    start_date: { type: "string", description: "Start date YYYY-MM-DD (only with CUSTOM)" },
+                    end_date:   { type: "string", description: "End date YYYY-MM-DD (only with CUSTOM)" },
                 },
                 required: ["account_name"],
             },
@@ -11113,6 +11334,60 @@ async function dispatchToolCall(name, args = {}) {
             }
         }
 
+    } else if (name === "get_pmax_channel_performance") {
+        const search    = (args.account_name || "").toLowerCase();
+        const dateRange = args.date_range || "LAST_90_DAYS";
+        const apiVersion = parseInt(GOOGLE_API_VERSION.replace(/^v/, ""), 10);
+        const match     = Object.entries(GOOGLE_ACCOUNTS).find(([, i]) => i.name.toLowerCase().includes(search));
+        if (!match) {
+            result = { error: `No Google account found matching '${args.account_name}'` };
+        } else if (apiVersion < PMAX_CHANNEL_MIN_API_VERSION) {
+            result = { error: `PMax channel reporting needs Google Ads API v${PMAX_CHANNEL_MIN_API_VERSION}+; this server is pinned to ${GOOGLE_API_VERSION}, which reports PMax as MIXED. Bump GOOGLE_API_VERSION.` };
+        } else if (dateRange === "CUSTOM" && !(args.start_date && args.end_date)) {
+            result = { error: "date_range CUSTOM requires both start_date and end_date (YYYY-MM-DD)." };
+        } else {
+            const [cid, info] = match;
+            const { token, error: authErr } = await getGoogleAccessToken(cid);
+            if (authErr) { result = { error: `Auth: ${authErr}` }; }
+            else {
+                try {
+                    const dateClause = resolveGaqlDateClause(dateRange, args.start_date, args.end_date);
+                    const { vtcError, unattributed_only, ...report } =
+                        await fetchPmaxChannelPerformance(token, cid, info.mcc, dateClause, args.campaign_name);
+                    if (unattributed_only && report.account_rollup.totals.spend > 0) {
+                        result = { error: `Google Ads API ${GOOGLE_API_VERSION} returned only MIXED/unknown networks for PMax in '${info.name}' — channel-level breakdown is not available for this account/period.` };
+                    } else {
+                        const warnings = [];
+                        if (vtcError) warnings.push(`View-through conversions unavailable: ${vtcError}`);
+                        if (report.reconciliation.flagged) {
+                            warnings.push(`$${report.reconciliation.total_unattributed_spend} (${report.reconciliation.unattributed_share}) of PMax spend could not be attributed to a channel.`);
+                        }
+                        result = {
+                            account:    info.name,
+                            date_range: dateRange,
+                            date_clause: dateClause,
+                            ...(args.campaign_name ? { campaign_filter: args.campaign_name } : {}),
+                            display_summary: report.display_summary,
+                            account_rollup:  report.account_rollup,
+                            campaigns:       report.campaigns,
+                            reconciliation: {
+                                ...report.reconciliation,
+                                networks_seen: report.networks_seen,
+                                note: "campaign_spend is the unsegmented PMax campaign total (ties to get_campaign_performance). " +
+                                      "total_unattributed_spend = MIXED/UNKNOWN network rows + any spend the channel-segmented query did not return. " +
+                                      "Flagged when it exceeds $1 or 0.5% of campaign spend.",
+                            },
+                            channel_mapping: "Channel comes from segments.ad_network_type (CONTENT = Display). Shopping = SEARCH rows with ad_using_product_data; " +
+                                             "product ads on Display/YouTube/Gmail/etc. stay on that channel and appear in format_split.product_ads. " +
+                                             "Search view-through conversions include Shopping (the API cannot split them).",
+                            ...(warnings.length ? { warnings } : {}),
+                        };
+                        if (!report.campaigns.length) result.note = "No PMax campaigns with data in this range" + (args.campaign_name ? ` matching '${args.campaign_name}'.` : ".");
+                    }
+                } catch (e) { result = { error: e.message }; }
+            }
+        }
+
     } else if (name === "get_shopping_performance") {
         const search    = (args.account_name || "").toLowerCase();
         const dateRange = args.date_range || "LAST_30_DAYS";
@@ -12441,6 +12716,7 @@ module.exports = {
     getPacingLabel, getFlightPacing, buildDailyBudgetRec, getDateInfo, getEffectiveBudget, pctChange,
     // Exported for tests
     clampTopN, shapeAgg, emptyAgg, addAgg, mergeAgg, listingCaseValueLabel, SHOPPING_GROUP_DIMENSIONS,
+    buildPmaxChannelReport, pmaxChannelName,
     matchByName, skippedRow, partitionSkipped, reportingPeriod, selectDetailAccounts, fetchMetaDailyBudgets,
     resolveAccount, buildAccountContext, addDays,
     collectPolicyViolations, googleAdsError, createGoogleCampaignFull, addKeywordsToAdGroup,

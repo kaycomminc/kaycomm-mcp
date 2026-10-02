@@ -60,6 +60,50 @@ Two field-naming traps, both verified against the v24 resource definitions:
 - Product type is levelled (`product_type_l1`…`l5`); plain `product_type` is not
   a field. `group_by: product_type` groups on level 1.
 
+### `get_pmax_channel_performance`
+
+Performance Max broken down by channel, per campaign and rolled up across all
+PMax campaigns in the account. Built for questions like "is Display driving
+conversions before we turn it off?"
+
+| Param | Notes |
+| --- | --- |
+| `account_name` | required, partial match |
+| `campaign_name` | optional, case-insensitive substring |
+| `date_range` | `LAST_90_DAYS` (default), `THIS_MONTH`, `LAST_7_DAYS`, `LAST_30_DAYS`, `LAST_MONTH`, `YEAR_TO_DATE`, `CUSTOM` |
+| `start_date` / `end_date` | required with `CUSTOM`, `YYYY-MM-DD` |
+
+Each channel row returns spend, impressions, clicks, CTR, avg CPC, conversions,
+conv value, view-through conversions, CPA, ROAS, share of campaign spend and
+conversions, and a `format_split` (product / video / other spend). Alongside:
+`display_summary` (Display at a glance), `account_rollup`, and `reconciliation`.
+
+**How channels map (verified live on v24).** Needs API v23+; earlier versions
+return `MIXED` for every PMax row, and the tool errors rather than returning that.
+
+| `segments.ad_network_type` | Channel |
+| --- | --- |
+| `SEARCH` + `ad_using_product_data = true` | Shopping |
+| `SEARCH` | Search |
+| `SEARCH_PARTNERS` | Search Partners |
+| `CONTENT` | Display |
+| `YOUTUBE` / `GMAIL` / `DISCOVER` / `MAPS` / `GOOGLE_TV` | same name |
+| `MIXED` / `UNKNOWN` / anything new | Unattributed |
+
+Shopping is not a network value. Product ads served elsewhere (dynamic product
+ads on Display, Gmail, YouTube) stay on that network and show in
+`format_split.product_ads`.
+
+**Two queries, not one.** `metrics.view_through_conversions` is prohibited
+alongside `ad_using_product_data` / `ad_using_video`, so VTCs come from a second,
+network-only query. Search VTCs therefore include Shopping. If that query fails
+the tool still returns, with `view_through_conversions: null` and a warning.
+
+**Reconciliation** compares the sum of channels to the unsegmented PMax campaign
+spend (which ties to `get_campaign_performance`). `total_unattributed_spend` is
+MIXED/UNKNOWN rows plus any spend the segmented query didn't return; it is
+flagged (and surfaced in `_meta.warnings`) above $1 or 0.5% of spend.
+
 ### `get_pmax_listing_groups`
 
 The listing group (product partition) tree per Performance Max asset group —

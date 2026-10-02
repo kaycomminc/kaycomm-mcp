@@ -251,5 +251,9 @@ then just leave the file.)
 - Retiring one morning monitor: after this pass Railway = pacing email,
   local routine = actions/state brief; revisit after a week.
 
+- `get_pmax_channel_performance` follow-ups (tool shipped 2026-10-02):
+  asset-group-level channel split (`asset_group` resource supports
+  `ad_network_type` from v23); `compare_periods` support for channel shifts.
+
 ## Final report
 List each task: done / skipped (why), commit hash, verification output summary.
