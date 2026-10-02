@@ -60,6 +60,12 @@ global.fetch = async (input, options = {}) => {
   if (method === 'GET') {
     const id = url.pathname.split('/').filter(Boolean).at(-1);
     if (id === 'adcreatives') return response({data:[]});
+    // Placement video fixtures: 904 is a single-video creative; 905 (4:5) is in
+    // the ad account library, 906 (9:16) is only readable by ID.
+    if (id === 'advideos') return response({ data: [{ id: '905' }] });
+    if (id === 'adimages') return response({ data: [{ hash: 'a'.repeat(32) }, { hash: 'b'.repeat(32) }] });
+    if (id === '904') return response({ id, account_id: 'act_a', name: 'Fixture video', url_tags: 'utm_source=facebook', object_story_spec: { page_id: '1', video_data: { video_id: '906', title: 'Apply', message: 'Body  text ', image_hash: 'a'.repeat(32), call_to_action: { type: 'APPLY_NOW', value: { link: 'https://example.com/jobs' } } } } });
+    if (id === '905' || id === '906') return response({ id, status: { video_status: 'ready' }, format: [{ filter: 'native', width: 1080, height: id === '905' ? 1350 : 1920 }], thumbnails: { data: [] } });
     if (id === '901' || id === '902') return response({ id, account_id: 'act_a', name: 'Fixture image', object_story_spec: { page_id: '1', link_data: { image_hash: 'fixture', link: 'https://example.com', message: 'Original' } }, degrees_of_freedom_spec: { creative_features_spec: { image_uncrop: { enroll_status: id === '902' ? 'OPT_IN' : 'OPT_OUT' } } } });
     // Ads for retag_meta_ad: one with a clean destination, one already carrying inline UTMs.
     if (id === 'synthetic_ad' || id === 'synthetic_ad_inline') return response({ id, account_id: 'act_a', name: 'Fixture ad', status: 'ACTIVE', effective_status: 'ACTIVE', creative: { id: id === 'synthetic_ad_inline' ? '903' : '901' } });
@@ -156,9 +162,9 @@ async function flushHttp() {
   await new Promise(resolve => setImmediate(resolve));
 }
 
-test('registered catalog contains 82 tools with annotations and output schemas', async () => {
+test('registered catalog contains 83 tools with annotations and output schemas', async () => {
   const listed = await listHandler({ method: 'tools/list', params: {} }, {});
-  assert.equal(listed.tools.length, 82);
+  assert.equal(listed.tools.length, 83);
   for (const tool of listed.tools) {
     assert.ok(tool.annotations, `${tool.name} is missing annotations`);
     assert.equal(typeof tool.annotations.readOnlyHint, 'boolean');
@@ -425,4 +431,45 @@ test('retag rejects an ad outside the selected account before any write', async 
   });
   assert.equal(value._meta.errors[0].code, 'TARGET_ACCOUNT_MISMATCH');
   assert.equal(fetches.filter(f => f.method === 'POST').length, 0);
+});
+
+const placementVideoArgs = { account_name: 'Audit Client A', creative_id: '904', variants: [
+  { video_id: '905', placements: ['facebook_feed', 'instagram_feed'], image_hash: 'b'.repeat(32) },
+  { video_id: '906', placements: ['instagram_stories', 'instagram_reels'] },
+] };
+test('placement videos dry run through the tool handler reports dimensions and makes no writes', async () => {
+  resetFetches();
+  const result = await invoke('prepare_meta_placement_videos', placementVideoArgs);
+  assert.equal(result.value.dry_run, true);
+  assert.equal(result.value._meta.status, 'success');
+  assert.equal(result.value.creative.asset_feed_spec.bodies[0].text, 'Body  text ');
+  assert.deepEqual(result.value.videos.map(v => [v.video_id, v.aspect_ratio, v.library]), [['906', '9:16', 'business_or_shared'], ['905', '4:5', 'ad_account']]);
+  assert.ok(result.value._meta.warnings.some(w => /906 isn't in this ad account's video library/.test(w)));
+  assert.equal(fetches.filter(x => x.method === 'POST').length, 0);
+});
+test('placement videos reject an unknown placement at the schema boundary', async () => {
+  const result = await invoke('prepare_meta_placement_videos', { ...placementVideoArgs, variants: [{ video_id: '905', placements: ['facebook_right_column'] }] });
+  assert.equal(result.value._meta.errors[0].code, 'INVALID_ARGUMENT');
+});
+test('placement videos confirm creates one unattached creative; retry with the same key is blocked', async () => {
+  resetFetches();
+  const args = { ...placementVideoArgs, confirm: true, idempotency_key: 'fixture-placement-videos' };
+  const result = await invoke('prepare_meta_placement_videos', args);
+  assert.equal(result.value.creative_id, '902');
+  assert.equal(result.value.live_ads_changed, false);
+  const posts = fetches.filter(x => x.method === 'POST');
+  assert.deepEqual(posts.map(p => p.path.split('/').slice(-2).join('/')), ['act_a/adcreatives']);
+  assert.deepEqual(posts[0].body.asset_feed_spec.asset_customization_rules.at(-1), { priority: 3, video_label: { name: 'placement_video_default' }, customization_spec: {} });
+  const retry = await invoke('prepare_meta_placement_videos', args);
+  assert.equal(retry.value._meta.errors[0].code, 'DUPLICATE_WRITE_BLOCKED');
+  assert.equal(fetches.filter(x => x.method === 'POST').length, 1);
+});
+test('update_meta_object creative swap dry run warns when the ad is ACTIVE', async () => {
+  resetFetches();
+  const result = await invoke('update_meta_object', { account_name: 'Audit Client A', object_id: 'synthetic_ad', level: 'ad', updates: { creative: { creative_id: '902' } } });
+  assert.equal(result.value.dry_run, true);
+  assert.equal(result.value.creative_swap.current_creative_id, '901');
+  assert.equal(result.value.creative_swap.new_creative_id, '902');
+  assert.match(result.value._meta.warnings[0], /ACTIVE.*learning phase/);
+  assert.equal(fetches.filter(x => x.method === 'POST').length, 0);
 });

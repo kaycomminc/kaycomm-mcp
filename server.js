@@ -1315,6 +1315,25 @@ async function metaGetAll(path, extraParams = {}) {
 
 function metaActId(id) { return id.startsWith("act_") ? id : `act_${id}`; }
 
+// Upload a video's auto-generated thumbnail to the account's image library and
+// return its hash (null when Meta has no thumbnail). The CDN URL is signed, so
+// Meta's adimages endpoint can't fetch it server-to-server — download it here.
+async function uploadMetaVideoThumbnail(accountId, videoId) {
+    const thumbRes = await metaGet(videoId, { fields: "thumbnails{uri,is_preferred}" });
+    const thumbs = thumbRes.thumbnails?.data || [];
+    const thumbUrl = (thumbs.find(t => t.is_preferred) || thumbs[0])?.uri;
+    if (!thumbUrl) return null;
+    const imgResp = await fetchFn(thumbUrl);
+    if (!imgResp.ok) throw new Error(`Thumbnail download failed (${imgResp.status})`);
+    const formData = new FormData();
+    formData.append("access_token", META_ACCESS_TOKEN);
+    formData.append("filename", new Blob([Buffer.from(await imgResp.arrayBuffer())]), "thumbnail.jpg");
+    const uploadResp = await fetchFn(`https://graph.facebook.com/${META_API_VERSION}/${metaActId(accountId)}/adimages`, { method: "POST", body: formData });
+    const uploadData = await uploadResp.json();
+    if (uploadData.error) throw new Error(uploadData.error.message);
+    return (uploadData.images ? Object.values(uploadData.images)[0] : uploadData)?.hash || null;
+}
+
 // Resolve a get_meta_ad_performance date_range preset to concrete since/until dates.
 function metaAdPerfDateRange(dateRange, customStart, customEnd) {
     if (dateRange === "CUSTOM") return { startDate: customStart, endDate: customEnd };
@@ -1778,33 +1797,33 @@ async function createMetaCampaignFull(accountId, pageId, config, instagramAccoun
                 // asset_feed_spec; object_story_spec only carries identity.
                 assetFeedSpec = metaBuild.buildAssetFeedSpec(adDef, { dynamicCreative: !!adSetDef.is_dynamic_creative });
                 storySpec = { page_id: pageId };
+            } else if (adDef.placement_videos?.length) {
+                const placementVideos = require('./src/meta-placement-videos');
+                const { variants } = placementVideos.validateVideoVariants(adDef.placement_videos);
+                const thumbs = new Map();
+                const thumbFor = async (videoId, explicit) => {
+                    if (explicit) return { thumbnail_hash: explicit };
+                    if (!thumbs.has(videoId)) {
+                        let hash = null;
+                        try { hash = await uploadMetaVideoThumbnail(accountId, videoId); }
+                        catch (e) { results.debug.push({ step: "thumbnail_auto", video_id: videoId, error: e.message }); }
+                        thumbs.set(videoId, hash);
+                    }
+                    return thumbs.get(videoId) ? { thumbnail_hash: thumbs.get(videoId) } : {};
+                };
+                const withThumbs = [];
+                for (const v of variants) withThumbs.push({ ...v, ...await thumbFor(v.video_id, v.image_hash) });
+                assetFeedSpec = placementVideos.buildPlacementVideoFeedSpec({
+                    defaultVideo: { video_id: adDef.video_id, ...await thumbFor(adDef.video_id, adDef.image_hash) },
+                    variants: withThumbs,
+                    copy: { body: adDef.primary_text, title: adDef.headline, description: adDef.description || "", link: adDef.url, cta: adDef.cta || "LEARN_MORE" },
+                });
+                storySpec = { page_id: pageId };
             } else if (adDef.video_id) {
                 let videoThumbHash = adDef.image_hash || null;
                 if (!videoThumbHash) {
                     try {
-                        const thumbRes = await metaGet(adDef.video_id, { fields: "thumbnails" });
-                        const thumbUrl = thumbRes.thumbnails?.data?.[0]?.uri;
-                        if (thumbUrl) {
-                            // Download thumbnail bytes ourselves — the CDN URL is signed
-                            // and Meta's adimages endpoint can't fetch it server-to-server.
-                            const imgResp = await fetchFn(thumbUrl);
-                            if (imgResp.ok) {
-                                const imgBuf = Buffer.from(await imgResp.arrayBuffer());
-                                const blob = new Blob([imgBuf]);
-                                const formData = new FormData();
-                                formData.append("access_token", META_ACCESS_TOKEN);
-                                formData.append("filename", blob, "thumbnail.jpg");
-                                const uploadResp = await fetchFn(
-                                    `https://graph.facebook.com/${META_API_VERSION}/${accountId}/adimages`,
-                                    { method: "POST", body: formData }
-                                );
-                                const uploadData = await uploadResp.json();
-                                if (!uploadData.error) {
-                                    const imgData = uploadData.images ? Object.values(uploadData.images)[0] : uploadData;
-                                    videoThumbHash = imgData.hash;
-                                }
-                            }
-                        }
+                        videoThumbHash = await uploadMetaVideoThumbnail(accountId, adDef.video_id);
                     } catch (e) {
                         results.debug.push({ step: "thumbnail_auto", video_id: adDef.video_id, error: e.message });
                     }
@@ -6535,7 +6554,8 @@ function makeServer() {
         {
             name: "list_meta_media",
             description: "List images and videos uploaded to a Meta ad account's Media Library. " +
-                "Use to find image hashes or video IDs needed for create_meta_campaign.",
+                "Use to find image hashes or video IDs needed for create_meta_campaign. Videos include width, height and aspect_ratio (e.g. '4:5', '9:16'). " +
+                "Videos uploaded to the Business Manager library or another ad account may be usable but not listed here; prepare_meta_placement_videos looks those up by ID.",
             inputSchema: {
                 type: "object",
                 properties: {
@@ -6754,6 +6774,20 @@ function makeServer() {
                                                     ad_formats:   { type: "array", items: { type: "string", enum: metaBuild.AD_FORMATS }, description: "Default: SINGLE_IMAGE for images, SINGLE_VIDEO for videos, AUTOMATIC_FORMAT for both." },
                                                 },
                                             },
+                                            placement_videos: {
+                                                type: "array", minItems: 1, maxItems: 8,
+                                                description: "Placement-customized video: show a different video per placement group (e.g. 4:5 for feeds, 9:16 for Stories/Reels). " +
+                                                    "Requires video_id (used for any placement not listed here), primary_text, headline and url; copy is sent byte-for-byte. Each placement may appear once. Not allowed with is_dynamic_creative, asset_feed_spec, carousel_cards, object_story_id or creative_id.",
+                                                items: {
+                                                    type: "object",
+                                                    properties: {
+                                                        video_id:   { type: "string", pattern: "^[0-9]+$" },
+                                                        placements: { type: "array", minItems: 1, uniqueItems: true, items: { type: "string", enum: require('./src/meta-placement-videos').VIDEO_PLACEMENT_KEYS } },
+                                                        image_hash: { type: "string", description: "Optional thumbnail; defaults to the video's auto-generated thumbnail." },
+                                                    },
+                                                    required: ["video_id", "placements"],
+                                                },
+                                            },
                                             url_tags: { type: "string", description: "UTM query string appended to the destination URL, e.g. 'utm_source=facebook&utm_medium=paid_social&utm_campaign={{campaign.name}}&utm_content={{ad.name}}'. Falls back to the ad set's url_tags, then a default with {{campaign.name}}/{{adset.name}}/{{ad.name}}/{{placement}} macros." },
                                         },
                                         required: ["name"],
@@ -6788,6 +6822,28 @@ function makeServer() {
                         }, required: ["width", "height", "placements"]
                     } },
                     confirm: { type: "boolean" }
+                }, required: ["account_name", "creative_id", "variants"]
+            }
+        },
+        {
+            name: "prepare_meta_placement_videos",
+            description: "Prepare an unattached placement-customized VIDEO creative from a single-video creative: assign a different video to each group of placements (e.g. 4:5 for feeds, 9:16 for Stories/Reels). " +
+                "Copies the source's primary text, headline, description, CTA, link and url_tags byte-for-byte (over-length copy only warns). Placements no variant covers fall back to the source video via a default rule. " +
+                "Dry run by default: checks every video exists (ad account library, then direct lookup for Business Manager/shared videos), is ready (not processing), and that no placement is assigned twice; reports each video's dimensions/aspect ratio. " +
+                "confirm=true uploads auto-generated thumbnails where no image_hash is given, then creates the creative. Never attaches it — preview with preview_meta_ad, then attach with update_meta_object (level=ad, updates: {creative: {creative_id}}).",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    account_name: { type: "string", description: "Meta account name (partial match ok)" },
+                    creative_id: { type: "string", pattern: "^[0-9]+$", description: "Source single-video creative to copy text, CTA, link and url_tags from" },
+                    variants: { type: "array", minItems: 1, maxItems: 8, items: {
+                        type: "object", properties: {
+                            video_id: { type: "string", pattern: "^[0-9]+$", description: "Video to show in these placements" },
+                            placements: { type: "array", minItems: 1, uniqueItems: true, items: { type: "string", enum: require('./src/meta-placement-videos').VIDEO_PLACEMENT_KEYS } },
+                            image_hash: { type: "string", pattern: "^[a-fA-F0-9]{32}$", description: "Optional thumbnail image hash from this account. If omitted, the video's auto-generated thumbnail is uploaded on confirm (the source video reuses the source creative's thumbnail)." },
+                        }, required: ["video_id", "placements"]
+                    } },
+                    confirm: { type: "boolean", description: "Set true to upload thumbnails and create the unattached creative. Omit for dry run." }
                 }, required: ["account_name", "creative_id", "variants"]
             }
         },
@@ -7154,7 +7210,8 @@ function makeServer() {
             description: "Update properties on a Meta campaign, ad set, or ad — name, bid strategy, schedule, targeting, status, and more. " +
                 "Supports any writable field on campaigns (name, status, daily_budget, lifetime_budget, bid_strategy, spend_cap), " +
                 "ad sets (name, status, daily_budget, lifetime_budget, bid_amount, bid_strategy, targeting, start_time, end_time, optimization_goal, billing_event, pacing_type), " +
-                "and ads (name, status, creative). Dry run by default — set confirm=true to apply.",
+                "and ads (name, status, creative). To swap an ad's creative: level='ad', updates: {creative: {creative_id: '<id>'}} — the dry run shows the current vs new creative and warns if the ad is ACTIVE (a swap resets learning). " +
+                "Dry run by default — set confirm=true to apply.",
             inputSchema: {
                 type: "object",
                 properties: {
@@ -9846,11 +9903,13 @@ async function dispatchToolCall(name, args = {}) {
                 }
                 if (mediaType === "video" || mediaType === "both") {
                     const videos = await metaGetAll(`${accountId}/advideos`, {
-                        fields: "id,title,length,picture,created_time",
+                        fields: "id,title,length,picture,created_time,format{filter,width,height}",
                     });
-                    out.videos = nameFilter
+                    const { videoDimensions } = require('./src/meta-placement-videos');
+                    out.videos = (nameFilter
                         ? videos.filter(v => (v.title || "").toLowerCase().includes(nameFilter))
-                        : videos;
+                        : videos
+                    ).map(({ format, ...v }) => ({ ...v, ...videoDimensions({ format }) }));
                 }
                 result = out;
             } catch (e) {
@@ -10185,6 +10244,15 @@ async function dispatchToolCall(name, args = {}) {
                             const creativeCheck = metaBuild.validateAdSetCreatives(adSetDef, i);
                             validationErrors.push(...creativeCheck.errors);
                             warnings.push(...creativeCheck.warnings);
+                            for (const [j, ad] of (adSetDef.ads || []).entries()) {
+                                if (!ad.placement_videos?.length || !ad.video_id) continue;
+                                const placementVideos = require('./src/meta-placement-videos');
+                                const adWhere = `${where} ads[${j}] '${ad.name}'`;
+                                const checked = await placementVideos.inspectVideos([ad.video_id, ...ad.placement_videos.map(v => v.video_id)], { accountId: metaActId(accountId), get: metaGet, getAll: metaGetAll });
+                                validationErrors.push(...checked.errors.map(e => `${adWhere}: ${e}`));
+                                warnings.push(...checked.warnings.map(w => `${adWhere}: ${w}`));
+                                warnings.push(...placementVideos.aspectWarnings(ad.placement_videos, checked.videos).map(w => `${adWhere}: ${w}`));
+                            }
                             if (adSetDef.existing_adset_id || adSetDef.name?.startsWith("existing:")) {
                                 plan.push({ spec: null, geo_resolution: null, sac: null });
                                 continue;
@@ -10210,6 +10278,21 @@ async function dispatchToolCall(name, args = {}) {
                             const adSetPreviews = args.ad_sets.map((adSetDef, i) => {
                                 const { spec: targetingSpec, geo_resolution: geoResolution, sac } = plan[i];
                                 const ads = (adSetDef.ads || []).map(ad => {
+                                    if (ad.placement_videos?.length) {
+                                        const placementVideos = require('./src/meta-placement-videos');
+                                        const { variants } = placementVideos.validateVideoVariants(ad.placement_videos);
+                                        const thumb = (videoId, hash) => ({ thumbnail_hash: hash || `<auto thumbnail of ${videoId}>` });
+                                        return {
+                                            name: ad.name,
+                                            creative_type: "placement_video",
+                                            asset_feed_spec: placementVideos.buildPlacementVideoFeedSpec({
+                                                defaultVideo: { video_id: ad.video_id, ...thumb(ad.video_id, ad.image_hash) },
+                                                variants: variants.map(v => ({ ...v, ...thumb(v.video_id, v.image_hash) })),
+                                                copy: { body: ad.primary_text, title: ad.headline, description: ad.description || "", link: ad.url, cta: ad.cta || "LEARN_MORE" },
+                                            }),
+                                            url_tags: ad.url_tags || adSetDef.url_tags || DEFAULT_META_URL_TAGS,
+                                        };
+                                    }
                                     if (ad.asset_feed_spec) {
                                         return {
                                             name: ad.name,
@@ -11246,6 +11329,18 @@ async function dispatchToolCall(name, args = {}) {
             result = { account: info.name, ...await preparePlacementImages(args, { accountId: metaActId(accountId), get: metaGet, post: metaPost, fetch: fetchFn }) };
         }
 
+    } else if (name === "prepare_meta_placement_videos") {
+        const { match, error } = resolveAccount(META_ACCOUNTS, args.account_name.toLowerCase(), { confirmed: args.confirm === true });
+        if (!match) result = { error };
+        else {
+            const [accountId, info] = match;
+            const { preparePlacementVideos } = require('./src/meta-placement-videos');
+            result = { account: info.name, ...await preparePlacementVideos(args, {
+                accountId: metaActId(accountId), get: metaGet, getAll: metaGetAll, post: metaPost,
+                uploadThumbnail: videoId => uploadMetaVideoThumbnail(accountId, videoId),
+            }) };
+        }
+
     } else if (name === "prepare_meta_image_enhancements") {
         const { match, error } = resolveAccount(META_ACCOUNTS, args.account_name.toLowerCase(), { confirmed: args.confirm === true });
         if (!match) result = { error };
@@ -12025,9 +12120,23 @@ async function dispatchToolCall(name, args = {}) {
                     body.bid_constraints = JSON.stringify({ roas_average_floor: Math.round(body.roas_control * 10000) });
                     delete body.roas_control;
                 }
+                // Creative swap: show what is being replaced and warn when it
+                // resets learning on a delivering ad.
+                let creativeSwap = null;
+                if (args.level === "ad" && updates.creative?.creative_id) {
+                    const ad = await metaGet(args.object_id, { fields: "id,name,status,effective_status,creative{id}" });
+                    creativeSwap = { ad_name: ad.name, status: ad.status, effective_status: ad.effective_status, current_creative_id: ad.creative?.id ?? null, new_creative_id: String(updates.creative.creative_id) };
+                    if (ad.status === "ACTIVE" || ad.effective_status === "ACTIVE") {
+                        creativeSwap.warning = "This ad is ACTIVE. Swapping its creative counts as a significant edit: the ad set re-enters the learning phase and accumulated delivery optimization is reset. Consider pausing first or swapping during a low-stakes window.";
+                    }
+                }
                 if (!confirm) {
                     const dryRun = { dry_run: true, message: "DRY RUN — set confirm=true to apply", account: info.name, object_id: args.object_id, level: args.level, updates: body };
                     if (budgetLines.length) dryRun.budget_confirmation = "BUDGET CHANGES (in dollars):\n" + budgetLines.join("\n");
+                    if (creativeSwap) {
+                        dryRun.creative_swap = creativeSwap;
+                        if (creativeSwap.warning) dryRun.warnings = [creativeSwap.warning];
+                    }
                     result = dryRun;
                 } else if (budgetLines.length && !args.budget_confirmed) {
                     result = { error: "BUDGET CHANGE REQUIRES CONFIRMATION. Set budget_confirmed=true in addition to confirm=true. Do not retry without budget_confirmed=true. Budget changes:\n" + budgetLines.join("\n"), code: "NEEDS_BUDGET_CONFIRMED" };
@@ -12036,6 +12145,7 @@ async function dispatchToolCall(name, args = {}) {
                         await metaPost(args.object_id, body);
                         result = { success: true, account: info.name, object_id: args.object_id, level: args.level, updated_fields: Object.keys(updates) };
                         if (budgetLines.length) result.budget_applied = budgetLines.join(", ");
+                        if (creativeSwap) result.creative_swap = creativeSwap;
                     } catch (e) { result = { error: e.message }; }
                 }
             }

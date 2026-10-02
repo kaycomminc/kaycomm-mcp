@@ -191,6 +191,16 @@ function validateAdSetCreatives(adSet, i) {
     ads.forEach((ad, j) => {
         const adWhere = `${where} ads[${j}] '${ad.name}'`;
         warnings.push(...copyLengthWarnings(ad, adWhere));
+        if (ad.placement_videos?.length) {
+            // Lazy: meta-placement-videos depends on this module.
+            const { validateVideoVariants } = require('./meta-placement-videos');
+            const conflicts = ['asset_feed_spec', 'carousel_cards', 'object_story_id', 'creative_id'].filter(k => ad[k] != null && !(Array.isArray(ad[k]) && !ad[k].length));
+            if (conflicts.length) errors.push(`${adWhere}: placement_videos can't be combined with ${conflicts.join(', ')}.`);
+            if (adSet.is_dynamic_creative) errors.push(`${adWhere}: placement_videos can't be used in a dynamic creative ad set.`);
+            if (!ad.video_id) errors.push(`${adWhere}: placement_videos needs video_id — the default video for placements not listed.`);
+            if (!ad.url) errors.push(`${adWhere}: placement_videos needs url.`);
+            errors.push(...validateVideoVariants(ad.placement_videos).errors.map(e => `${adWhere}: ${e}`));
+        }
         const afs = ad.asset_feed_spec;
         if (!afs) return;
         const conflicts = ['image_hash', 'video_id', 'carousel_cards', 'object_story_id', 'creative_id', 'primary_text', 'headline', 'description']

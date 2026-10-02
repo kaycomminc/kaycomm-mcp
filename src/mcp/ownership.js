@@ -15,7 +15,7 @@ const META_TOOLS = new Set([
   'create_meta_subscription', 'update_meta_subscription',
   'delete_meta_subscription', 'create_meta_audience',
   'manage_meta_audience_users', 'manage_meta_ad_rules', 'update_meta_object',
-  'manage_meta_leads', 'prepare_meta_image_enhancements', 'prepare_meta_placement_images',
+  'manage_meta_leads', 'prepare_meta_image_enhancements', 'prepare_meta_placement_images', 'prepare_meta_placement_videos',
   'retag_meta_ad',
 ]);
 
@@ -272,6 +272,10 @@ function invalidMetaUpdateShape(toolName, args) {
       }
     }
   }
+  // Meta takes a reusable creative as { creative: { creative_id } }. A bare
+  // creative_id would bypass the ownership check on that shape.
+  if (updates.creative_id !== undefined)
+    return resultError('INVALID_ARGUMENT', 'Use updates.creative = { creative_id } to swap an ad creative, not updates.creative_id.');
   for (const field of ['campaign_id', 'adset_id']) {
     if (updates[field] !== undefined && typeof updates[field] !== 'string' && typeof updates[field] !== 'number')
       return resultError('INVALID_ARGUMENT', `updates.${field} must be an ID.`);
@@ -286,7 +290,9 @@ function invalidMetaUpdateShape(toolName, args) {
 
 function metaChecks(name, args) {
   const checks = [];
-  if (name === 'prepare_meta_image_enhancements' || name === 'prepare_meta_placement_images') {
+  if (name === 'prepare_meta_image_enhancements' || name === 'prepare_meta_placement_images' || name === 'prepare_meta_placement_videos') {
+    // Video IDs are checked inside prepare_meta_placement_videos: Business
+    // Manager library videos are valid but never appear under act_X/advideos.
     addMetaCheck(checks, args.creative_id, 'adcreatives', 'Creative ID');
   } else if (name === 'retag_meta_ad') {
     // The source creative is read from the ad itself, so the ad is the only
