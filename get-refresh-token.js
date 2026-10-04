@@ -1,6 +1,12 @@
 const http = require("http");
 const { exec } = require("child_process");
 const querystring = require("querystring");
+const { loadLocalEnv, writeEnvVar } = require("./local-env");
+
+// Optional: env var name to save the token under in ./.env, e.g.
+//   node get-refresh-token.js GOOGLE_REFRESH_TOKEN_3
+const SAVE_AS = process.argv[2];
+loadLocalEnv();
 
 const CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
 const CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
@@ -60,10 +66,15 @@ const server = http.createServer(async (req, res) => {
 
     if (data.refresh_token) {
       console.log("\n=== SUCCESS ===");
-      console.log("Refresh token:", data.refresh_token);
-      console.log("\nAdd this as GOOGLE_REFRESH_TOKEN_2 in your environment.\n");
+      if (SAVE_AS) {
+        writeEnvVar(SAVE_AS, data.refresh_token);
+        console.log(`Saved refresh token to .env as ${SAVE_AS}.\n`);
+      } else {
+        console.log("Refresh token:", data.refresh_token);
+        console.log("\nAdd this as GOOGLE_REFRESH_TOKEN_N in your environment.\n");
+      }
       res.writeHead(200, { "Content-Type": "text/html" });
-      res.end("<h2>Success! Refresh token printed in terminal.</h2><p>You can close this tab.</p>");
+      res.end(`<h2>Success! Refresh token ${SAVE_AS ? "saved to .env" : "printed in terminal"}.</h2><p>You can close this tab.</p>`);
     } else {
       console.error("No refresh_token in response:", data);
       res.writeHead(200, { "Content-Type": "text/html" });

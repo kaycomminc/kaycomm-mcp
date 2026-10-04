@@ -189,6 +189,13 @@
           "expires": "2026-10-02"
         }
       ]
+    },
+    "4399982656": {
+      "name": "Contractor's Recycling",
+      "budget": 2000,
+      "refresh_token_env": "GOOGLE_REFRESH_TOKEN_3",
+      "health": false,
+      "mcc": "4399982656"
     }
   },
   "meta": {

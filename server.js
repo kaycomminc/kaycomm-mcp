@@ -35,6 +35,9 @@ const fetchFn = (url, options = {}) => {
 
 // ── Credentials — loaded from environment variables ───────────────────────────
 // Set these in Railway → Variables, and in ./.env for local scripts (see local-env.js)
+// Locally, fall back to ./.env for anything the Claude Desktop config doesn't set
+// (Desktop can rewrite its config on quit and drop newly added vars). No-op on Railway.
+require("./local-env").loadLocalEnv();
 const GOOGLE_DEVELOPER_TOKEN = process.env.GOOGLE_DEVELOPER_TOKEN;
 const GOOGLE_CLIENT_ID       = process.env.GOOGLE_CLIENT_ID;
 const GOOGLE_CLIENT_SECRET   = process.env.GOOGLE_CLIENT_SECRET;
@@ -9088,7 +9091,7 @@ async function dispatchToolCall(name, args = {}) {
         result = {};
 
         if (platform === "google" || platform === "both") {
-            const { token, error: authErr } = await getGoogleAccessToken(cid);
+            const { token, error: authErr } = await getGoogleAccessToken();
             if (authErr) { result.google_error = `Auth: ${authErr}`; }
             else {
                 try {
