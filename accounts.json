@@ -162,13 +162,6 @@
         "impression_share_floor": 60
       }
     },
-    "7539940999": {
-      "name": "Digital Practice Growth",
-      "budget": 1250,
-      "refresh_token_env": "GOOGLE_REFRESH_TOKEN_2",
-      "health": false,
-      "mcc": "7539940999"
-    },
     "7681141633": {
       "name": "PHQ",
       "budget": 765,
