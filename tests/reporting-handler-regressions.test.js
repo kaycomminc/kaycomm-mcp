@@ -82,3 +82,11 @@ test("a failed selected platform does not discard a successful platform row", as
     assert.equal(typeof google.error, "undefined");
     assert.ok(google.flight_spend >= 0);
 });
+
+test("budget overview authenticates each Google account instead of an undefined cid", async () => {
+    const overview = await handleToolCall("get_budget_overview", { platform: "google" });
+    assert.doesNotMatch(JSON.stringify(overview), /cid is not defined/);
+    assert.equal(overview.google_error, undefined);
+    assert.ok(Array.isArray(overview.google));
+    for (const row of overview.google) assert.doesNotMatch(row.error || "", /Auth:/);
+});
