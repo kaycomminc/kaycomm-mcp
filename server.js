@@ -9332,30 +9332,28 @@ async function dispatchToolCall(name, args = {}) {
         result = { google: [], meta: [] };
 
         if (platform === "google" || platform === "both") {
-            const { token, error: authErr } = await getGoogleAccessToken(cid);
-            if (authErr) { result.google_error = `Auth: ${authErr}`; }
-            else {
-                for (const [cid, info] of Object.entries(GOOGLE_ACCOUNTS)) {
-                    if (acctFilter && !info.name.toLowerCase().includes(acctFilter)) continue;
-                    try {
-                        const campaigns = await listGoogleCampaignsFull(token, cid, info.mcc);
-                        const filtered  = activeOnly ? campaigns.filter(c => c.status === "ENABLED") : campaigns;
-                        if (filtered.length) {
-                            result.google.push({
-                                account: info.name,
-                                spend_through: getDateInfo().today,
-                                campaigns: filtered.map(c => ({
-                                    name:         c.name,
-                                    status:       c.status,
-                                    type:         c.type,
-                                    daily_budget: c.daily_budget || null,
-                                    mtd_spend_incl_today: c.mtd_spend_incl_today,
-                                })),
-                            });
-                        }
-                    } catch (e) {
-                        result.google.push({ account: info.name, error: e.message });
+            for (const [cid, info] of Object.entries(GOOGLE_ACCOUNTS)) {
+                if (acctFilter && !info.name.toLowerCase().includes(acctFilter)) continue;
+                try {
+                    const { token, error: authErr } = await getGoogleAccessToken(cid);
+                    if (authErr) { result.google.push({ account: info.name, error: `Auth: ${authErr}` }); continue; }
+                    const campaigns = await listGoogleCampaignsFull(token, cid, info.mcc);
+                    const filtered  = activeOnly ? campaigns.filter(c => c.status === "ENABLED") : campaigns;
+                    if (filtered.length) {
+                        result.google.push({
+                            account: info.name,
+                            spend_through: getDateInfo().today,
+                            campaigns: filtered.map(c => ({
+                                name:         c.name,
+                                status:       c.status,
+                                type:         c.type,
+                                daily_budget: c.daily_budget || null,
+                                mtd_spend_incl_today: c.mtd_spend_incl_today,
+                            })),
+                        });
                     }
+                } catch (e) {
+                    result.google.push({ account: info.name, error: e.message });
                 }
             }
         }
