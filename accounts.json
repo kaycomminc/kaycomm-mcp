@@ -195,7 +195,14 @@
       "budget": 2000,
       "refresh_token_env": "GOOGLE_REFRESH_TOKEN_3",
       "health": false,
-      "mcc": "4399982656"
+      "mcc": "4399982656",
+      "notes": [
+        {
+          "text": "Built 10/4, all 3 campaigns PAUSED awaiting client advertiser verification — $0 spend is expected until launch. If budget is tight, V9 prefers tightening geo over cutting a campaign.",
+          "added": "2026-10-04",
+          "expires": "2026-10-19"
+        }
+      ]
     }
   },
   "meta": {
