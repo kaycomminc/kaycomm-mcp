@@ -6378,6 +6378,21 @@ function makeServer() {
             },
         },
         {
+            name: "get_ad_copy",
+            description: "Read responsive search ad (RSA) headlines, descriptions, pins, and final URLs in a Google Ads account. " +
+                "Read-only. Omit campaign_name to list every non-removed RSA in the account. " +
+                "Use to copy an existing ad's format when building new ad groups.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    account_name:  { type: "string", description: "Client name (partial match ok)" },
+                    campaign_name: { type: "string", description: "Campaign name (exact match preferred, falls back to substring). Omit for all campaigns." },
+                    ad_group_name: { type: "string", description: "Ad group name (exact match preferred, falls back to substring). Omit for all ad groups." },
+                },
+                required: ["account_name"],
+            },
+        },
+        {
             name: "update_ad_copy",
             description: "View or update responsive search ad (RSA) headlines and descriptions in a Google Ads ad group. " +
                 "Omit headlines/descriptions to preview current copy. Provide new copy to replace it. " +
@@ -9698,6 +9713,26 @@ async function dispatchToolCall(name, args = {}) {
                             } catch (e) { result = { error: e.message }; }
                         }
                     }
+                }
+            }
+        }
+
+    } else if (name === "get_ad_copy") {
+        const { match, error: matchErr } = resolveAccount(GOOGLE_ACCOUNTS, (args.account_name || "").toLowerCase());
+        if (!match) {
+            result = { error: matchErr };
+        } else {
+            const [cid, info] = match;
+            const { token, error: authErr } = await getGoogleAccessToken(cid);
+            if (authErr) { result = { error: `Auth: ${authErr}` }; }
+            else {
+                try {
+                    const ads = await getAdGroupAds(token, cid, info.mcc,
+                        (args.campaign_name || "").toLowerCase(),
+                        args.ad_group_name ? args.ad_group_name.toLowerCase() : null);
+                    result = { account: info.name, ad_count: ads.length, ads };
+                } catch (e) {
+                    result = { error: e.message };
                 }
             }
         }
