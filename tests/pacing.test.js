@@ -4,6 +4,7 @@ const assert = require("node:assert/strict");
 
 const {
     getPacingLabel, getFlightPacing, buildDailyBudgetRec, getDateInfo, getEffectiveBudget, pctChange,
+    buildCampaignBudgetLines,
 } = require("../server.js");
 
 // ── getPacingLabel ──────────────────────────────────────────────────────────
@@ -191,4 +192,47 @@ test("pctChange: normal increase is prefixed with +", () => {
 
 test("pctChange: normal decrease has no + prefix", () => {
     assert.equal(pctChange(50, 100), "-50.0%");
+});
+
+// ── buildCampaignBudgetLines ────────────────────────────────────────────────
+
+const lineData = {
+    spend:  { "v9 - catering dtc": 200, "v9 - catering downtown": 50, "catering downtown old": 999 },
+    daily:  { "v9 - catering dtc": 10, "v9 - catering downtown": 10.5, "catering downtown old": 0 },
+    status: { "v9 - catering dtc": "ENABLED", "v9 - catering downtown": "ENABLED", "catering downtown old": "PAUSED" },
+};
+
+test("campaign lines: exact names only, full month paced like the account", () => {
+    const [line] = buildCampaignBudgetLines(
+        [{ label: "DTC", campaigns: ["V9 - Catering DTC"], budget: 600 }], lineData, "2026-10-01", 10, 31);
+    assert.equal(line.mtd_spend, 200);
+    assert.equal(line.prorated_budget, undefined);
+    assert.equal(line.pct_budget, 33.3);
+    assert.equal(line.daily_budget.days_remaining, 21);
+});
+
+test("campaign lines: substring names never join a line", () => {
+    const [line] = buildCampaignBudgetLines(
+        [{ label: "DT", campaigns: ["V9 - Catering Downtown"], budget: 300 }], lineData, "2026-10-01", 10, 31);
+    assert.equal(line.mtd_spend, 50);
+});
+
+test("campaign lines: start date prorates the first month", () => {
+    const [line] = buildCampaignBudgetLines(
+        [{ label: "DT", campaigns: ["V9 - Catering Downtown"], budget: 310, start: "2026-10-06" }], lineData, "2026-10-01", 10, 31);
+    assert.equal(line.prorated_budget, 260);           // 310 × 26/31
+    assert.equal(line.pct_expected, 100);              // 50 vs 260 × 5/26 = 50
+    assert.equal(line.daily_budget.needed_per_day, 10); // 210 over 21 days
+});
+
+test("campaign lines: before start date, no complete days; missing names reported", () => {
+    const [a, b] = buildCampaignBudgetLines([
+        { label: "A", campaigns: ["V9 - Catering Downtown"], budget: 300, start: "2026-10-20" },
+        { label: "B", campaigns: ["Renamed Campaign"], budget: 100 },
+    ], lineData, "2026-10-01", 10, 31);
+    assert.equal(a.status, "NO_COMPLETE_DAYS_YET");
+    assert.equal(a.daily_budget.days_remaining, 12);
+    assert.deepEqual(b.missing_campaigns, ["Renamed Campaign"]);
+    const [c] = buildCampaignBudgetLines([{ label: "C", campaigns: [], budget: 1, start: "2026-11-02" }], lineData, "2026-10-01", 10, 31);
+    assert.equal(c.status, "NOT_STARTED");
 });

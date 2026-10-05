@@ -73,7 +73,7 @@
       "flight_end": "2026-10-31",
       "notes": [
         {
-          "text": "FAMU Online is currently only running YouTube and Meta — no Search campaigns active.",
+          "text": "FAMU Online is currently only running YouTube and Meta \u2014 no Search campaigns active.",
           "added": "2026-09-25",
           "expires": "2026-10-25"
         }
@@ -89,9 +89,39 @@
           "added": "2026-09-23"
         },
         {
-          "text": "2026-10-05: Budget raised $1,125→$1,725 (+$600 Downtown: $300 Events & Catering Downtown, $300 Online Ordering Downtown, both $10.50/day; drop to ~$9.25/day in Nov). Downtown Branded paused — another party runs La Loma Downtown ads. October will land under $1,725 since Downtown launched mid-month.",
+          "text": "2026-10-05: Budget raised $1,125\u2192$1,725 (+$600 Downtown, client request: $300 Events & Catering Downtown + $300 Online Ordering Downtown, both $9.25/day, launched 10/5). Per-request budgets tracked in campaign_budgets \u2014 pace each line, not just the account. Downtown Branded paused: another party runs La Loma Downtown ads.",
           "added": "2026-10-05",
           "expires": "2026-11-05"
+        }
+      ],
+      "campaign_budgets": [
+        {
+          "label": "Downtown Events & Catering",
+          "campaigns": [
+            "V9 - Events & Catering Downtown"
+          ],
+          "budget": 300,
+          "start": "2026-10-05"
+        },
+        {
+          "label": "Downtown Online Ordering",
+          "campaigns": [
+            "V9 - Online Ordering Downtown"
+          ],
+          "budget": 300,
+          "start": "2026-10-05"
+        },
+        {
+          "label": "DTC & Parker (original budget)",
+          "campaigns": [
+            "V9 - Catering DTC",
+            "V9 - Catering Parker",
+            "V9 - Private Events DTC",
+            "V9 - Private Events Parker",
+            "V9 - Online Ordering DTC/Parker",
+            "V9 - La Loma - Downtown Branded"
+          ],
+          "budget": 1125
         }
       ]
     },
@@ -196,7 +226,7 @@
       "mcc": "4399982656",
       "notes": [
         {
-          "text": "Built 10/4, all 3 campaigns PAUSED awaiting client advertiser verification — $0 spend is expected until launch. If budget is tight, V9 prefers tightening geo over cutting a campaign.",
+          "text": "Built 10/4, all 3 campaigns PAUSED awaiting client advertiser verification \u2014 $0 spend is expected until launch. If budget is tight, V9 prefers tightening geo over cutting a campaign.",
           "added": "2026-10-04",
           "expires": "2026-10-19"
         }

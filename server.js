@@ -66,6 +66,7 @@ const API_VERSION_INFO = {
 // ── Accounts — loaded from accounts.json ─────────────────────────────────────
 // Google fields: name, budget, mcc (login-customer-id), nc_budget?, ga4?,
 //                budget_schedule? [{from, budget, nc_budget?}], flight_start?, flight_end?,
+//                campaign_budgets? [{label, campaigns: [exact names], budget, start?}] — per-campaign client budgets,
 //                health? (object of threshold overrides, or false to exclude from health checks)
 // Meta fields:   name, budget, budget_schedule?, flight_start?, flight_end?, health?
 // Both:          inactive? ("<reason>" skips API calls), notes? [{text, added, expires?}]
@@ -106,7 +107,7 @@ const BUILTIN_HEALTH_DEFAULTS = {
 // add/update field lists and getEffectiveBudget's budget_schedule).
 const KNOWN_ACCOUNT_KEYS = new Set([
     "name", "budget", "mcc", "nc_budget", "ga4", "health", "refresh_token_env",
-    "flight_start", "flight_end", "budget_schedule",
+    "flight_start", "flight_end", "budget_schedule", "campaign_budgets",
     "page_id", "instagram_account_id", "inactive", "notes",
 ]);
 
@@ -240,7 +241,7 @@ function manageAccounts(args) {
             } else {
                 const entry = { name: args.name, budget: args.budget };
                 if (platform === "google") entry.mcc = args.mcc || id;
-                for (const f of ["ga4", "nc_budget", "flight_start", "flight_end", "budget_schedule", "health", "page_id"]) {
+                for (const f of ["ga4", "nc_budget", "flight_start", "flight_end", "budget_schedule", "campaign_budgets", "health", "page_id"]) {
                     if (args[f] != null) entry[f] = args[f];
                 }
                 if (!confirm) {
@@ -257,7 +258,7 @@ function manageAccounts(args) {
                 result = { error: `${id} not found in ${platform} accounts.`, available: Object.entries(store).map(([k, a]) => `${k} (${a.name})`) };
             } else {
                 const changes = {};
-                for (const f of ["name", "budget", "mcc", "ga4", "nc_budget", "flight_start", "flight_end", "budget_schedule", "health", "page_id"]) {
+                for (const f of ["name", "budget", "mcc", "ga4", "nc_budget", "flight_start", "flight_end", "budget_schedule", "campaign_budgets", "health", "page_id"]) {
                     if (args[f] != null) changes[f] = args[f];
                 }
                 if (args.inactive != null) changes.inactive = args.inactive || null;
@@ -268,7 +269,7 @@ function manageAccounts(args) {
                     changes.notes = notes.length ? notes : null;
                 }
                 if (!Object.keys(changes).length) {
-                    result = { error: "No fields to update. Provide name, budget, mcc, ga4, nc_budget, flight_start, flight_end, budget_schedule, health, page_id, inactive, add_note, or clear_notes." };
+                    result = { error: "No fields to update. Provide name, budget, mcc, ga4, nc_budget, flight_start, flight_end, budget_schedule, campaign_budgets, health, page_id, inactive, add_note, or clear_notes." };
                 } else if (!confirm) {
                     result = { dry_run: true, message: "DRY RUN — set confirm=true to save", platform, id, current: store[id], changes };
                 } else {
@@ -368,6 +369,7 @@ function buildAccountContext(stores, today, rules = []) {
             const row = { platform, id };
             if (info.budget != null) row.budget = getEffectiveBudget(info, today).budget;
             if (info.flight_start) row.flight = `${info.flight_start} → ${info.flight_end || "?"}`;
+            if (info.campaign_budgets?.length) row.campaign_budgets = info.campaign_budgets.map(c => `${c.label}: $${c.budget}/mo`);
             if (info.inactive) row.inactive = typeof info.inactive === "string" ? info.inactive : true;
             if (info.health === false) row.health_check = "excluded";
             entry.platforms.push(row);
@@ -885,6 +887,69 @@ function budgetFetchState(fetcher) {
         }));
 }
 
+// Per-campaign budget lines inside one account (e.g. a client asks for "$300 on
+// Downtown catering"). Entries: [{label, campaigns: [exact names], budget, start?}].
+// Names match exactly (case-insensitive) — never substring, so a similar name
+// can't silently join a group. `start` prorates the first month: a $300 line
+// starting Oct 6 is paced against $300 × 26/31 over the days it has existed.
+async function fetchGoogleCampaignLines(token, customerId, mccId, monthStart, yesterday) {
+    const [spendRows, campRows] = await Promise.all([
+        emptyWindow(monthStart, yesterday) ? [] : googleSearch(token, customerId, mccId, `
+            SELECT campaign.name, metrics.cost_micros
+            FROM campaign WHERE segments.date BETWEEN '${monthStart}' AND '${yesterday}'`),
+        googleSearch(token, customerId, mccId, `
+            SELECT campaign.name, campaign.status, campaign_budget.amount_micros
+            FROM campaign WHERE campaign.status != 'REMOVED'`),
+    ]);
+    const spend = {}, daily = {}, status = {};
+    for (const r of spendRows) {
+        const k = r.campaign.name.toLowerCase();
+        spend[k] = (spend[k] || 0) + parseInt(r.metrics?.costMicros || 0) / 1_000_000;
+    }
+    for (const r of campRows) {
+        const k = r.campaign.name.toLowerCase();
+        status[k] = r.campaign.status;
+        daily[k] = r.campaign.status === "ENABLED" ? parseInt(r.campaignBudget?.amountMicros || 0) / 1_000_000 : 0;
+    }
+    return { spend, daily, status };
+}
+
+function buildCampaignBudgetLines(items, data, monthStart, paceDom, dim, tolerance) {
+    const monthEnd = `${monthStart.slice(0, 8)}${String(dim).padStart(2, "0")}`;
+    return items.map(item => {
+        const keys    = (item.campaigns || []).map(n => n.toLowerCase());
+        const missing = (item.campaigns || []).filter(n => !(n.toLowerCase() in data.status));
+        const spend   = Math.round(keys.reduce((s, k) => s + (data.spend[k] || 0), 0) * 100) / 100;
+        const current = keys.reduce((s, k) => s + (data.daily[k] || 0), 0);
+        const line = { label: item.label, campaigns: item.campaigns, monthly_budget: item.budget, mtd_spend: spend };
+        if (missing.length) line.missing_campaigns = missing;
+        if (item.start && item.start > monthEnd) return { ...line, status: "NOT_STARTED", start: item.start };
+
+        const startDom   = item.start && item.start > monthStart ? +item.start.slice(8, 10) : 1;
+        const activeDays = dim - startDom + 1;
+        const elapsed    = Math.max(0, paceDom - startDom + 1);
+        const budget     = Math.round(item.budget * activeDays / dim * 100) / 100;
+        if (startDom > 1) { line.start = item.start; line.prorated_budget = budget; }
+        Object.assign(line, elapsed
+            ? getPacingLabel(spend, budget, elapsed, activeDays, tolerance)
+            : { status: "NO_COMPLETE_DAYS_YET", remaining: Math.round((budget - spend) * 100) / 100 });
+        const rec = buildDailyBudgetRec(current, budget - spend, dim - Math.max(paceDom, startDom - 1), tolerance);
+        if (rec) line.daily_budget = rec;
+        return line;
+    });
+}
+
+async function attachCampaignBudgets(row, info, token, cid, monthStart, yesterday, paceDom, dim, tolerance) {
+    if (!Array.isArray(info.campaign_budgets) || !info.campaign_budgets.length) return row;
+    try {
+        const data = await fetchGoogleCampaignLines(token, cid, info.mcc, monthStart, yesterday);
+        row.campaign_budgets = buildCampaignBudgetLines(info.campaign_budgets, data, monthStart, paceDom, dim, tolerance);
+    } catch (e) {
+        row.campaign_budgets_error = e.message || String(e);
+    }
+    return row;
+}
+
 function withReportingPeriod(row, info, monthStart, yesterday) {
     return { ...row, period: reportingPeriod(info, monthStart, yesterday) };
 }
@@ -974,7 +1039,7 @@ async function buildGoogleRow(defaultToken, pace_dom, dim, today, monthStart, ye
                 row.breakdown.nc.daily_budget    = buildDailyBudgetRec(budgets.nc,    ncBudget - nc,       daysLeft, tolerance);
                 row.breakdown.other.daily_budget = buildDailyBudgetRec(budgets.other, otherBudget - other, daysLeft, tolerance);
             }
-            return row;
+            return attachCampaignBudgets(row, info, token, cid, monthStart, yesterday, pace_dom, dim, tolerance);
         }
 
         const [{ spend, error }, budgetState] = await Promise.all([
@@ -991,7 +1056,7 @@ async function buildGoogleRow(defaultToken, pace_dom, dim, today, monthStart, ye
         else if (budgets && budget) {
             row.daily_budget = buildDailyBudgetRec(budgets.total, budget - spend, dim - pace_dom, tolerance);
         }
-        return row;
+        return attachCampaignBudgets(row, info, token, cid, monthStart, yesterday, pace_dom, dim, tolerance);
 }
 
 async function buildGoogleRows(defaultToken, pace_dom, dim, today, monthStart, yesterday) {
@@ -6011,6 +6076,21 @@ function makeServer() {
                         type: "array",
                         description: "Future budget changes: [{from: 'YYYY-MM-DD', budget: 2000}]",
                         items: { type: "object", properties: { from: { type: "string" }, budget: { type: "number" }, nc_budget: { type: "number" } }, required: ["from"] },
+                    },
+                    campaign_budgets: {
+                        type: "array",
+                        description: "Google only: client-requested budgets for specific campaigns inside the account, paced separately in get_full_pacing/get_google_pacing. " +
+                            "Replaces the whole list. Campaign names match exactly. start (YYYY-MM-DD) prorates the first month. Pass [] to clear.",
+                        items: {
+                            type: "object",
+                            properties: {
+                                label:     { type: "string", description: "e.g. 'Downtown Events & Catering'" },
+                                campaigns: { type: "array", items: { type: "string" }, description: "Exact campaign names in this line" },
+                                budget:    { type: "number", description: "Monthly budget in dollars" },
+                                start:     { type: "string", description: "YYYY-MM-DD the line began (prorates that month)" },
+                            },
+                            required: ["label", "campaigns", "budget"],
+                        },
                     },
                     health: {
                         description: "Health-check threshold overrides for run_health_check, e.g. {cpa_target: 75, conversion_dry_spell_hours: 48, impression_share_floor: 50, frequency_cap: 3.0, pacing_tolerance_pct: 10}. " +
@@ -12756,6 +12836,7 @@ module.exports = {
     matchByName, skippedRow, partitionSkipped, reportingPeriod, selectDetailAccounts, fetchMetaDailyBudgets,
     resolveAccount, buildAccountContext, addDays,
     collectPolicyViolations, googleAdsError, createGoogleCampaignFull, addKeywordsToAdGroup,
+    buildCampaignBudgetLines,
 };
 
 if (require.main === module && !process.env.MCP_TEST) main().catch(console.error);
