@@ -1026,6 +1026,54 @@ async function copyConversionGoals(token, customerId, mccId, targetName, sourceN
     return confirm ? { success: true, ...summary } : { dry_run: true, validation: "PASSES", message: "DRY RUN — set confirm=true to apply", ...summary };
 }
 
+async function updateCustomConversionGoal(token, customerId, mccId, goalName, addNames, removeNames, confirm) {
+    if (!addNames.length && !removeNames.length) return { error: "Provide add_actions and/or remove_actions." };
+    const [goals, actions] = await Promise.all([
+        googleSearch(token, customerId, mccId, `
+            SELECT custom_conversion_goal.resource_name, custom_conversion_goal.name, custom_conversion_goal.conversion_actions
+            FROM custom_conversion_goal WHERE custom_conversion_goal.status = 'ENABLED'`),
+        googleSearch(token, customerId, mccId, `
+            SELECT conversion_action.resource_name, conversion_action.name
+            FROM conversion_action WHERE conversion_action.status = 'ENABLED'`),
+    ]);
+    const goal = goals.map(r => r.customConversionGoal).filter(g => g.name === goalName);
+    if (goal.length !== 1) return { error: `Expected one enabled custom goal named '${goalName}', found ${goal.length}`, available: goals.map(r => r.customConversionGoal.name) };
+    const resByName = Object.fromEntries(actions.map(r => [r.conversionAction.name, r.conversionAction.resourceName]));
+    const nameByRes = Object.fromEntries(actions.map(r => [r.conversionAction.resourceName, r.conversionAction.name]));
+    const unknown = [...addNames, ...removeNames].filter(n => !resByName[n]);
+    if (unknown.length) return { error: `Unknown conversion action(s): ${unknown.join(", ")}` };
+
+    const before = goal[0].conversionActions || [];
+    const removeRes = new Set(removeNames.map(n => resByName[n]));
+    const after = [...new Set([...before.filter(r => !removeRes.has(r)), ...addNames.map(n => resByName[n])])];
+    const names = list => list.map(r => nameByRes[r] || r).sort();
+    if (after.length === before.length && after.every(r => before.includes(r))) return { message: "No change — goal already has these actions.", actions: names(before) };
+
+    const resp = await fetchFn(
+        `https://googleads.googleapis.com/${GOOGLE_API_VERSION}/customers/${customerId}/googleAds:mutate`,
+        {
+            method: "POST",
+            headers: {
+                "Authorization":     `Bearer ${token}`,
+                "developer-token":   GOOGLE_DEVELOPER_TOKEN,
+                "login-customer-id": mccId,
+                "Content-Type":      "application/json",
+            },
+            body: JSON.stringify({
+                mutateOperations: [{ customConversionGoalOperation: {
+                    update: { resourceName: goal[0].resourceName, conversionActions: after },
+                    updateMask: "conversion_actions",
+                } }],
+                validateOnly: !confirm,
+            }),
+        }
+    );
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(googleAdsError(data));
+    const summary = { goal: goalName, before: names(before), after: names(after) };
+    return confirm ? { success: true, ...summary } : { dry_run: true, validation: "PASSES", message: "DRY RUN — set confirm=true to apply", ...summary };
+}
+
 async function fetchGoogleCampaignLines(token, customerId, mccId, monthStart, yesterday) {
     const [spendRows, campRows] = await Promise.all([
         emptyWindow(monthStart, yesterday) ? [] : googleSearch(token, customerId, mccId, `
@@ -6162,6 +6210,22 @@ function makeServer() {
             },
         },
         {
+            name: "update_custom_conversion_goal",
+            description: "Add or remove conversion actions in a Google Ads custom conversion goal (affects every campaign using that goal). " +
+                "Goal and action names match exactly. Dry run by default (validated with Google) — set confirm=true to apply.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    account_name:   { type: "string", description: "Client name (partial match ok)" },
+                    goal_name:      { type: "string", description: "Exact custom conversion goal name (see get_conversion_goals)" },
+                    add_actions:    { type: "array", items: { type: "string" }, description: "Exact conversion action names to add" },
+                    remove_actions: { type: "array", items: { type: "string" }, description: "Exact conversion action names to remove" },
+                    confirm:        { type: "boolean", description: "Set true to apply. Omit for dry run." },
+                },
+                required: ["account_name", "goal_name"],
+            },
+        },
+        {
             name: "get_conversion_health",
             description: "Check Google Ads conversion tracking health — lists every enabled conversion action with 30-day and 7-day volume and flags actions that have GONE_SILENT (fired in 30d but not 7d — possible broken tag) or are INACTIVE_30D. Run across all accounts or one.",
             inputSchema: {
@@ -9090,6 +9154,24 @@ async function dispatchToolCall(name, args = {}) {
             else {
                 try {
                     result = { account: info.name, ...(await copyConversionGoals(token, cid, info.mcc, args.campaign_name, args.copy_from_campaign, args.confirm === true)) };
+                } catch (e) {
+                    result = { error: e.message };
+                }
+            }
+        }
+
+    } else if (name === "update_custom_conversion_goal") {
+        const { match, error: matchErr } = resolveAccount(GOOGLE_ACCOUNTS, (args.account_name || "").toLowerCase(), { confirmed: args.confirm === true });
+        if (!match) {
+            result = { error: matchErr };
+        } else {
+            const [cid, info] = match;
+            const { token, error: authErr } = await getGoogleAccessToken(cid);
+            if (authErr) { result = { error: `Auth: ${authErr}` }; }
+            else {
+                try {
+                    result = { account: info.name, ...(await updateCustomConversionGoal(token, cid, info.mcc, args.goal_name,
+                        args.add_actions || [], args.remove_actions || [], args.confirm === true)) };
                 } catch (e) {
                     result = { error: e.message };
                 }

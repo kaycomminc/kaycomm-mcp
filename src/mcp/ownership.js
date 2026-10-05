@@ -26,6 +26,7 @@ const GOOGLE_TOOLS = new Set([
   'create_pmax_campaign', 'create_video_campaign', 'update_ad_copy',
   'update_ad_url', 'update_geo_targeting', 'add_ad_extension',
   'add_negative_keywords', 'manage_negative_lists', 'set_conversion_goals',
+  'update_custom_conversion_goal',
 ]);
 
 const META_ACTIONS = {
