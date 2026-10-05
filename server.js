@@ -892,6 +892,140 @@ function budgetFetchState(fetcher) {
 // Names match exactly (case-insensitive) — never substring, so a similar name
 // can't silently join a group. `start` prorates the first month: a $300 line
 // starting Oct 6 is paced against $300 × 26/31 over the days it has existed.
+// Resolve each campaign's effective conversion goals. A campaign either follows
+// the account defaults (goal_config_level CUSTOMER), sets its own category/origin
+// goals (CAMPAIGN), or uses a custom conversion goal (explicit action list).
+// For category goals, an action counts when its (category, origin) pair is
+// biddable for the campaign AND the action is primary_for_goal.
+async function fetchConversionGoals(token, customerId, mccId, campaignFilter) {
+    const [configs, campGoals, acctGoals, customGoals, actions] = await Promise.all([
+        googleSearch(token, customerId, mccId, `
+            SELECT campaign.name, campaign.status, conversion_goal_campaign_config.goal_config_level,
+                   conversion_goal_campaign_config.custom_conversion_goal
+            FROM conversion_goal_campaign_config WHERE campaign.status != 'REMOVED'`),
+        googleSearch(token, customerId, mccId, `
+            SELECT campaign.name, campaign_conversion_goal.category, campaign_conversion_goal.origin,
+                   campaign_conversion_goal.biddable
+            FROM campaign_conversion_goal WHERE campaign.status != 'REMOVED'`),
+        googleSearch(token, customerId, mccId, `
+            SELECT customer_conversion_goal.category, customer_conversion_goal.origin, customer_conversion_goal.biddable
+            FROM customer_conversion_goal`),
+        googleSearch(token, customerId, mccId, `
+            SELECT custom_conversion_goal.resource_name, custom_conversion_goal.name,
+                   custom_conversion_goal.conversion_actions, custom_conversion_goal.status
+            FROM custom_conversion_goal`),
+        googleSearch(token, customerId, mccId, `
+            SELECT conversion_action.resource_name, conversion_action.name, conversion_action.category,
+                   conversion_action.origin, conversion_action.primary_for_goal, conversion_action.status
+            FROM conversion_action WHERE conversion_action.status = 'ENABLED'`),
+    ]);
+    const actionList = actions.map(r => r.conversionAction);
+    const actionByRes = Object.fromEntries(actionList.map(a => [a.resourceName, a]));
+    const customByRes = Object.fromEntries(customGoals.map(r => [r.customConversionGoal.resourceName, r.customConversionGoal]));
+    const pair = g => `${g.category}|${g.origin}`;
+    const actionsFor = pairs => actionList
+        .filter(a => a.primaryForGoal && pairs.has(`${a.category}|${a.origin}`))
+        .map(a => a.name).sort();
+
+    const biddableByCampaign = {};
+    for (const r of campGoals) {
+        if (!r.campaignConversionGoal.biddable) continue;
+        (biddableByCampaign[r.campaign.name] ||= new Set()).add(pair(r.campaignConversionGoal));
+    }
+    const acctPairs = new Set(acctGoals.filter(r => r.customerConversionGoal.biddable).map(r => pair(r.customerConversionGoal)));
+    const filter = (campaignFilter || "").toLowerCase();
+
+    const campaigns = configs
+        .filter(r => !filter || r.campaign.name.toLowerCase().includes(filter))
+        .map(r => {
+            const cfg = r.conversionGoalCampaignConfig || {};
+            const out = { campaign: r.campaign.name, status: r.campaign.status, goal_level: cfg.goalConfigLevel };
+            const custom = cfg.customConversionGoal && customByRes[cfg.customConversionGoal];
+            if (custom) {
+                out.goal_source = `custom goal: ${custom.name}`;
+                out.counted_actions = (custom.conversionActions || []).map(res => actionByRes[res]?.name || res).sort();
+            } else {
+                const pairs = biddableByCampaign[r.campaign.name] || new Set();
+                out.goal_source = cfg.goalConfigLevel === "CAMPAIGN" ? "campaign-specific goals" : "account default goals";
+                out.goal_categories = [...pairs].map(p => p.split("|")[0]).sort();
+                out.counted_actions = actionsFor(pairs);
+            }
+            return out;
+        })
+        .sort((a, b) => a.campaign.localeCompare(b.campaign));
+
+    return {
+        account_default_actions: actionsFor(acctPairs),
+        custom_goals: customGoals.map(r => ({
+            name: r.customConversionGoal.name, status: r.customConversionGoal.status,
+            actions: (r.customConversionGoal.conversionActions || []).map(res => actionByRes[res]?.name || res).sort(),
+        })),
+        campaigns,
+    };
+}
+
+async function copyConversionGoals(token, customerId, mccId, targetName, sourceName, confirm) {
+    const esc = n => n.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+    const [configs, goals] = await Promise.all([
+        googleSearch(token, customerId, mccId, `
+            SELECT campaign.name, conversion_goal_campaign_config.resource_name,
+                   conversion_goal_campaign_config.goal_config_level, conversion_goal_campaign_config.custom_conversion_goal
+            FROM conversion_goal_campaign_config
+            WHERE campaign.name IN ('${esc(targetName)}', '${esc(sourceName)}') AND campaign.status != 'REMOVED'`),
+        googleSearch(token, customerId, mccId, `
+            SELECT campaign.name, campaign_conversion_goal.resource_name, campaign_conversion_goal.category,
+                   campaign_conversion_goal.origin, campaign_conversion_goal.biddable
+            FROM campaign_conversion_goal
+            WHERE campaign.name IN ('${esc(targetName)}', '${esc(sourceName)}') AND campaign.status != 'REMOVED'`),
+    ]);
+    const cfgOf = n => configs.filter(r => r.campaign.name === n);
+    if (cfgOf(targetName).length !== 1) return { error: `Expected exactly one campaign named '${targetName}', found ${cfgOf(targetName).length}` };
+    if (cfgOf(sourceName).length !== 1) return { error: `Expected exactly one campaign named '${sourceName}', found ${cfgOf(sourceName).length}` };
+    const src = cfgOf(sourceName)[0].conversionGoalCampaignConfig;
+    const dst = cfgOf(targetName)[0].conversionGoalCampaignConfig;
+
+    const key = g => `${g.category}|${g.origin}`;
+    const srcBiddable = new Map(goals.filter(r => r.campaign.name === sourceName).map(r => [key(r.campaignConversionGoal), !!r.campaignConversionGoal.biddable]));
+    const goalOps = [], goalChanges = [];
+    for (const r of goals.filter(r => r.campaign.name === targetName)) {
+        const g = r.campaignConversionGoal;
+        const want = srcBiddable.get(key(g)) ?? false;
+        if (!!g.biddable === want) continue;
+        goalChanges.push({ category: g.category, origin: g.origin, biddable: want });
+        goalOps.push({ campaignConversionGoalOperation: { update: { resourceName: g.resourceName, biddable: want }, updateMask: "biddable" } });
+    }
+    const cfgUpdate = { resourceName: dst.resourceName, goalConfigLevel: src.goalConfigLevel };
+    const mask = ["goal_config_level"];
+    if (src.customConversionGoal || dst.customConversionGoal) {
+        cfgUpdate.customConversionGoal = src.customConversionGoal || null;
+        mask.push("custom_conversion_goal");
+    }
+    const ops = [{ conversionGoalCampaignConfigOperation: { update: cfgUpdate, updateMask: mask.join(",") } }, ...goalOps];
+
+    const resp = await fetchFn(
+        `https://googleads.googleapis.com/${GOOGLE_API_VERSION}/customers/${customerId}/googleAds:mutate`,
+        {
+            method: "POST",
+            headers: {
+                "Authorization":     `Bearer ${token}`,
+                "developer-token":   GOOGLE_DEVELOPER_TOKEN,
+                "login-customer-id": mccId,
+                "Content-Type":      "application/json",
+            },
+            body: JSON.stringify({ mutateOperations: ops, validateOnly: !confirm }),
+        }
+    );
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(googleAdsError(data));
+    const summary = {
+        campaign: targetName, copied_from: sourceName,
+        goal_level: `${dst.goalConfigLevel} → ${src.goalConfigLevel}`,
+        custom_goal: src.customConversionGoal || dst.customConversionGoal ? `${dst.customConversionGoal || "none"} → ${src.customConversionGoal || "none"}` : undefined,
+        category_goal_changes: goalChanges,
+    };
+    return confirm ? { success: true, ...summary } : { dry_run: true, validation: "PASSES", message: "DRY RUN — set confirm=true to apply", ...summary };
+}
+
 async function fetchGoogleCampaignLines(token, customerId, mccId, monthStart, yesterday) {
     const [spendRows, campRows] = await Promise.all([
         emptyWindow(monthStart, yesterday) ? [] : googleSearch(token, customerId, mccId, `
@@ -5999,6 +6133,35 @@ function makeServer() {
             },
         },
         {
+            name: "get_conversion_goals",
+            description: "Show which conversion actions each Google Ads campaign actually optimizes toward and counts in 'Conversions'. " +
+                "Resolves account-default goals vs campaign-specific goals vs custom conversion goals into a per-campaign list of actions. Read-only.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    account_name:  { type: "string", description: "Client name (partial match ok)" },
+                    campaign_name: { type: "string", description: "Filter to campaigns whose name contains this (case-insensitive). Omit for all non-removed campaigns." },
+                },
+                required: ["account_name"],
+            },
+        },
+        {
+            name: "set_conversion_goals",
+            description: "Copy the conversion goal setup (account-default / campaign-specific category goals / custom conversion goal) from one Google Ads campaign to another, " +
+                "so a new campaign optimizes toward and counts the same actions as an existing one. Campaign names match exactly. " +
+                "Dry run by default (validated with Google) — set confirm=true to apply. Use get_conversion_goals to check before and after.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    account_name:       { type: "string", description: "Client name (partial match ok)" },
+                    campaign_name:      { type: "string", description: "Exact name of the campaign to change" },
+                    copy_from_campaign: { type: "string", description: "Exact name of the campaign whose goal setup to copy" },
+                    confirm:            { type: "boolean", description: "Set true to apply. Omit for dry run." },
+                },
+                required: ["account_name", "campaign_name", "copy_from_campaign"],
+            },
+        },
+        {
             name: "get_conversion_health",
             description: "Check Google Ads conversion tracking health — lists every enabled conversion action with 30-day and 7-day volume and flags actions that have GONE_SILENT (fired in 30d but not 7d — possible broken tag) or are INACTIVE_30D. Run across all accounts or one.",
             inputSchema: {
@@ -8893,6 +9056,40 @@ async function dispatchToolCall(name, args = {}) {
                             }
                         }
                     }
+                } catch (e) {
+                    result = { error: e.message };
+                }
+            }
+        }
+
+    } else if (name === "get_conversion_goals") {
+        const { match, error: matchErr } = resolveAccount(GOOGLE_ACCOUNTS, (args.account_name || "").toLowerCase());
+        if (!match) {
+            result = { error: matchErr };
+        } else {
+            const [cid, info] = match;
+            const { token, error: authErr } = await getGoogleAccessToken(cid);
+            if (authErr) { result = { error: `Auth: ${authErr}` }; }
+            else {
+                try {
+                    result = { account: info.name, ...(await fetchConversionGoals(token, cid, info.mcc, args.campaign_name)) };
+                } catch (e) {
+                    result = { error: e.message };
+                }
+            }
+        }
+
+    } else if (name === "set_conversion_goals") {
+        const { match, error: matchErr } = resolveAccount(GOOGLE_ACCOUNTS, (args.account_name || "").toLowerCase(), { confirmed: args.confirm === true });
+        if (!match) {
+            result = { error: matchErr };
+        } else {
+            const [cid, info] = match;
+            const { token, error: authErr } = await getGoogleAccessToken(cid);
+            if (authErr) { result = { error: `Auth: ${authErr}` }; }
+            else {
+                try {
+                    result = { account: info.name, ...(await copyConversionGoals(token, cid, info.mcc, args.campaign_name, args.copy_from_campaign, args.confirm === true)) };
                 } catch (e) {
                     result = { error: e.message };
                 }
