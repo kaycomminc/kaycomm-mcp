@@ -21,6 +21,7 @@ const { sameSecret, readJson, safeHttpHandler } = require("./src/mcp/http");
 const { createAccountsSync, syncedWriteAllowed } = require("./src/accounts-github");
 const metaBuild = require("./src/meta-campaign-build");
 const metaMedia = require("./src/meta-media");
+const metaBilling = require("./src/meta-billing");
 const requestContext = new AsyncLocalStorage();
 const TOOL_TIMEOUT_MS = Number(process.env.MCP_TOOL_TIMEOUT_MS) || 150000;
 const UPSTREAM_TIMEOUT_MS = Number(process.env.MCP_UPSTREAM_TIMEOUT_MS) || 30000;
@@ -7725,6 +7726,25 @@ function makeServer() {
             },
         },
         {
+            name: "get_meta_billing",
+            description: "Meta ad account billing lookup — what was charged to the card, when, and for which spend dates. " +
+                "Returns payment method (e.g. Visa ····8324), unbilled balance, transactions with the date range each one covers, " +
+                "daily spend, campaigns that spent in the range, and campaigns still ACTIVE. " +
+                "Pass amount to check a mystery card charge: flags a matching transaction, or a run of spend days that sums to it " +
+                "(Meta sweeps leftover spend on the monthly bill date, so a charge can land weeks after ads stop). " +
+                "Works on accounts not in accounts.json: pass account_id, or an account_name the token can see.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    account_name: { type: "string", description: "Meta account name (partial match ok). Falls back to every ad account the token can access." },
+                    account_id: { type: "string", description: "Ad account ID (act_123 or 123). Use instead of account_name." },
+                    start_date: { type: "string", description: "Start date YYYY-MM-DD (with end_date; default: last 90 days)" },
+                    end_date: { type: "string", description: "End date YYYY-MM-DD (default: today)" },
+                    amount: { type: "number", description: "Charge amount to look for, in dollars (e.g. 691.40)" },
+                },
+            },
+        },
+        {
             name: "get_meta_ad_performance",
             description: "Get ad-level performance metrics from Meta (Facebook/Instagram) — spend, clicks, CTR, CPC, CPM, reach, " +
                 "link clicks, landing page views, purchases, post engagement, CPA, and ROAS for each ad. " +
@@ -12659,6 +12679,84 @@ async function dispatchToolCall(name, args = {}) {
                 });
                 result = { account: info.name, breakdown: args.breakdown, level, date_preset: datePreset, total_rows: formatted.length, rows: formatted };
             } catch (e) { result = { error: e.message }; }
+        }
+
+    } else if (name === "get_meta_billing") {
+        try {
+            let accountId = null;
+            if (args.account_id) {
+                accountId = metaActId(String(args.account_id).trim());
+            } else if (args.account_name) {
+                const s = args.account_name.toLowerCase().trim();
+                const configured = Object.entries(META_ACCOUNTS).filter(([, i]) => i.name.toLowerCase().includes(s));
+                if (configured.length === 1) accountId = configured[0][0];
+                else if (configured.length > 1) throw new Error(`Ambiguous account '${args.account_name}' matches: ${configured.map(([, i]) => i.name).join(", ")} — use the exact name or account_id`);
+                else {
+                    // Not in accounts.json (e.g. a finished flight): search everything the token can see.
+                    const all = (await listMetaAdAccountsAll()).filter(a => (a.name || "").toLowerCase().includes(s));
+                    if (all.length === 1) accountId = all[0].id;
+                    else if (all.length > 1) throw new Error(`Ambiguous account '${args.account_name}' matches: ${all.map(a => `${a.name} (${a.id})`).join(", ")} — pass account_id`);
+                    else throw new Error(`No Meta ad account matching '${args.account_name}' is accessible to this token. Pass account_id, or get access to the account in Business Manager.`);
+                }
+            } else {
+                throw new Error("account_name or account_id is required");
+            }
+
+            const today = new Date().toISOString().slice(0, 10);
+            const endDate = args.end_date || today;
+            const startDate = args.start_date || new Date(Date.parse(endDate + "T00:00:00Z") - 90 * 86400000).toISOString().slice(0, 10);
+            const warnings = [];
+
+            const account = metaBilling.normalizeAccount(await metaGet(accountId, { fields: metaBilling.ACCOUNT_FIELDS }));
+
+            let transactions = [];
+            try {
+                const rows = await metaGetAll(`${accountId}/transactions`, {
+                    fields: metaBilling.TRANSACTION_FIELDS,
+                    time_start: metaBilling.dateToUnix(startDate),
+                    time_stop: metaBilling.dateToUnix(endDate) + 86400,
+                    limit: 200,
+                });
+                transactions = rows.map(t => metaBilling.normalizeTransaction(t, account.timezone))
+                    .filter(t => !t.charged_on || (t.charged_on >= startDate && t.charged_on <= endDate));
+            } catch (e) {
+                warnings.push(`Transactions unavailable (${e.message}). Needs billing access on the ad account; check Billing & Payments in Ads Manager.`);
+            }
+
+            const timeRange = JSON.stringify({ since: startDate, until: endDate });
+            const daily = metaBilling.normalizeDailySpend(await metaGetAll(`${accountId}/insights`, {
+                fields: "spend", level: "account", time_increment: 1, time_range: timeRange, limit: 500,
+            }));
+            const campaignRows = await metaGetAll(`${accountId}/insights`, {
+                fields: "campaign_name,spend,date_start,date_stop", level: "campaign", time_range: timeRange, limit: 200,
+            });
+            const campaignsWithSpend = campaignRows
+                .map(r => ({ campaign: r.campaign_name, spend: Math.round(parseFloat(r.spend || 0) * 100) / 100 }))
+                .filter(r => r.spend > 0)
+                .sort((a, b) => b.spend - a.spend);
+            let activeCampaigns = [];
+            try {
+                activeCampaigns = (await metaGetAll(`${accountId}/campaigns`, {
+                    fields: "name,effective_status", effective_status: JSON.stringify(["ACTIVE"]), limit: 200,
+                })).map(c => c.name);
+            } catch (e) {
+                warnings.push(`Could not list active campaigns (${e.message})`);
+            }
+
+            const analysis = metaBilling.analyzeBilling({ account, transactions, daily, amount: args.amount });
+            result = {
+                account,
+                in_accounts_json: !!META_ACCOUNTS[accountId],
+                range: { start_date: startDate, end_date: endDate },
+                analysis,
+                transactions,
+                daily_spend: daily,
+                campaigns_with_spend: campaignsWithSpend,
+                active_campaigns: activeCampaigns,
+            };
+            if (warnings.length) result.warnings = warnings;
+        } catch (e) {
+            result = { error: e.message };
         }
 
     } else if (name === "get_meta_ad_performance") {
