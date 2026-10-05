@@ -131,14 +131,15 @@
     "v9_ads": {
       "customer": "Volume Nine",
       "billing_type": "recurring",
-      "active": true,
+      "active": false,
       "line_items": [
         {
           "product_service": "Google Ads + ChatGPT Ads",
           "description": "V9 Ads",
           "rate": 350
         }
-      ]
+      ],
+      "notes": "Inactive: V9 took its ads in-house 2026-10-04."
     },
     "axis_office": {
       "customer": "Volume Nine",
