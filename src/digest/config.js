@@ -96,7 +96,6 @@ const CONFIG = {
   ignoreUnlisted: [
     'google:Warrior Advocates',
     'meta:Warrior Advocates',
-    'google:Axis Office',
   ],
   // StackAdapt rows come back from get_full_pacing too. All four advertisers
   // are currently uncapped with no spend, so they are out of scope here.
