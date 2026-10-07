@@ -3298,6 +3298,59 @@ async function updateGoogleKeywordStatus(token, customerId, mccId, resourceNames
     return data;
 }
 
+async function listAdGroupAdStatuses(token, customerId, mccId, campaignSearch, adGroupSearch) {
+    const rows = await googleSearch(token, customerId, mccId, `
+        SELECT campaign.name, ad_group.name,
+               ad_group_ad.resource_name,
+               ad_group_ad.status,
+               ad_group_ad.ad.id,
+               ad_group_ad.ad.type,
+               ad_group_ad.ad.responsive_search_ad.headlines
+        FROM ad_group_ad
+        WHERE ad_group_ad.status != 'REMOVED'
+          AND ad_group.status != 'REMOVED'
+          AND campaign.status != 'REMOVED'`);
+    return rows
+        .map(row => ({
+            resource_name: row.adGroupAd.resourceName,
+            ad_resource:   `customers/${customerId}/ads/${row.adGroupAd.ad.id}`,
+            ad_id:         String(row.adGroupAd.ad.id),
+            ad_type:       row.adGroupAd.ad.type,
+            status:        row.adGroupAd.status,
+            ad_group:      row.adGroup.name,
+            campaign:      row.campaign.name,
+            headlines:     (row.adGroupAd.ad.responsiveSearchAd?.headlines || []).map(h => h.text),
+        }))
+        .filter(a => !campaignSearch || a.campaign.toLowerCase().includes(campaignSearch))
+        .filter(a => !adGroupSearch || a.ad_group.toLowerCase().includes(adGroupSearch));
+}
+
+async function updateGoogleAdStatus(token, customerId, mccId, resourceNames, status) {
+    const resp = await fetchFn(
+        `https://googleads.googleapis.com/${GOOGLE_API_VERSION}/customers/${customerId}/googleAds:mutate`,
+        {
+            method: "POST",
+            headers: {
+                "Authorization":     `Bearer ${token}`,
+                "developer-token":   GOOGLE_DEVELOPER_TOKEN,
+                "login-customer-id": mccId,
+                "Content-Type":      "application/json",
+            },
+            body: JSON.stringify({
+                mutateOperations: resourceNames.map(resourceName => ({
+                    adGroupAdOperation: {
+                        update:     { resourceName, status },
+                        updateMask: "status",
+                    },
+                })),
+            }),
+        }
+    );
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(googleAdsError(data));
+    return data;
+}
+
 async function updateGoogleCampaignBudget(token, customerId, mccId, campaignResourceName, dailyBudgetDollars) {
     // Step 1: get the budget resource name for this campaign
     const rows = await googleSearch(token, customerId, mccId, `
@@ -6150,6 +6203,40 @@ function makeServer() {
             },
         },
         {
+            name: "pause_ad",
+            description: "Pause individual Google Ads ads (e.g. seasonal RSAs) without touching the ad group. Dry run by default — set confirm=true to apply. Select ads by ad_resource_names (customers/X/ads/Y from get_ad_copy, or customers/X/adGroupAds/AG~AD) or by headline_contains (case-insensitive substring of any RSA headline), optionally narrowed by campaign_name / ad_group_name. When more than one ad matches, set all_matches=true.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    account_name:      { type: "string", description: "Client name (partial match ok)" },
+                    ad_resource_names: { type: "array", items: { type: "string" }, description: "Exact ads to target: customers/X/ads/Y or customers/X/adGroupAds/AG~AD" },
+                    headline_contains: { type: "string", description: "Match ads with an RSA headline containing this text (case-insensitive)" },
+                    campaign_name:     { type: "string", description: "Campaign to scope the match to (partial match ok)" },
+                    ad_group_name:     { type: "string", description: "Ad group to scope the match to (partial match ok)" },
+                    all_matches:       { type: "boolean", description: "Set true to act on every matching ad when more than one matches" },
+                    confirm:           { type: "boolean", description: "Set true to actually pause. Omit for dry run." },
+                },
+                required: ["account_name"],
+            },
+        },
+        {
+            name: "enable_ad",
+            description: "Re-enable paused Google Ads ads. Dry run by default — set confirm=true to apply. Same selection rules as pause_ad.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    account_name:      { type: "string", description: "Client name (partial match ok)" },
+                    ad_resource_names: { type: "array", items: { type: "string" }, description: "Exact ads to target: customers/X/ads/Y or customers/X/adGroupAds/AG~AD" },
+                    headline_contains: { type: "string", description: "Match ads with an RSA headline containing this text (case-insensitive)" },
+                    campaign_name:     { type: "string", description: "Campaign to scope the match to (partial match ok)" },
+                    ad_group_name:     { type: "string", description: "Ad group to scope the match to (partial match ok)" },
+                    all_matches:       { type: "boolean", description: "Set true to act on every matching ad when more than one matches" },
+                    confirm:           { type: "boolean", description: "Set true to actually enable. Omit for dry run." },
+                },
+                required: ["account_name"],
+            },
+        },
+        {
             name: "find_keywords",
             description: "Search the full keyword inventory for a Google Ads account — including keywords in paused/removed campaigns and keywords that never served. Unlike get_keyword_performance (which only returns keywords with metrics), this queries ad_group_criterion directly and returns every keyword that exists or existed.",
             inputSchema: {
@@ -8434,6 +8521,61 @@ async function dispatchToolCall(name, args = {}) {
                     } else {
                         await updateGoogleKeywordStatus(token, cid, info.mcc, actionable.map(k => k.resource_name), newStatus);
                         result = { success: true, account: info.name, status: newStatus, keywords: actionable.map(({ resource_name, ...k }) => ({ ...k, status: newStatus })) };
+                    }
+                } catch (e) { result = { error: e.message }; }
+            }
+        }
+
+    } else if (name === "pause_ad" || name === "enable_ad") {
+        const campSearch = args.campaign_name ? args.campaign_name.toLowerCase() : null;
+        const agSearch   = args.ad_group_name ? args.ad_group_name.toLowerCase() : null;
+        const hlSearch   = args.headline_contains ? args.headline_contains.toLowerCase().trim() : null;
+        const resNames   = Array.isArray(args.ad_resource_names) ? args.ad_resource_names.filter(Boolean) : [];
+        const allMatches = !!args.all_matches;
+        const confirm    = args.confirm === true;
+        const newStatus  = name === "pause_ad" ? "PAUSED" : "ENABLED";
+
+        const { match, error: acctErr } = resolveAccount(GOOGLE_ACCOUNTS, args.account_name, { confirmed: args.confirm === true });
+        if (!resNames.length && !hlSearch) { result = { error: "Provide ad_resource_names or headline_contains." }; }
+        else if (!match) { result = { error: acctErr }; }
+        else {
+            const [cid, info] = match;
+            const { token, error: authErr } = await getGoogleAccessToken(cid);
+            if (authErr) { result = { error: `Auth: ${authErr}` }; }
+            else {
+                try {
+                    const ads = await listAdGroupAdStatuses(token, cid, info.mcc, campSearch, agSearch);
+                    let matches = ads;
+                    if (resNames.length) {
+                        const wanted = new Set(resNames);
+                        matches = matches.filter(a => wanted.has(a.resource_name) || wanted.has(a.ad_resource));
+                        const found = new Set(matches.flatMap(a => [a.resource_name, a.ad_resource]));
+                        const missing = resNames.filter(r => !found.has(r));
+                        if (missing.length) throw new Error(`Ads not found in ${info.name}${campSearch || agSearch ? " (with the given campaign/ad group filters)" : ""}: ${missing.join(", ")}`);
+                    }
+                    if (hlSearch) matches = matches.filter(a => a.headlines.some(h => h.toLowerCase().includes(hlSearch)));
+                    const actionable = matches.filter(a => a.status !== newStatus);
+                    const summarize = list => list.map(({ headlines, ...a }) => ({ ...a, first_headlines: headlines.slice(0, 3) }));
+
+                    if (matches.length === 0) {
+                        result = {
+                            error: `No ads matching` +
+                                   (hlSearch ? ` headline '${args.headline_contains}'` : "") +
+                                   (campSearch ? ` in campaigns matching '${args.campaign_name}'` : "") +
+                                   (agSearch ? ` in ad groups matching '${args.ad_group_name}'` : ""),
+                        };
+                    } else if (actionable.length === 0) {
+                        result = { message: `All ${matches.length} matching ad(s) are already ${newStatus}.`, ads: summarize(matches) };
+                    } else if (actionable.length > 1 && !allMatches && resNames.length !== actionable.length) {
+                        result = {
+                            error: `${actionable.length} ads match — narrow with campaign_name / ad_group_name / headline_contains, or set all_matches=true to ${name === "pause_ad" ? "pause" : "enable"} all of them.`,
+                            ads: summarize(actionable),
+                        };
+                    } else if (!confirm) {
+                        result = { dry_run: true, message: `DRY RUN — set confirm=true to apply`, account: info.name, new_status: newStatus, ad_count: actionable.length, ads: summarize(actionable) };
+                    } else {
+                        await updateGoogleAdStatus(token, cid, info.mcc, actionable.map(a => a.resource_name), newStatus);
+                        result = { success: true, account: info.name, status: newStatus, ad_count: actionable.length, ads: summarize(actionable).map(a => ({ ...a, status: newStatus })) };
                     }
                 } catch (e) { result = { error: e.message }; }
             }

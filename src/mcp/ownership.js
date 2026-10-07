@@ -21,7 +21,7 @@ const META_TOOLS = new Set([
 
 const GOOGLE_TOOLS = new Set([
   'pause_campaign', 'enable_campaign', 'pause_ad_group', 'enable_ad_group',
-  'pause_keyword', 'enable_keyword', 'update_budget', 'create_ad_group',
+  'pause_keyword', 'enable_keyword', 'pause_ad', 'enable_ad', 'update_budget', 'create_ad_group',
   'populate_ad_group', 'set_bidding_strategy', 'create_campaign',
   'create_pmax_campaign', 'create_video_campaign', 'update_ad_copy',
   'update_ad_url', 'update_geo_targeting', 'add_ad_extension',
@@ -195,6 +195,13 @@ function googleCheck(name, args, accountId) {
     checks.push(['ad_group_resource', args.ad_group_resource, 'ad_group']);
   if ((name === 'update_ad_copy' || name === 'update_ad_url') && args.ad_resource_name)
     checks.push(['ad_resource_name', args.ad_resource_name, 'ad']);
+  if ((name === 'pause_ad' || name === 'enable_ad') && Array.isArray(args.ad_resource_names)) {
+    const escaped = String(cid).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const adOrAdGroupAd = new RegExp(`^customers/${escaped}/(?:ads/\\d+|adGroupAds/\\d+~\\d+)$`);
+    for (const [i, value] of args.ad_resource_names.entries()) {
+      if (typeof value !== 'string' || !adOrAdGroupAd.test(value)) return invalidGoogleResource(`ad_resource_names[${i}]`, 'ad');
+    }
+  }
   if (name === 'update_geo_targeting') {
     for (const [field, value] of (args.remove || []).entries()) {
       if (typeof value === 'string' && value.startsWith('customers/')) checks.push([`remove[${field}]`, value, 'campaign_criterion']);
