@@ -75,6 +75,11 @@
           "text": "Google API access fixed 2026-09-17 (MCC corrected to 7631184147), so permission errors are now real failures. $5,500 budget = $3K Google base + $2.5K redirected from Meta while the Meta account is disabled (per Liza Hammon, 2026-07-29); revert to $3K when Meta is restored.",
           "added": "2026-09-22",
           "expires": "2026-10-31"
+        },
+        {
+          "text": "2026-10-08 location split: 7 onsite-shipping states (AK, DE, MT, NH, NC, OR, VA) → Search_G_Brand_OnsiteStates ($10, /our-products/) + Shopping_G_Standard ($15, re-enabled, Max Clicks $1.25 cap). Other 43 states + DC → Search_G_Brand_Charlies_US_Other ($52, $1.50 cap, BWP page) + PMax_G_US_All products ($60). PMax_Non Brand ($13) kept on 2-week watch (97% YouTube). BWP conversion tracking broken since ~9/2 and cookie banner since 9/25 — low conversions are a known tracking gap, not a new break. Search_G_NonBrand_BWP-States ($15, 43 states + DC, BWP page, Max Clicks $1.50 cap, 3 exact-match ad groups) built PAUSED 10/8 awaiting enable.",
+          "added": "2026-10-08",
+          "expires": "2026-11-08"
         }
       ]
     },
