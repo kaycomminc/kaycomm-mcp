@@ -4271,6 +4271,11 @@ async function setBiddingStrategy(token, customerId, mccId, campaignResourceName
 async function createGoogleCampaignFull(token, customerId, mccId, config) {
     // config: { campaign_name, daily_budget, campaign_type, bidding_strategy, ad_groups: [{name, keywords:[{text,match_type}]}] }
     const type = (config.campaign_type || "SEARCH").toUpperCase();
+    // Standard Shopping: needs a linked Merchant Center ID, product ad groups,
+    // one Shopping product ad each, and a root listing group (all products).
+    const isShopping = type === "SHOPPING";
+    if (isShopping && !config.merchant_id) throw new Error("SHOPPING campaigns need merchant_id (a Merchant Center account linked to this Google Ads account).");
+    const shoppingBidMicros = String(Math.round((config.default_cpc_bid || 1) * 1_000_000));
     const mutateOperations = [];
 
     // Op 0: Budget
@@ -4323,6 +4328,7 @@ async function createGoogleCampaignFull(token, customerId, mccId, config) {
                     positiveGeoTargetType: "PRESENCE",
                 },
                 containsEuPoliticalAdvertising: "DOES_NOT_CONTAIN_EU_POLITICAL_ADVERTISING",
+                ...(isShopping ? { shoppingSetting: { merchantId: String(config.merchant_id), campaignPriority: 0, enableLocal: false } } : {}),
                 ...biddingFields,
             },
         },
@@ -4342,9 +4348,23 @@ async function createGoogleCampaignFull(token, customerId, mccId, config) {
                     name:         ag.name,
                     campaign:     campaignTempName,
                     status:       "ENABLED",
+                    ...(isShopping ? { type: "SHOPPING_PRODUCT_ADS", cpcBidMicros: shoppingBidMicros } : {}),
                 },
             },
         });
+        if (isShopping) {
+            mutateOperations.push({
+                adGroupAdOperation: {
+                    create: { adGroup: agTempName, status: "ENABLED", ad: { shoppingProductAd: {} } },
+                },
+            });
+            mutateOperations.push({
+                adGroupCriterionOperation: {
+                    create: { adGroup: agTempName, status: "ENABLED", listingGroup: { type: "UNIT" }, cpcBidMicros: shoppingBidMicros },
+                },
+            });
+            continue;
+        }
         for (const kw of (ag.keywords || [])) {
             keywordOps.set(mutateOperations.length, { ad_group: ag.name, text: kw.text, match_type: (kw.match_type || "BROAD").toUpperCase() });
             mutateOperations.push({
@@ -4359,8 +4379,9 @@ async function createGoogleCampaignFull(token, customerId, mccId, config) {
         }
     }
 
-    // Language targeting: English
-    mutateOperations.push({
+    // Language targeting: English (Shopping takes its language from the feed
+    // and rejects language criteria)
+    if (!isShopping) mutateOperations.push({
         campaignCriterionOperation: {
             create: {
                 campaign: campaignTempName,
@@ -6600,7 +6621,9 @@ function makeServer() {
                     account_name:      { type: "string", description: "Client name (partial match ok)" },
                     campaign_name:     { type: "string", description: "Name for the new campaign" },
                     daily_budget:      { type: "number", description: "Daily budget in dollars" },
-                    campaign_type:     { type: "string", enum: ["SEARCH","DISPLAY","SHOPPING"], description: "Campaign type (default: SEARCH)" },
+                    campaign_type:     { type: "string", enum: ["SEARCH","DISPLAY","SHOPPING"], description: "Campaign type (default: SEARCH). SHOPPING builds a Standard Shopping campaign: requires merchant_id; each ad group becomes a product ad group with one Shopping ad and an all-products listing group (keywords ignored)." },
+                    merchant_id:       { type: "string", description: "SHOPPING only: linked Merchant Center ID to advertise from." },
+                    default_cpc_bid:   { type: "number", description: "SHOPPING only: ad group / listing group CPC bid in dollars (default 1.00; used by Manual CPC, ignored by automated bidding)." },
                     bidding_strategy:  { type: "string", enum: ["MANUAL_CPC","MAXIMIZE_CLICKS","MAXIMIZE_CONVERSIONS"], description: "Bidding strategy (default: MANUAL_CPC). For TARGET_CPA/TARGET_ROAS, create with MAXIMIZE_CONVERSIONS then switch via set_bidding_strategy." },
                     geo_targets: {
                         type: "array",
@@ -10000,6 +10023,8 @@ async function dispatchToolCall(name, args = {}) {
                         bidding_strategy: args.bidding_strategy || "MANUAL_CPC",
                         geo_targets:      args.geo_targets,
                         ad_groups:        args.ad_groups,
+                        merchant_id:      args.merchant_id,
+                        default_cpc_bid:  args.default_cpc_bid,
                     };
 
                     if (!confirm) {
@@ -10026,10 +10051,11 @@ async function dispatchToolCall(name, args = {}) {
                                 daily_budget:     "$" + config.daily_budget.toFixed(2),
                                 bidding_strategy: config.bidding_strategy,
                                 status:           "PAUSED (default for new campaigns)",
-                                language:         "English",
+                                language:         config.campaign_type === "SHOPPING" ? "From feed (en)" : "English",
                                 geo_targets:      config.geo_targets.map(id => `geoTargetConstants/${id}`),
                                 geo_targeting:    "PRESENCE (people in your targeted locations)",
                                 search_partners:  "OFF",
+                                ...(config.campaign_type === "SHOPPING" ? { merchant_id: config.merchant_id, default_cpc_bid: "$" + (config.default_cpc_bid || 1).toFixed(2), listing_groups: "All products (one root unit per ad group)" } : {}),
                                 ad_groups:        config.ad_groups.map(ag => ({
                                     name:          ag.name,
                                     keyword_count: ag.keywords?.length || 0,
