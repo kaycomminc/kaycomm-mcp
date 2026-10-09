@@ -101,6 +101,8 @@ const BUILTIN_HEALTH_DEFAULTS = {
     quality_score_floor: 5,
     zero_spend_days_threshold: 7,
     budget_exhaustion_is_lost_pct: 20,
+    campaign_delivery_drop_pct: -60,
+    campaign_underdelivery_pct: 25,
 };
 
 // Top-level keys the code actually reads off a google/meta account entry
@@ -2284,18 +2286,30 @@ async function fetchGA4Report(token, propertyId, dateRange, breakdownBy = "chann
 // ── Campaign performance ──────────────────────────────────────────────────────
 async function fetchGoogleCampaignPerf(token, customerId, mccId, dateRange, startDate, endDate, segmentBy) {
     const dateClause = resolveGaqlDateClause(dateRange, startDate, endDate);
-    const byConvAction = segmentBy === "conversion_action";
+    // all_conversion_action uses all_conversions so secondary (non-bidding) actions show up too
+    const allConvs     = segmentBy === "all_conversion_action";
+    const byConvAction = segmentBy === "conversion_action" || allConvs;
 
     if (byConvAction) {
-        const rows = await googleSearch(token, customerId, mccId, `
-            SELECT campaign.name, campaign.status, campaign.advertising_channel_type,
-                   segments.conversion_action, segments.conversion_action_name,
-                   segments.conversion_action_category,
-                   metrics.conversions, metrics.conversions_value
-            FROM campaign
-            WHERE segments.date ${dateClause}
-              AND metrics.conversions > 0
-            ORDER BY metrics.conversions DESC`);
+        const convMetric = allConvs ? "all_conversions" : "conversions";
+        const [rows, primary] = await Promise.all([
+            googleSearch(token, customerId, mccId, `
+                SELECT campaign.name, campaign.status, campaign.advertising_channel_type,
+                       segments.conversion_action, segments.conversion_action_name,
+                       segments.conversion_action_category,
+                       metrics.${convMetric}, metrics.${convMetric}_value
+                FROM campaign
+                WHERE segments.date ${dateClause}
+                  AND metrics.${convMetric} > 0
+                ORDER BY metrics.${convMetric} DESC`),
+            allConvs
+                ? googleSearch(token, customerId, mccId, `
+                    SELECT conversion_action.resource_name, conversion_action.primary_for_goal
+                    FROM conversion_action`).catch(() => [])
+                : [],
+        ]);
+        const isPrimary = Object.fromEntries(primary.map(r =>
+            [r.conversionAction.resourceName, !!r.conversionAction.primaryForGoal]));
         const byCampaign = {};
         for (const row of rows) {
             const name = row.campaign.name;
@@ -2307,15 +2321,17 @@ async function fetchGoogleCampaignPerf(token, customerId, mccId, dateRange, star
                     conversion_actions: [],
                 };
             }
-            const convs   = parseFloat(row.metrics.conversions || 0);
-            const convVal = parseFloat(row.metrics.conversionsValue || 0);
+            const convs   = parseFloat((allConvs ? row.metrics.allConversions : row.metrics.conversions) || 0);
+            const convVal = parseFloat((allConvs ? row.metrics.allConversionsValue : row.metrics.conversionsValue) || 0);
             if (convs === 0 && convVal === 0) continue;
-            byCampaign[name].conversion_actions.push({
+            const entry = {
                 conversion_action: row.segments?.conversionActionName || "Unknown",
                 category:          row.segments?.conversionActionCategory || null,
                 conversions:       convs,
                 conv_value:        Math.round(convVal * 100) / 100,
-            });
+            };
+            if (allConvs) entry.primary = isPrimary[row.segments?.conversionAction] ?? null;
+            byCampaign[name].conversion_actions.push(entry);
         }
         for (const c of Object.values(byCampaign)) {
             c.conversion_actions.sort((a, b) => b.conversions - a.conversions);
@@ -4193,51 +4209,34 @@ async function fetchZeroImpressionCampaigns(token, customerId, mccId, yesterday)
 
 function buildBiddingUpdateBody(strategy, options = {}) {
     const s = strategy.toUpperCase();
-    // Update masks may only list leaf fields (parent scheme fields are rejected
-    // with FIELD_HAS_SUBFIELDS), so strategy switches set bidding_strategy_type
-    // directly; Maximize Clicks is the TARGET_SPEND scheme.
+    // campaign.bidding_strategy_type is output-only: a mutate that sets just it
+    // returns 200 and changes nothing. Switching strategy means setting the
+    // scheme oneof, and update masks may only list leaf fields (parent scheme
+    // fields are rejected with FIELD_HAS_SUBFIELDS), so each branch masks one
+    // leaf of its scheme — left unset when no target is given, which selects
+    // the scheme with no target. Maximize Clicks is the TARGET_SPEND scheme.
+    const micros = d => String(Math.round(d * 1_000_000));
     if (s === "MANUAL_CPC") {
-        return { campaignFields: { biddingStrategyType: "MANUAL_CPC" }, updateMask: "bidding_strategy_type" };
+        return { campaignFields: { manualCpc: { enhancedCpcEnabled: false } }, updateMask: "manual_cpc.enhanced_cpc_enabled" };
     } else if (s === "ENHANCED_CPC") {
         throw new Error("Enhanced CPC was sunset by Google and can no longer be set via the API — use MANUAL_CPC or MAXIMIZE_CLICKS instead.");
     } else if (s === "MAXIMIZE_CLICKS") {
-        if (options.cpc_bid_ceiling) {
-            return {
-                campaignFields: { biddingStrategyType: "TARGET_SPEND", targetSpend: { cpcBidCeilingMicros: String(Math.round(options.cpc_bid_ceiling * 1_000_000)) } },
-                updateMask: "bidding_strategy_type,target_spend.cpc_bid_ceiling_micros",
-            };
-        }
-        return { campaignFields: { biddingStrategyType: "TARGET_SPEND" }, updateMask: "bidding_strategy_type" };
+        const targetSpend = options.cpc_bid_ceiling ? { cpcBidCeilingMicros: micros(options.cpc_bid_ceiling) } : {};
+        return { campaignFields: { targetSpend }, updateMask: "target_spend.cpc_bid_ceiling_micros" };
     } else if (s === "MAXIMIZE_CONVERSIONS") {
-        if (options.target_cpa) {
-            return {
-                campaignFields: { biddingStrategyType: "MAXIMIZE_CONVERSIONS", maximizeConversions: { targetCpaMicros: String(Math.round(options.target_cpa * 1_000_000)) } },
-                updateMask: "bidding_strategy_type,maximize_conversions.target_cpa_micros",
-            };
-        }
-        return { campaignFields: { biddingStrategyType: "MAXIMIZE_CONVERSIONS" }, updateMask: "bidding_strategy_type" };
+        const maximizeConversions = options.target_cpa ? { targetCpaMicros: micros(options.target_cpa) } : {};
+        return { campaignFields: { maximizeConversions }, updateMask: "maximize_conversions.target_cpa_micros" };
     } else if (s === "TARGET_CPA") {
         if (!options.target_cpa) throw new Error("target_cpa (dollars) is required for TARGET_CPA strategy");
-        return {
-            campaignFields: { biddingStrategyType: "TARGET_CPA", targetCpa: { targetCpaMicros: String(Math.round(options.target_cpa * 1_000_000)) } },
-            updateMask: "bidding_strategy_type,target_cpa.target_cpa_micros",
-        };
+        return { campaignFields: { targetCpa: { targetCpaMicros: micros(options.target_cpa) } }, updateMask: "target_cpa.target_cpa_micros" };
     } else if (s === "TARGET_ROAS") {
         if (!options.target_roas) throw new Error("target_roas is required for TARGET_ROAS strategy (e.g. 3.0 = 300% ROAS)");
-        return {
-            campaignFields: { biddingStrategyType: "TARGET_ROAS", targetRoas: { targetRoas: options.target_roas } },
-            updateMask: "bidding_strategy_type,target_roas.target_roas",
-        };
+        return { campaignFields: { targetRoas: { targetRoas: options.target_roas } }, updateMask: "target_roas.target_roas" };
     } else if (s === "MAXIMIZE_CONVERSION_VALUE") {
-        if (options.target_roas) {
-            return {
-                campaignFields: { biddingStrategyType: "MAXIMIZE_CONVERSION_VALUE", maximizeConversionValue: { targetRoas: options.target_roas } },
-                updateMask: "bidding_strategy_type,maximize_conversion_value.target_roas",
-            };
-        }
-        return { campaignFields: { biddingStrategyType: "MAXIMIZE_CONVERSION_VALUE" }, updateMask: "bidding_strategy_type" };
+        const maximizeConversionValue = options.target_roas ? { targetRoas: options.target_roas } : {};
+        return { campaignFields: { maximizeConversionValue }, updateMask: "maximize_conversion_value.target_roas" };
     } else {
-        throw new Error(`Unknown strategy: ${strategy}. Valid: MANUAL_CPC, MAXIMIZE_CLICKS, MAXIMIZE_CONVERSIONS, TARGET_CPA, TARGET_ROAS`);
+        throw new Error(`Unknown strategy: ${strategy}. Valid: MANUAL_CPC, MAXIMIZE_CLICKS, MAXIMIZE_CONVERSIONS, MAXIMIZE_CONVERSION_VALUE, TARGET_CPA, TARGET_ROAS`);
     }
 }
 
@@ -5957,8 +5956,8 @@ function makeServer() {
                     end_date:   { type: "string", description: "End date YYYY-MM-DD (only with CUSTOM)" },
                     segment_by: {
                         type: "string",
-                        description: "Optional segmentation. 'conversion_action' breaks out conversions and conv_value by individual conversion action per campaign (Google only).",
-                        enum: ["conversion_action"],
+                        description: "Optional segmentation (Google only). 'conversion_action' breaks out conversions and conv_value by individual conversion action per campaign — primary (bidding) actions only. 'all_conversion_action' uses all_conversions instead, so secondary actions (retailer click-outs, GA4 events, etc.) are included, each flagged primary true/false.",
+                        enum: ["conversion_action", "all_conversion_action"],
                     },
                 },
                 required: ["account_name"],
@@ -9994,7 +9993,14 @@ async function dispatchToolCall(name, args = {}) {
                                 target_roas:     args.target_roas,
                                 cpc_bid_ceiling: args.cpc_bid_ceiling,
                             });
-                            result = { success: true, account: info.name, campaign: camp.name, new_strategy: strategy, change: preview };
+                            // Read back: Google can accept a mutate that changes nothing.
+                            const expected = strategy === "MAXIMIZE_CLICKS" ? "TARGET_SPEND" : strategy;
+                            const after = (await fetchBiddingStrategies(token, cid, info.mcc, camp.name)).find(c => c.campaign === camp.name);
+                            if (after?.bidding_strategy !== expected) {
+                                result = { error: `Google accepted the change but ${camp.name} still reads ${after?.bidding_strategy ?? "unknown"} (expected ${expected}).`, account: info.name, campaign: camp.name, attempted: preview };
+                            } else {
+                                result = { success: true, account: info.name, campaign: camp.name, new_strategy: strategy, change: preview, verified: after };
+                            }
                         }
                     }
                 } catch (e) { result = { error: e.message }; }
@@ -11381,7 +11387,7 @@ async function dispatchToolCall(name, args = {}) {
         const errors = [];
         let accountsChecked = 0;
 
-        const checksRun = ["pacing_drift", "conversion_dry_spell", "cpa_roas_breach", "spend_anomaly", "zero_impressions", "budget_exhaustion"];
+        const checksRun = ["pacing_drift", "conversion_dry_spell", "cpa_roas_breach", "spend_anomaly", "zero_impressions", "budget_exhaustion", "campaign_delivery"];
         if (weekly) checksRun.push("impression_share_decay", "ctr_degradation", "meta_frequency", "quality_score");
         if (structural) checksRun.push("zero_spend_7d", "ad_disapprovals", "negative_keyword_conflicts");
 
@@ -11591,6 +11597,62 @@ async function dispatchToolCall(name, args = {}) {
                                 { campaigns: exhausted.map(c => ({ campaign: c.name, budget_lost_is: Math.round(c.budgetLostIS * 10000) / 100 + "%" })) });
                         }
                     }
+
+                    // ── Check 6b: Campaign delivery collapse / throttled bid target ──
+                    // Account-level spend can stay on pace while one campaign quietly stops
+                    // serving (other campaigns absorb the budget), e.g. a tCPA set far below
+                    // what the campaign's conversion goal actually costs. Spend isn't subject
+                    // to conversion lag, so the last 7 days are safe to judge.
+                    try {
+                        const start = daysAgo(27, yesterday), recentStart = daysAgo(6, yesterday);
+                        const rows = await googleSearch(token, cid, gAcct.mcc, `
+                            SELECT segments.date, campaign.name, campaign.bidding_strategy_type,
+                                   campaign.maximize_conversions.target_cpa_micros,
+                                   campaign.target_cpa.target_cpa_micros,
+                                   campaign.maximize_conversion_value.target_roas,
+                                   campaign.target_roas.target_roas,
+                                   campaign_budget.amount_micros,
+                                   metrics.cost_micros, metrics.conversions
+                            FROM campaign
+                            WHERE segments.date BETWEEN '${start}' AND '${yesterday}'
+                              AND campaign.status = 'ENABLED'`);
+                        const camps = {};
+                        for (const row of rows) {
+                            const c = camps[row.campaign.name] ||= {
+                                strategy: row.campaign.biddingStrategyType,
+                                target_cpa: parseInt(row.campaign.maximizeConversions?.targetCpaMicros || row.campaign.targetCpa?.targetCpaMicros || 0) / 1_000_000 || null,
+                                target_roas: parseFloat(row.campaign.maximizeConversionValue?.targetRoas || row.campaign.targetRoas?.targetRoas || 0) || null,
+                                daily_budget: parseInt(row.campaignBudget?.amountMicros || 0) / 1_000_000,
+                                recent: 0, prior: 0, prior_convs: 0,
+                            };
+                            const spend = parseInt(row.metrics?.costMicros || 0) / 1_000_000;
+                            if (row.segments.date >= recentStart) c.recent += spend;
+                            else { c.prior += spend; c.prior_convs += parseFloat(row.metrics?.conversions || 0); }
+                        }
+                        const r2 = n => Math.round(n * 100) / 100;
+                        for (const [name, c] of Object.entries(camps)) {
+                            if (c.daily_budget < 5) continue;
+                            const recentAvg = c.recent / 7, priorAvg = c.prior / 21;
+                            const budgetPct = Math.round((recentAvg / c.daily_budget) * 100);
+                            const dropPct = priorAvg > 0 ? Math.round(((recentAvg - priorAvg) / priorAvg) * 100) : null;
+                            const hasTarget = !!(c.target_cpa || c.target_roas);
+                            const collapsed = priorAvg >= 5 && dropPct != null && dropPct <= hc.campaign_delivery_drop_pct;
+                            const throttled = hasTarget && budgetPct < hc.campaign_underdelivery_pct;
+                            if (!collapsed && !throttled) continue;
+                            const target = c.target_cpa ? `tCPA $${c.target_cpa}` : c.target_roas ? `tROAS ${Math.round(c.target_roas * 100)}%` : null;
+                            const priorCpa = c.prior_convs > 0 ? r2(c.prior / c.prior_convs) : null;
+                            const why = [
+                                collapsed ? `7d avg $${r2(recentAvg)}/day vs $${r2(priorAvg)}/day prior 21d (${dropPct}%)` : `7d avg $${r2(recentAvg)}/day`,
+                                `${budgetPct}% of $${c.daily_budget}/day budget`,
+                                target ? `${target}${c.target_cpa && priorCpa ? ` vs $${priorCpa} prior CPA` : ""} may be throttling bids — check target and conversion goal` : null,
+                            ].filter(Boolean).join("; ");
+                            addFinding(budgetPct < 10 ? "critical" : "warning", "campaign_delivery", gAcct.name, "google",
+                                `"${name}" under-delivering: ${why}`,
+                                { campaign: name, strategy: c.strategy, target_cpa: c.target_cpa, target_roas: c.target_roas,
+                                  daily_budget: c.daily_budget, recent_7d_avg: r2(recentAvg), prior_21d_avg: r2(priorAvg),
+                                  drop_pct: dropPct, budget_utilization_pct: budgetPct, prior_21d_cpa: priorCpa });
+                        }
+                    } catch (e) { errors.push(`${gAcct.name} campaign delivery check: ${e.message}`); }
 
                     // ── Weekly checks ──
                     if (weekly) {
