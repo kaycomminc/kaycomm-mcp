@@ -285,6 +285,23 @@
       "name": "PHQ",
       "budget": 510,
       "page_id": "513620928749165"
+    },
+    "act_691815912715665": {
+      "name": "Eye Associates of NF",
+      "budget": 1900,
+      "budget_schedule": [
+        {
+          "from": "2026-11-01",
+          "budget": 1400
+        }
+      ],
+      "notes": [
+        {
+          "text": "Meta managed for Grova Creative (G Williams), runs through 2026-12-31. $1,900 Oct, $1,400/mo from 11/1. FLORIDA ONLY: no Georgia targeting (GA test postponed per G 10/9). Geos = areas around the 4 offices (Tallahassee, Perry, Quincy, Crawfordville) plus small/seasonal towns without advanced eye care (Blountstown, Apalachicola, etc.).",
+          "added": "2026-10-10",
+          "expires": "2026-12-31"
+        }
+      ]
     }
   },
   "stackadapt": {},
