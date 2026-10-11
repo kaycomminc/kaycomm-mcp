@@ -7527,7 +7527,7 @@ function makeServer() {
         },
         {
             name: "preview_meta_ad",
-            description: "Generate a preview of a Meta ad by ad ID, creative ID, or creative spec. Returns an iframe HTML preview valid for 24 hours.",
+            description: "Generate a preview of a Meta ad by ad ID, creative ID, or creative spec. Returns an iframe HTML preview valid for 24 hours; with ad_id also returns shareable_link (fb.me link for clients).",
             inputSchema: {
                 type: "object",
                 properties: {
@@ -12353,8 +12353,12 @@ async function dispatchToolCall(name, args = {}) {
             const adFormat = args.ad_format || "DESKTOP_FEED_STANDARD";
             try {
                 if (args.ad_id) {
-                    const data = await metaGet(`${args.ad_id}/previews`, { ad_format: adFormat });
-                    result = { ad_id: args.ad_id, ad_format: adFormat, previews: data.data || [] };
+                    const [data, ad] = await Promise.all([
+                        metaGet(`${args.ad_id}/previews`, { ad_format: adFormat }),
+                        metaGet(args.ad_id, { fields: "preview_shareable_link" }).catch(() => ({})),
+                    ]);
+                    // Shareable link (fb.me) works for clients without Ads Manager access.
+                    result = { ad_id: args.ad_id, ad_format: adFormat, shareable_link: ad.preview_shareable_link || null, previews: data.data || [] };
                 } else if (args.creative_id) {
                     const data = await metaGet(`${metaActId(accountId)}/generatepreviews`, {
                         creative: JSON.stringify({ creative_id: args.creative_id }),
