@@ -816,18 +816,18 @@ async function fetchMetaDailyBudgets(accountId) {
         // metaGetAll follows Graph's paging.next cursor. A single metaGet here
         // silently dropped campaigns/ad sets after the first page and could
         // turn an under-counted current budget into a misleading RAISE.
-        metaGetAll(`${accountId}/campaigns`, { fields: "id,effective_status,daily_budget,lifetime_budget", limit: 200 }),
-        metaGetAll(`${accountId}/adsets`,    { fields: "id,campaign_id,effective_status,daily_budget,lifetime_budget", limit: 500 }),
+        metaGetAll(`${accountId}/campaigns`, { fields: "id,effective_status,daily_budget,lifetime_budget,stop_time", limit: 200 }),
+        metaGetAll(`${accountId}/adsets`,    { fields: "id,campaign_id,effective_status,daily_budget,lifetime_budget,end_time", limit: 500 }),
     ]);
     let total = 0, hasLifetime = false;
     const campHasBudget = new Set();
     for (const c of camps) {
-        if (c.effective_status !== "ACTIVE") continue;
+        if (c.effective_status !== "ACTIVE" || metaEnded(c.stop_time)) continue;
         if (c.daily_budget)    { total += parseInt(c.daily_budget) / 100; campHasBudget.add(c.id); }
         if (c.lifetime_budget) { hasLifetime = true; campHasBudget.add(c.id); }
     }
     for (const s of adsets) {
-        if (s.effective_status !== "ACTIVE") continue;
+        if (s.effective_status !== "ACTIVE" || metaEnded(s.end_time)) continue;
         if (campHasBudget.has(s.campaign_id)) continue;
         if (s.daily_budget)    total += parseInt(s.daily_budget) / 100;
         if (s.lifetime_budget) hasLifetime = true;
@@ -1663,23 +1663,54 @@ async function getMetaCreativeDetails(creativeIds) {
     return results;
 }
 
+// Meta never flips status when a schedule ends: a finished campaign/ad set
+// stays status=ACTIVE and effective_status=ACTIVE, and Ads Manager derives
+// "Completed" from the end date. Mirror that so a finished flight never reads
+// as live (or gets its budget counted in pacing).
+const metaEnded = (end) => !!end && new Date(end).getTime() <= Date.now();
+
+function metaDelivery(effectiveStatus, ended) {
+    if (ended && (effectiveStatus === "ACTIVE" || !effectiveStatus)) return "COMPLETED";
+    return effectiveStatus || null;
+}
+
 async function getMetaCampaigns(accountId) {
-    const rows = await metaGetAll(`${accountId}/campaigns`, {
-        fields: "id,name,status,daily_budget,lifetime_budget,objective",
-        limit: 100,
+    const [rows, adsets] = await Promise.all([
+        metaGetAll(`${accountId}/campaigns`, {
+            fields: "id,name,status,effective_status,daily_budget,lifetime_budget,objective,start_time,stop_time",
+            limit: 100,
+        }),
+        // ABO campaigns usually have no stop_time; their end dates live on the
+        // ad sets. A campaign whose every ad set has ended is complete.
+        metaGetAll(`${accountId}/adsets`, { fields: "campaign_id,end_time", limit: 500 }),
+    ]);
+    const adsetEnds = new Map();
+    for (const s of adsets) {
+        if (!adsetEnds.has(s.campaign_id)) adsetEnds.set(s.campaign_id, []);
+        adsetEnds.get(s.campaign_id).push(s.end_time || null);
+    }
+    return rows.map(c => {
+        const ends = adsetEnds.get(c.id) || [];
+        const allAdsetsEnded = ends.length > 0 && ends.every(metaEnded);
+        const ended = metaEnded(c.stop_time) || allAdsetsEnded;
+        const latestAdsetEnd = allAdsetsEnded ? ends.reduce((a, b) => (a > b ? a : b)) : null;
+        return {
+            id: c.id, name: c.name, status: c.status,
+            effective_status: c.effective_status || null,
+            delivery: metaDelivery(c.effective_status, ended),
+            start_time: c.start_time || null,
+            end_time: c.stop_time || latestAdsetEnd,
+            daily_budget:    c.daily_budget    ? parseFloat(c.daily_budget) / 100    : null,
+            lifetime_budget: c.lifetime_budget ? parseFloat(c.lifetime_budget) / 100 : null,
+            objective: c.objective,
+            level: "campaign",
+        };
     });
-    return rows.map(c => ({
-        id: c.id, name: c.name, status: c.status,
-        daily_budget:    c.daily_budget    ? parseFloat(c.daily_budget) / 100    : null,
-        lifetime_budget: c.lifetime_budget ? parseFloat(c.lifetime_budget) / 100 : null,
-        objective: c.objective,
-        level: "campaign",
-    }));
 }
 
 async function getMetaAdsets(accountId) {
     const rows = await metaGetAll(`${accountId}/adsets`, {
-        fields: "id,name,status,daily_budget,lifetime_budget,campaign_id,campaign{name},targeting",
+        fields: "id,name,status,effective_status,start_time,end_time,daily_budget,lifetime_budget,campaign_id,campaign{name},targeting",
         limit: 200,
     });
     return rows.map(s => {
@@ -1688,6 +1719,10 @@ async function getMetaAdsets(accountId) {
         const behaviors = (t.flexible_spec || []).flatMap(fs => (fs.behaviors || []).map(b => ({ id: b.id, name: b.name })));
         return {
             id: s.id, name: s.name, status: s.status,
+            effective_status: s.effective_status || null,
+            delivery: metaDelivery(s.effective_status, metaEnded(s.end_time)),
+            start_time: s.start_time || null,
+            end_time: s.end_time || null,
             campaign: s.campaign?.name || s.campaign_id,
             daily_budget:    s.daily_budget    ? parseFloat(s.daily_budget) / 100    : null,
             lifetime_budget: s.lifetime_budget ? parseFloat(s.lifetime_budget) / 100 : null,
@@ -1864,6 +1899,9 @@ async function buildMetaTargetingSpec(targeting) {
     for (const [k, v] of Object.entries(targeting)) {
         if (!handled.has(k) && v != null) spec[k] = v;
     }
+
+    // Meta requires an explicit Advantage+ audience flag on new ad sets; default off (no AI features).
+    if (!spec.targeting_automation) spec.targeting_automation = { advantage_audience: 0 };
 
     return { spec, warnings, errors, geo_resolution: geoResolution };
 }
@@ -9925,13 +9963,15 @@ async function dispatchToolCall(name, args = {}) {
                 try {
                     const campaigns = await getMetaCampaigns(accountId);
                     const adsets    = await getMetaAdsets(accountId);
-                    const filtCamp  = activeOnly ? campaigns.filter(c => c.status === "ACTIVE") : campaigns;
-                    const filtAds   = activeOnly ? adsets.filter(s => s.status === "ACTIVE") : adsets;
+                    const filtCamp  = activeOnly ? campaigns.filter(c => c.delivery === "ACTIVE") : campaigns;
+                    const filtAds   = activeOnly ? adsets.filter(s => s.delivery === "ACTIVE") : adsets;
                     result.meta.push({
                         account: info.name,
                         campaigns: filtCamp.map(c => ({
                             name:             c.name,
                             status:           c.status,
+                            delivery:         c.delivery,
+                            end_time:         c.end_time,
                             budget_type:      c.daily_budget ? "daily" : c.lifetime_budget ? "lifetime" : "none",
                             daily_budget:     c.daily_budget    ? "$" + c.daily_budget.toFixed(2)    : null,
                             lifetime_budget:  c.lifetime_budget ? "$" + c.lifetime_budget.toFixed(2) : null,
@@ -9941,6 +9981,8 @@ async function dispatchToolCall(name, args = {}) {
                             name:            s.name,
                             campaign:        s.campaign,
                             status:          s.status,
+                            delivery:        s.delivery,
+                            end_time:        s.end_time,
                             budget_type:     s.daily_budget ? "daily" : s.lifetime_budget ? "lifetime" : "inherited",
                             daily_budget:    s.daily_budget    ? "$" + s.daily_budget.toFixed(2)    : null,
                             lifetime_budget: s.lifetime_budget ? "$" + s.lifetime_budget.toFixed(2) : null,

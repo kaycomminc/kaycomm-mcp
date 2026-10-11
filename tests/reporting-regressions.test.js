@@ -18,11 +18,18 @@ global.fetch = async (url) => {
     let body;
     if (isCampaign) {
         body = secondPage
-            ? { data: [{ id: "c2", effective_status: "ACTIVE", lifetime_budget: "5000" }] }
+            ? { data: [
+                { id: "c2", effective_status: "ACTIVE", lifetime_budget: "5000" },
+                // Completed flight: Meta leaves it ACTIVE after stop_time passes.
+                { id: "c4", effective_status: "ACTIVE", daily_budget: "2000", stop_time: "2020-01-31T23:59:00-0500" },
+            ] }
             : { data: [{ id: "c1", effective_status: "ACTIVE", daily_budget: "1000" }], paging: { next: "https://graph.facebook.com/v25.0/act_test/campaigns?after=2" } };
     } else {
         body = secondPage
-            ? { data: [{ id: "s2", campaign_id: "c3", effective_status: "ACTIVE", daily_budget: "3000" }] }
+            ? { data: [
+                { id: "s2", campaign_id: "c3", effective_status: "ACTIVE", daily_budget: "3000" },
+                { id: "s3", campaign_id: "c5", effective_status: "ACTIVE", daily_budget: "4000", end_time: "2020-01-31T23:59:00-0500" },
+            ] }
             : { data: [{ id: "s1", campaign_id: "c1", effective_status: "ACTIVE", daily_budget: "9000" }], paging: { next: "https://graph.facebook.com/v25.0/act_test/adsets?after=2" } };
     }
     return new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
@@ -35,7 +42,7 @@ global.fetch = realFetch;
 
 test("Meta daily budgets follow campaign and ad set cursors and dedupe CBO/ABO", async () => {
     const budgets = await fetchMetaDailyBudgets("act_test");
-    assert.equal(budgets.total, 40); // $10 campaign + $30 standalone ad set
+    assert.equal(budgets.total, 40); // $10 campaign + $30 standalone ad set; ended c4/s3 excluded
     assert.equal(budgets.has_lifetime_budgets, true);
     assert.equal(budgets.complete, true);
     assert.equal(calls.filter(url => url.includes("after=2")).length, 2);
