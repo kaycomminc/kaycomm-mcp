@@ -13128,8 +13128,22 @@ async function dispatchToolCall(name, args = {}) {
                         creativeSwap.warning = "This ad is ACTIVE. Swapping its creative counts as a significant edit: the ad set re-enters the learning phase and accumulated delivery optimization is reset. Consider pausing first or swapping during a low-stakes window.";
                     }
                 }
+                // Targeting is replaced wholesale by Meta, and list_adsets omits
+                // fields like custom_audiences — show the live spec and flag drops.
+                let targetingCheck = null;
+                if (args.level === "adset" && updates.targeting && !confirm) {
+                    try {
+                        const live = (await metaGet(args.object_id, { fields: "targeting" })).targeting || {};
+                        const dropped = Object.keys(live).filter(k => !(k in updates.targeting));
+                        targetingCheck = { current_targeting: live, dropped_keys: dropped };
+                    } catch (e) { targetingCheck = { current_targeting_error: e.message }; }
+                }
                 if (!confirm) {
                     const dryRun = { dry_run: true, message: "DRY RUN — set confirm=true to apply", account: info.name, object_id: args.object_id, level: args.level, updates: body };
+                    if (targetingCheck) {
+                        dryRun.targeting_check = targetingCheck;
+                        if (targetingCheck.dropped_keys?.length) dryRun.warnings = [`Targeting is replaced, not merged. These current keys would be removed: ${targetingCheck.dropped_keys.join(", ")}`];
+                    }
                     if (budgetLines.length) dryRun.budget_confirmation = "BUDGET CHANGES (in dollars):\n" + budgetLines.join("\n");
                     if (creativeSwap) {
                         dryRun.creative_swap = creativeSwap;
