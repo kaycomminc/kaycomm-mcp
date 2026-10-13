@@ -20,6 +20,7 @@ const { FileWriteStore, PostgresWriteStore, assertReserved } = require("./src/mc
 const { sameSecret, readJson, safeHttpHandler } = require("./src/mcp/http");
 const { createAccountsSync, syncedWriteAllowed } = require("./src/accounts-github");
 const metaBuild = require("./src/meta-campaign-build");
+const metaForecast = require("./src/meta-forecast");
 const metaMedia = require("./src/meta-media");
 const metaBilling = require("./src/meta-billing");
 const requestContext = new AsyncLocalStorage();
@@ -1760,6 +1761,33 @@ async function getMetaAds(accountId, filterName) {
         object_story_id: a.creative?.object_story_id || null,
         level: "ad",
     }));
+}
+
+// Campaign × 30-day insight rows across accounts, for reach-estimate
+// benchmarks. Cached in-process for 6h — the inputs move slowly.
+const metaBenchmarkCache = new Map();
+async function fetchMetaBenchmarkRows(accounts, days, warnings = []) {
+    const until = new Date(Date.now() - 86400000);
+    const since = new Date(until.getTime() - (days - 1) * 86400000);
+    const fmt = d => d.toISOString().slice(0, 10);
+    const timeRange = JSON.stringify({ since: fmt(since), until: fmt(until) });
+    const perAccount = await Promise.all(accounts.map(async ([accountId, info]) => {
+        const key = `${accountId}|${timeRange}`;
+        const hit = metaBenchmarkCache.get(key);
+        if (hit && Date.now() - hit.at < 6 * 3600000) return hit.rows;
+        try {
+            const rows = (await metaGetAll(`${metaActId(accountId)}/insights`, {
+                level: "campaign", time_range: timeRange, time_increment: 30, limit: 500,
+                fields: "campaign_name,objective,spend,impressions,reach,frequency,inline_link_clicks,actions",
+            })).map(r => ({ ...r, account: info.name }));
+            metaBenchmarkCache.set(key, { at: Date.now(), rows });
+            return rows;
+        } catch (e) {
+            warnings.push(`Benchmark fetch failed for ${info.name}: ${e.message}`);
+            return [];
+        }
+    }));
+    return perAccount.flat();
 }
 
 // ── Meta Campaign Creation Helpers ───────────────────────────────────────────
@@ -7747,14 +7775,29 @@ function makeServer() {
         },
         {
             name: "get_meta_reach_estimate",
-            description: "Estimate the potential reach for a Meta targeting spec. " +
-                "Returns estimated audience size for given targeting parameters. " +
-                "Use to validate targeting before creating campaigns.",
+            description: "Estimate audience size AND forecast monthly outcomes by budget for a Meta targeting spec — use for pitches and budget sizing. " +
+                "Accepts local geos (cities + radius, ZIPs, counties, DMAs, states). Returns Meta's audience range plus a modeled " +
+                "budget curve (impressions, reach, frequency, link clicks, results low/mid/high, saturation) at each daily budget. " +
+                "Meta's own delivery_estimate curve is empty via API, so the curve is modeled from Meta audience size + CPM/CTR/cost-per-result " +
+                "benchmarks from our Meta accounts' recent campaigns with the matching objective. Set forecast=false for audience size only.",
             inputSchema: {
                 type: "object",
                 properties: {
-                    account_name: { type: "string", description: "Meta account name (partial match ok)" },
-                    countries: { type: "array", items: { type: "string" }, description: "Country codes (e.g. ['US', 'CA'])" },
+                    account_name: { type: "string", description: "Meta account to run the estimate under (partial match ok). Any account works for prospects." },
+                    geos: {
+                        type: "array",
+                        description: "Local locations, resolved via Meta location search to exact keys (ambiguous/unmatched names error with suggestions). Include the state. Takes precedence over countries.",
+                        items: {
+                            type: "object",
+                            properties: {
+                                name:   { type: "string", description: "e.g. 'Frisco, CO', 'Summit County, CO', 'Colorado', '80443'" },
+                                radius: { type: "number", description: "Miles around a city (10-50, default 25). Ignored for non-cities." },
+                                type:   { type: "string", enum: ["city", "county", "region", "state", "zip", "dma", "neighborhood", "subcity", "country"], description: "Optional: restrict the search to one location type." },
+                            },
+                            required: ["name"],
+                        },
+                    },
+                    countries: { type: "array", items: { type: "string" }, description: "Country codes (e.g. ['US']) — used when geos is omitted." },
                     age_min: { type: "number", description: "Minimum age (default: 18)" },
                     age_max: { type: "number", description: "Maximum age (default: 65)" },
                     genders: { type: "array", items: { type: "number" }, description: "1=male, 2=female. Omit for all." },
@@ -7763,9 +7806,28 @@ function makeServer() {
                     custom_audiences: { type: "array", items: { type: "string" }, description: "Custom audience IDs" },
                     excluded_audiences: { type: "array", items: { type: "string" }, description: "Excluded audience IDs" },
                     publisher_platforms: { type: "array", items: { type: "string" }, description: "e.g. ['facebook', 'instagram']" },
-                    optimize_for: { type: "string", description: "Optimization goal (e.g. 'IMPRESSIONS', 'LINK_CLICKS')" },
+                    optimization_goal: {
+                        type: "string",
+                        enum: ["LEAD_GENERATION", "QUALITY_LEAD", "OFFSITE_CONVERSIONS", "VALUE", "LINK_CLICKS", "LANDING_PAGE_VIEWS", "REACH", "IMPRESSIONS", "AD_RECALL_LIFT", "THRUPLAY"],
+                        description: "Ad set optimization goal (default LEAD_GENERATION). Picks the benchmark objective and what counts as a result.",
+                    },
+                    optimize_for: { type: "string", description: "Deprecated alias for optimization_goal." },
+                    forecast: { type: "boolean", description: "Include the modeled budget curve (default true)." },
+                    daily_budgets: { type: "array", items: { type: "number" }, description: "Daily budgets ($) to forecast. Default: 5,10,20,35,50,75,100,150,200." },
+                    monthly_budgets: { type: "array", items: { type: "number" }, description: "Monthly budgets ($) to forecast — converted to daily (/30.4). Combined with daily_budgets." },
+                    benchmark_accounts: { type: "array", items: { type: "string" }, description: "Meta account names to benchmark from (partial match). Default: all Meta accounts." },
+                    benchmark_days: { type: "number", description: "Lookback for benchmarks, in days (default 90, max 365). Split into 30-day samples per campaign." },
+                    benchmark_objective: { type: "string", description: "Override the campaign objective benchmarked (e.g. 'OUTCOME_LEADS', 'OUTCOME_TRAFFIC')." },
+                    result_action_type: { type: "string", description: "Override what counts as a result with a raw Meta action_type (e.g. 'offsite_conversion.fb_pixel_custom')." },
+                    min_sample_spend: { type: "number", description: "Min spend ($) for a campaign-month to count as a benchmark sample (default 50)." },
+                    cpm: { type: "number", description: "Override CPM ($) instead of benchmarks." },
+                    ctr: { type: "number", description: "Override link CTR as a fraction (0.012 = 1.2%)." },
+                    cvr: { type: "number", description: "Override click→result conversion rate as a fraction (0.05 = 5%)." },
+                    cost_per_result: { type: "number", description: "Override cost per result ($) — replaces the CTR×CVR result model." },
+                    reachable_share: { type: "number", description: "Share of Meta's audience estimate actually reachable in a month (default 0.5)." },
+                    frequency_floor: { type: "number", description: "Override the baseline 30-day frequency (default: benchmark median)." },
                 },
-                required: ["account_name", "countries"],
+                required: ["account_name"],
             },
         },
         {
@@ -12695,11 +12757,24 @@ async function dispatchToolCall(name, args = {}) {
         const acctMatch = Object.entries(META_ACCOUNTS).find(([, info]) => info.name.toLowerCase().includes(search));
         if (!acctMatch) {
             result = { error: `No Meta account found matching '${args.account_name}'. Available: ${Object.values(META_ACCOUNTS).map(a => a.name).join(", ")}` };
+        } else if (!args.geos?.length && !args.countries?.length) {
+            result = { error: "Provide geos (cities/ZIPs/counties/DMAs) or countries." };
         } else {
             const [accountId, info] = acctMatch;
             try {
+                const warnings = [];
                 const targetingSpec = {};
-                if (args.countries?.length) targetingSpec.geo_locations = { countries: args.countries };
+                let geoResolution = null;
+                if (args.geos?.length) {
+                    if (args.countries?.length) warnings.push("geos is set, so countries is ignored.");
+                    const geo = await metaBuild.resolveMetaGeos(args.geos, { searchGeo: metaSearchGeoTyped });
+                    warnings.push(...geo.warnings);
+                    if (geo.errors.length) throw Object.assign(new Error("geo resolution failed"), { geoErrors: geo.errors });
+                    geoResolution = geo.resolved;
+                    targetingSpec.geo_locations = geo.geo_locations;
+                } else {
+                    targetingSpec.geo_locations = { countries: args.countries };
+                }
                 if (args.age_min) targetingSpec.age_min = args.age_min;
                 if (args.age_max) targetingSpec.age_max = args.age_max;
                 if (args.genders?.length) targetingSpec.genders = args.genders;
@@ -12710,14 +12785,16 @@ async function dispatchToolCall(name, args = {}) {
                         for (const name of args.interests) {
                             const results = await metaSearchInterests(name);
                             if (results.length) resolved.push({ id: results[0].id, name: results[0].name });
+                            else warnings.push(`Interest '${name}' not found — skipped.`);
                         }
                         if (resolved.length) flexSpec.interests = resolved;
                     }
                     if (args.behaviors?.length) {
                         const resolved = [];
                         for (const name of args.behaviors) {
-                            const results = await metaSearchInterests(name);
+                            const results = await metaSearchBehaviors(name);
                             if (results.length) resolved.push({ id: results[0].id, name: results[0].name });
+                            else warnings.push(`Behavior '${name}' not found — skipped.`);
                         }
                         if (resolved.length) flexSpec.behaviors = resolved;
                     }
@@ -12727,17 +12804,104 @@ async function dispatchToolCall(name, args = {}) {
                 if (args.excluded_audiences?.length) targetingSpec.excluded_custom_audiences = args.excluded_audiences.map(id => ({ id }));
                 if (args.publisher_platforms?.length) targetingSpec.publisher_platforms = args.publisher_platforms;
 
-                const params = { targeting_spec: JSON.stringify(targetingSpec) };
-                if (args.optimize_for) params.optimize_for = args.optimize_for;
-                const data = await metaGet(`${metaActId(accountId)}/reachestimate`, params);
+                const goal = String(args.optimization_goal || args.optimize_for || "LEAD_GENERATION").toUpperCase();
+                const actId = metaActId(accountId);
+                const tsJson = JSON.stringify(targetingSpec);
+                const [reachRaw, deliveryRaw] = await Promise.all([
+                    metaGet(`${actId}/reachestimate`, { targeting_spec: tsJson }),
+                    metaGet(`${actId}/delivery_estimate`, { targeting_spec: tsJson, optimization_goal: goal })
+                        .catch(e => { warnings.push(`delivery_estimate failed: ${e.message}`); return null; }),
+                ]);
+                const reach = metaForecast.parseReachEstimate(reachRaw);
+                const delivery = deliveryRaw ? metaForecast.parseDeliveryEstimate(deliveryRaw) : null;
+                const lower = reach.lower ?? delivery?.lower ?? null;
+                const upper = reach.upper ?? delivery?.upper ?? null;
+                const audienceMid = lower != null && upper != null ? (lower + upper) / 2 : (lower ?? upper);
+
                 result = {
                     account: info.name,
+                    optimization_goal: goal,
                     targeting_spec: targetingSpec,
-                    estimated_users: data.data?.[0]?.users ?? data.users ?? null,
-                    estimate_ready: data.data?.[0]?.estimate_ready ?? data.estimate_ready ?? null,
-                    bid_estimations: data.data?.[0]?.bid_estimations ?? null,
+                    geo_resolution: geoResolution,
+                    audience: { lower_bound: lower, upper_bound: upper, midpoint: audienceMid != null ? Math.round(audienceMid) : null, estimate_ready: reach.estimate_ready },
+                    estimated_users: audienceMid != null ? Math.round(audienceMid) : null,
+                    meta_curve: delivery?.curve
+                        ? { available: true, daily_outcomes_curve: delivery.curve, estimate_dau: delivery.dau }
+                        : { available: false, note: "Meta's delivery_estimate returned an empty daily_outcomes_curve (all zeros); any forecast here is modeled from our benchmarks." },
                 };
-            } catch (e) { result = { error: e.message }; }
+
+                if (args.forecast !== false) {
+                    const family = metaForecast.goalFamily(goal, args.benchmark_objective);
+                    const resultType = args.result_action_type || family.result;
+                    const days = Math.min(Math.max(Math.round(args.benchmark_days || 90), 30), 365);
+                    const benchAccts = args.benchmark_accounts?.length
+                        ? Object.entries(META_ACCOUNTS).filter(([, a]) => args.benchmark_accounts.some(n => a.name.toLowerCase().includes(String(n).toLowerCase())))
+                        : Object.entries(META_ACCOUNTS);
+                    if (!benchAccts.length) warnings.push(`benchmark_accounts matched no Meta accounts.`);
+                    const rows = await fetchMetaBenchmarkRows(benchAccts, days, warnings);
+                    const filtered = rows.filter(r => r.objective === family.objective);
+                    const minSpend = args.min_sample_spend ?? 50;
+                    const benchmarks = metaForecast.buildBenchmarks(filtered, { resultType, minSpend });
+                    // Too little same-objective history: borrow delivery metrics
+                    // (CPM / CTR / frequency) from every objective. CVR is never borrowed.
+                    let deliveryFallback = false;
+                    if (benchmarks.samples < 3) {
+                        const all = metaForecast.buildBenchmarks(rows, { resultType, minSpend });
+                        if (all.samples > benchmarks.samples) {
+                            deliveryFallback = true;
+                            Object.assign(benchmarks, { cpm: all.cpm, ctr: all.ctr, frequency_30d: all.frequency_30d });
+                            warnings.push(`Only ${benchmarks.samples} ${family.objective} sample(s) — CPM/CTR/frequency use all ${all.samples} campaign-months across objectives.`);
+                        }
+                    }
+                    const inputs = metaForecast.resolveInputs(benchmarks, {
+                        cpm: args.cpm, ctr: args.ctr, cvr: args.cvr, cost_per_result: args.cost_per_result, frequency_floor: args.frequency_floor,
+                    });
+                    const reachableShare = args.reachable_share > 0 && args.reachable_share <= 1 ? args.reachable_share : metaForecast.DEFAULT_REACHABLE_SHARE;
+                    const dailyBudgets = [
+                        ...(args.daily_budgets || []),
+                        ...(args.monthly_budgets || []).map(m => Math.round(m / metaForecast.DAYS_PER_MONTH * 100) / 100),
+                    ];
+                    const curve = metaForecast.forecastCurve({ audience: audienceMid, dailyBudgets, inputs, resultType, reachableShare });
+                    warnings.push(...curve.warnings);
+                    if (!deliveryFallback && benchmarks.samples < 5 && args.cpm == null) warnings.push(`Only ${benchmarks.samples} benchmark sample(s) for ${family.objective} — treat the forecast as directional, or pass cpm/ctr/cvr overrides.`);
+                    const modelsResults = !["reach", "link_clicks"].includes(resultType) && args.cvr == null && args.cost_per_result == null;
+                    if (modelsResults && benchmarks.samples_with_results > 0 && benchmarks.samples_with_results < 5) warnings.push(`Conversion rate is based on only ${benchmarks.samples_with_results} campaign-month(s) with tracked ${resultType} — results range is wide; consider a cvr override.`);
+                    const top = benchmarks.top_result_account;
+                    if (modelsResults && top && top.share > 0.6 && benchmarks.samples_with_results > 1) warnings.push(`${Math.round(top.share * 100)}% of benchmark ${resultType} come from ${top.account} — conversion rate leans on one client's offer.`);
+
+                    const r2 = v => v == null ? null : Math.round(v * 100) / 100;
+                    const range = x => x && { low: r2(x.low), mid: r2(x.mid), high: r2(x.high), source: x.source };
+                    result.forecast = {
+                        result_type: resultType,
+                        max_efficient_daily_budget: curve.max_efficient_daily_budget,
+                        curve: curve.points,
+                        inputs: {
+                            cpm: range(inputs.cpm),
+                            ctr: inputs.ctr && { low: r2(inputs.ctr.low * 100), mid: r2(inputs.ctr.mid * 100), high: r2(inputs.ctr.high * 100), unit: "%", source: inputs.ctr.source },
+                            cvr: inputs.cvr && { low: r2(inputs.cvr.low * 100), mid: r2(inputs.cvr.mid * 100), high: r2(inputs.cvr.high * 100), unit: "%", source: inputs.cvr.source },
+                            cost_per_result: range(inputs.cost_per_result),
+                            frequency_floor_30d: r2(inputs.frequency_floor),
+                            reachable_share: reachableShare,
+                        },
+                        benchmarks: {
+                            objective: family.objective, lookback_days: days,
+                            samples: benchmarks.samples, samples_with_results: benchmarks.samples_with_results,
+                            delivery_metrics_from_all_objectives: deliveryFallback,
+                            total_spend: benchmarks.total_spend, accounts: benchmarks.accounts, campaigns: benchmarks.campaigns,
+                        },
+                        assumptions: [
+                            "Modeled, not Meta's forecast. CPM / CTR / click→result rate = median (mid) and p25/p75 (range) of our campaign-month samples with the same objective; results = clicks × rate.",
+                            "Campaign-months with zero tracked results are excluded from the conversion rate (treated as untracked, not 0%).",
+                            "Benchmarks are from other geos/offers — local CPM and conversion rates can differ materially.",
+                            "Frequency never drops below the benchmark median 30-day frequency; once impressions saturate the audience, results scale with reach rather than spend (conservative).",
+                            `Reachable audience = ${Math.round(reachableShare * 100)}% of the midpoint of Meta's monthly active audience range.`,
+                        ],
+                    };
+                }
+                if (warnings.length) result.warnings = warnings;
+            } catch (e) {
+                result = e.geoErrors ? { error: "Could not resolve geos.", geo_errors: e.geoErrors } : { error: e.message };
+            }
         }
 
     } else if (name === "manage_meta_ad_rules") {
