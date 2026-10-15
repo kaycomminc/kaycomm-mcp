@@ -4518,8 +4518,12 @@ async function getAdGroupAds(token, customerId, mccId, campaignSearch, adGroupSe
             ad_group_ad.ad.final_urls,
             ad_group_ad.ad.responsive_search_ad.headlines,
             ad_group_ad.ad.responsive_search_ad.descriptions,
+            ad_group_ad.status,
+            ad_group_ad.policy_summary.approval_status,
             ad_group.name,
-            campaign.name
+            ad_group.status,
+            campaign.name,
+            campaign.status
         FROM ad_group_ad
         WHERE ad_group_ad.status != 'REMOVED'
           AND ad_group_ad.ad.type = 'RESPONSIVE_SEARCH_AD'`);
@@ -4540,6 +4544,13 @@ async function getAdGroupAds(token, customerId, mccId, campaignSearch, adGroupSe
         resource_name: r.adGroupAd.ad.resourceName,
         campaign:      r.campaign.name,
         ad_group:      r.adGroup.name,
+        // Running only if the ad, its ad group, and its campaign are all ENABLED and the ad isn't disapproved.
+        status:          r.adGroupAd.status,
+        ad_group_status: r.adGroup.status,
+        campaign_status: r.campaign.status,
+        approval_status: r.adGroupAd.policySummary?.approvalStatus || null,
+        running:         r.adGroupAd.status === "ENABLED" && r.adGroup.status === "ENABLED" &&
+                         r.campaign.status === "ENABLED" && r.adGroupAd.policySummary?.approvalStatus !== "DISAPPROVED",
         final_urls:    r.adGroupAd.ad.finalUrls || [],
         headlines:     (r.adGroupAd.ad.responsiveSearchAd?.headlines || []).map(h => ({ text: h.text, pinned: h.pinnedField || null })),
         descriptions:  (r.adGroupAd.ad.responsiveSearchAd?.descriptions || []).map(d => ({ text: d.text, pinned: d.pinnedField || null })),
@@ -6864,6 +6875,8 @@ function makeServer() {
             name: "get_ad_copy",
             description: "Read responsive search ad (RSA) headlines, descriptions, pins, and final URLs in a Google Ads account. " +
                 "Read-only. Omit campaign_name to list every non-removed RSA in the account. " +
+                "Each ad includes status, ad_group_status, campaign_status, approval_status, and running (true only when the ad, ad group, and campaign are all ENABLED and the ad isn't disapproved). " +
+                "Set running_only=true to return only running ads. " +
                 "Use to copy an existing ad's format when building new ad groups.",
             inputSchema: {
                 type: "object",
@@ -6871,6 +6884,7 @@ function makeServer() {
                     account_name:  { type: "string", description: "Client name (partial match ok)" },
                     campaign_name: { type: "string", description: "Campaign name (exact match preferred, falls back to substring). Omit for all campaigns." },
                     ad_group_name: { type: "string", description: "Ad group name (exact match preferred, falls back to substring). Omit for all ad groups." },
+                    running_only:  { type: "boolean", description: "Only return ads that are actually running (ad, ad group, and campaign all ENABLED; not disapproved). Default false." },
                 },
                 required: ["account_name"],
             },
@@ -10387,7 +10401,8 @@ async function dispatchToolCall(name, args = {}) {
                     const ads = await getAdGroupAds(token, cid, info.mcc,
                         (args.campaign_name || "").toLowerCase(),
                         args.ad_group_name ? args.ad_group_name.toLowerCase() : null);
-                    result = { account: info.name, ad_count: ads.length, ads };
+                    const shown = args.running_only === true ? ads.filter(a => a.running) : ads;
+                    result = { account: info.name, ad_count: shown.length, running_count: ads.filter(a => a.running).length, ads: shown };
                 } catch (e) {
                     result = { error: e.message };
                 }
