@@ -138,6 +138,20 @@ test("lifetime budgets downgrade the recommendation instead of advising a raise"
     assert.match(r.note, /lifetime/);
 });
 
+test("converted lifetime budgets give a normal recommendation with a note", () => {
+    const r = buildDailyBudgetRec(12, 400, 10, 5, { hasLifetimeBudgets: true, lifetimeConverted: true, lifetimeDaily: 12 });
+    assert.equal(r.confidence, undefined);
+    assert.match(r.recommendation, /^RAISE/);
+    assert.equal(r.lifetime_daily_equivalent, 12);
+    assert.match(r.note, /Ads Manager/);
+});
+
+test("unconverted lifetime budgets keep the reduced-confidence wording", () => {
+    const r = buildDailyBudgetRec(12, 400, 10, 5, { hasLifetimeBudgets: true, lifetimeConverted: false });
+    assert.equal(r.confidence, "reduced");
+    assert.match(r.recommendation, /^REDUCED_CONFIDENCE/);
+});
+
 test("an exhausted budget stays exhausted even with lifetime budgets", () => {
     const r = buildDailyBudgetRec(50, -100, 10, 15, { hasLifetimeBudgets: true });
     assert.match(r.recommendation, /^BUDGET_EXHAUSTED/);

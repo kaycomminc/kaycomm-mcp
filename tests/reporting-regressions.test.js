@@ -7,11 +7,30 @@ const assert = require("node:assert/strict");
 const realFetch = global.fetch;
 const calls = [];
 let failPaging = false;
+// Ten days out, so the conversion is stable whenever the test runs.
+const lifeEnd = new Date(Date.now() + 9.5 * 86400000).toISOString();
 global.fetch = async (url) => {
     const target = String(url);
     calls.push(target);
     if (failPaging && target.includes("after=2")) {
         return new Response(JSON.stringify({ error: { message: "page unavailable" } }), { status: 200 });
+    }
+    if (target.includes("/insights")) {
+        // c6's lifetime spend; anything else (e.g. c7) fails the insights read
+        const body = target.includes("/c6/") ? { data: [{ spend: "400" }] } : { error: { message: "insights unavailable" } };
+        return new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    if (target.includes("act_life/")) {
+        const body = target.includes("/campaigns")
+            ? { data: [{ id: "c6", effective_status: "ACTIVE", lifetime_budget: "100000", stop_time: lifeEnd }] }
+            : { data: [{ id: "s6", campaign_id: "c8", effective_status: "ACTIVE", daily_budget: "1000" }] };
+        return new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    if (target.includes("act_lifefail/")) {
+        const body = target.includes("/campaigns")
+            ? { data: [{ id: "c7", effective_status: "ACTIVE", lifetime_budget: "100000", stop_time: lifeEnd }] }
+            : { data: [] };
+        return new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
     }
     const isCampaign = target.includes("/campaigns");
     const secondPage = target.includes("after=2");
@@ -36,7 +55,7 @@ global.fetch = async (url) => {
 };
 
 const {
-    fetchMetaDailyBudgets, reportingPeriod, resolveAccount,
+    fetchMetaDailyBudgets, reportingPeriod, resolveAccount, metaLifetimeDailyEquivalent,
 } = require("../server.js");
 global.fetch = realFetch;
 
@@ -44,8 +63,25 @@ test("Meta daily budgets follow campaign and ad set cursors and dedupe CBO/ABO",
     const budgets = await fetchMetaDailyBudgets("act_test");
     assert.equal(budgets.total, 40); // $10 campaign + $30 standalone ad set; ended c4/s3 excluded
     assert.equal(budgets.has_lifetime_budgets, true);
+    // c2's lifetime budget has no stop_time, so it can't be converted to a daily figure
+    assert.equal(budgets.lifetime_converted, false);
     assert.equal(budgets.complete, true);
     assert.equal(calls.filter(url => url.includes("after=2")).length, 2);
+});
+
+test("Meta lifetime budgets count as remaining budget over days left", async () => {
+    const budgets = await fetchMetaDailyBudgets("act_life");
+    // $10 daily ad set + ($1,000 − $400) / 10 days = $70
+    assert.equal(budgets.lifetime_converted, true);
+    assert.equal(budgets.lifetime_daily_equivalent, 60);
+    assert.equal(Math.round(budgets.total * 100) / 100, 70);
+});
+
+test("a failed lifetime spend read falls back to the reduced-confidence flag", async () => {
+    const budgets = await fetchMetaDailyBudgets("act_lifefail");
+    assert.equal(budgets.has_lifetime_budgets, true);
+    assert.equal(budgets.lifetime_converted, false);
+    assert.equal(budgets.total, 0);
 });
 
 test("a failed Meta budget page rejects instead of producing a partial raise input", async () => {
@@ -71,4 +107,20 @@ test("detail account resolution refuses ambiguous requests before any read", () 
     const resolved = resolveAccount(accounts, "Acme");
     assert.equal(resolved.match, undefined);
     assert.match(resolved.error, /Ambiguous/);
+});
+
+test("lifetime budget converts to remaining budget over days left, today included", () => {
+    const now = Date.parse("2026-10-15T12:00:00-04:00");
+    // $1,000 lifetime, $400 spent, ends Oct 31 23:59 → 17 days left → ~$35.29/day
+    const eq = metaLifetimeDailyEquivalent("100000", "400", "2026-10-31T23:59:00-0400", now);
+    assert.equal(Math.round(eq * 100) / 100, 35.29);
+});
+
+test("lifetime budget without an end date can't be converted", () => {
+    assert.equal(metaLifetimeDailyEquivalent("100000", "0", undefined), null);
+});
+
+test("an overspent lifetime budget counts as $0/day, never negative", () => {
+    const now = Date.parse("2026-10-15T12:00:00-04:00");
+    assert.equal(metaLifetimeDailyEquivalent("50000", "650", "2026-10-31T23:59:00-0400", now), 0);
 });
