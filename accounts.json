@@ -227,13 +227,13 @@
       "name": "Contractor's Recycling",
       "budget": 2000,
       "refresh_token_env": "GOOGLE_REFRESH_TOKEN_3",
-      "health": false,
+      "health": {},
       "mcc": "4399982656",
       "notes": [
         {
-          "text": "Built 10/4, all 3 campaigns PAUSED awaiting client advertiser verification — $0 spend is expected until launch. If budget is tight, V9 prefers tightening geo over cutting a campaign.",
-          "added": "2026-10-04",
-          "expires": "2026-10-19"
+          "text": "LIVE ~10/17. Jason wants the FULL $2K spent in October. On 10/18 daily budgets were raised to $130/day total (Rental Yards $75, Commercial Dumping $50, Brand $5) to catch up from $116 MTD. On Nov 1, drop back to $65/day (Yards $36, Dumping $24, Brand $5). Early lost impression share is mostly rank (54–69%), not budget, so Oct may still under-deliver; if so, consider widening geo/keywords rather than more budget. Yard search volume is very low. If budget is tight, V9 prefers tightening geo over cutting a campaign.",
+          "added": "2026-10-18",
+          "expires": "2026-11-03"
         }
       ]
     }
