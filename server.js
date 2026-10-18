@@ -588,8 +588,10 @@ function getFlightPacing(spent, budget, flightStart, flightEnd, yesterday, toler
 // to it and the account reads as underfunded. Every RAISE/LOWER recommendation
 // derives from that undercount, so acting on one would double-fund the account.
 // Say so in the recommendation itself rather than in a note beside it, which is
-// easy to read past.
-function buildDailyBudgetRec(currentDaily, remaining, daysRemaining, tolerancePct = PACING_TOLERANCE_PCT, { hasLifetimeBudgets = false } = {}) {
+// easy to read past. When fetchMetaDailyBudgets could convert every lifetime
+// budget to a daily equivalent (`lifetimeConverted`), currentDaily already
+// includes it and the normal recommendation applies, with a note.
+function buildDailyBudgetRec(currentDaily, remaining, daysRemaining, tolerancePct = PACING_TOLERANCE_PCT, { hasLifetimeBudgets = false, lifetimeConverted = false, lifetimeDaily = 0 } = {}) {
     if (currentDaily == null || daysRemaining == null || daysRemaining <= 0) return null;
     const needed = Math.round((remaining / daysRemaining) * 100) / 100;
     const out = {
@@ -597,7 +599,13 @@ function buildDailyBudgetRec(currentDaily, remaining, daysRemaining, tolerancePc
         needed_per_day: needed,
         days_remaining: daysRemaining,
     };
-    if (hasLifetimeBudgets) {
+    if (hasLifetimeBudgets && lifetimeConverted) {
+        // current_daily_budget already includes the lifetime budgets' daily
+        // equivalent, so the RAISE/LOWER below is sound. Say where that part
+        // has to be changed: update_budget only edits daily budgets.
+        out.lifetime_daily_equivalent = Math.round(lifetimeDaily * 100) / 100;
+        out.note = `Includes ~$${lifetimeDaily.toFixed(2)}/day from lifetime budgets (remaining lifetime budget ÷ days left in its schedule). Change lifetime budgets in Ads Manager; update_budget only edits daily budgets.`;
+    } else if (hasLifetimeBudgets) {
         out.confidence = "reduced";
         out.note = "Some budgets are lifetime, not daily — current_daily_budget undercounts them.";
         out.recommendation = remaining <= 0
@@ -810,8 +818,24 @@ async function fetchMetaMTD(accountId, monthStart, yesterday) {
     return { spend, error: null };
 }
 
+// Lifetime budget as a per-day figure: what is left of it, spread over the days
+// left in its schedule (today included). Returns null when it can't be worked
+// out (no end date), so the caller keeps the lifetime budget flagged instead.
+function metaLifetimeDailyEquivalent(lifetimeBudgetCents, lifetimeSpend, end, now = Date.now()) {
+    if (!end) return null;
+    const endMs = new Date(end).getTime();
+    if (!Number.isFinite(endMs)) return null;
+    const daysLeft = Math.max(1, Math.ceil((endMs - now) / 86400000));
+    const left = parseInt(lifetimeBudgetCents) / 100 - (parseFloat(lifetimeSpend) || 0);
+    return Math.max(0, left) / daysLeft;
+}
+
 // Sum of active daily budgets across campaigns (CBO) and ad sets (ABO).
 // effective_status filters out anything paused directly or via its parent.
+// Lifetime budgets are converted to a daily equivalent (remaining lifetime
+// budget / days left) and counted too, so an account running on lifetime
+// budgets doesn't read as $0/day. `lifetime_converted` is false when any of
+// them couldn't be converted; callers then keep the reduced-confidence wording.
 async function fetchMetaDailyBudgets(accountId) {
     const [camps, adsets] = await Promise.all([
         // metaGetAll follows Graph's paging.next cursor. A single metaGet here
@@ -820,23 +844,44 @@ async function fetchMetaDailyBudgets(accountId) {
         metaGetAll(`${accountId}/campaigns`, { fields: "id,effective_status,daily_budget,lifetime_budget,stop_time", limit: 200 }),
         metaGetAll(`${accountId}/adsets`,    { fields: "id,campaign_id,effective_status,daily_budget,lifetime_budget,end_time", limit: 500 }),
     ]);
-    let total = 0, hasLifetime = false;
+    let daily = 0;
+    const lifetime = [];
     const campHasBudget = new Set();
     for (const c of camps) {
         if (c.effective_status !== "ACTIVE" || metaEnded(c.stop_time)) continue;
-        if (c.daily_budget)    { total += parseInt(c.daily_budget) / 100; campHasBudget.add(c.id); }
-        if (c.lifetime_budget) { hasLifetime = true; campHasBudget.add(c.id); }
+        if (c.daily_budget)    { daily += parseInt(c.daily_budget) / 100; campHasBudget.add(c.id); }
+        if (c.lifetime_budget) { lifetime.push({ id: c.id, budget: c.lifetime_budget, end: c.stop_time }); campHasBudget.add(c.id); }
     }
     for (const s of adsets) {
         if (s.effective_status !== "ACTIVE" || metaEnded(s.end_time)) continue;
         if (campHasBudget.has(s.campaign_id)) continue;
-        if (s.daily_budget)    total += parseInt(s.daily_budget) / 100;
-        if (s.lifetime_budget) hasLifetime = true;
+        if (s.daily_budget)    daily += parseInt(s.daily_budget) / 100;
+        if (s.lifetime_budget) lifetime.push({ id: s.id, budget: s.lifetime_budget, end: s.end_time });
     }
+    // Lifetime spend is a separate, best-effort read: only for the few lifetime
+    // items, and a failure falls back to the reduced-confidence flag instead of
+    // failing the whole budget read.
+    const equivalents = await Promise.all(lifetime.map(async item => {
+        if (!item.end) return null;
+        try {
+            const r = await metaGet(`${item.id}/insights`, { date_preset: "maximum", fields: "spend" });
+            return metaLifetimeDailyEquivalent(item.budget, r.data?.[0]?.spend ?? 0, item.end);
+        } catch (_) { return null; }
+    }));
+    const hasLifetime = lifetime.length > 0;
+    const converted = hasLifetime && equivalents.every(eq => eq != null);
+    const lifetimeDaily = converted ? equivalents.reduce((sum, eq) => sum + eq, 0) : 0;
     // Only return a recommendation input after both complete paginated reads
     // succeeded. Callers catch a rejected fetch and omit daily_budget, so a
     // failed/incomplete budget read can never recommend raising spend.
-    return { total, has_lifetime_budgets: hasLifetime, complete: true };
+    return {
+        total: daily + lifetimeDaily,
+        daily_total: daily,
+        lifetime_daily_equivalent: Math.round(lifetimeDaily * 100) / 100,
+        has_lifetime_budgets: hasLifetime,
+        lifetime_converted: converted,
+        complete: true,
+    };
 }
 
 // ── Row builders ──────────────────────────────────────────────────────────────
@@ -1277,7 +1322,7 @@ async function buildMetaRow(pace_dom, dim, today, monthStart, yesterday, id, inf
             const { budgets, budgetError } = budgetState;
             if (budgetError) row.daily_budget_error = budgetError;
             else if (budgets?.complete && pacing.days_remaining > 0) {
-                row.daily_budget = buildDailyBudgetRec(budgets.total, pacing.remaining, pacing.days_remaining, tolerance, { hasLifetimeBudgets: budgets.has_lifetime_budgets });
+                row.daily_budget = buildDailyBudgetRec(budgets.total, pacing.remaining, pacing.days_remaining, tolerance, { hasLifetimeBudgets: budgets.has_lifetime_budgets, lifetimeConverted: budgets.lifetime_converted, lifetimeDaily: budgets.lifetime_daily_equivalent });
             }
             return row;
         }
@@ -1294,7 +1339,7 @@ async function buildMetaRow(pace_dom, dim, today, monthStart, yesterday, id, inf
         const { budgets, budgetError } = budgetState;
         if (budgetError) row.daily_budget_error = budgetError;
         else if (budgets?.complete && budget) {
-            row.daily_budget = buildDailyBudgetRec(budgets.total, budget - spend, dim - pace_dom, tolerance, { hasLifetimeBudgets: budgets.has_lifetime_budgets });
+            row.daily_budget = buildDailyBudgetRec(budgets.total, budget - spend, dim - pace_dom, tolerance, { hasLifetimeBudgets: budgets.has_lifetime_budgets, lifetimeConverted: budgets.lifetime_converted, lifetimeDaily: budgets.lifetime_daily_equivalent });
         }
         return row;
 }
@@ -13679,7 +13724,7 @@ module.exports = {
     // Exported for tests
     clampTopN, shapeAgg, emptyAgg, addAgg, mergeAgg, listingCaseValueLabel, SHOPPING_GROUP_DIMENSIONS,
     buildPmaxChannelReport, pmaxChannelName,
-    matchByName, skippedRow, partitionSkipped, reportingPeriod, selectDetailAccounts, fetchMetaDailyBudgets,
+    matchByName, skippedRow, partitionSkipped, reportingPeriod, selectDetailAccounts, fetchMetaDailyBudgets, metaLifetimeDailyEquivalent,
     resolveAccount, buildAccountContext, addDays,
     collectPolicyViolations, googleAdsError, createGoogleCampaignFull, addKeywordsToAdGroup,
     buildCampaignBudgetLines,
