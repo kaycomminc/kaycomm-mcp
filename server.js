@@ -5206,7 +5206,7 @@ async function listGoogleCampaignsAll(token, customerId, mccId) {
 }
 
 // Generic googleAds:mutate wrapper for typed mutate operations
-async function googleMutateOps(token, customerId, mccId, mutateOperations) {
+async function googleMutateOps(token, customerId, mccId, mutateOperations, { validateOnly = false } = {}) {
     const resp = await fetchFn(
         `https://googleads.googleapis.com/${GOOGLE_API_VERSION}/customers/${customerId}/googleAds:mutate`,
         {
@@ -5217,12 +5217,116 @@ async function googleMutateOps(token, customerId, mccId, mutateOperations) {
                 "login-customer-id": mccId,
                 "Content-Type":      "application/json",
             },
-            body: JSON.stringify({ mutateOperations }),
+            body: JSON.stringify(validateOnly ? { mutateOperations, validateOnly: true } : { mutateOperations }),
         }
     );
     const data = await resp.json();
     if (!resp.ok) throw new Error(googleAdsError(data));
     return data.mutateOperationResponses || [];
+}
+
+// ── Standard Shopping listing groups (manage_shopping_listing_groups) ────────
+// Planning lives in src/google-listing-groups.js; this does the lookups and
+// runs the single atomic mutate (validateOnly for dry runs).
+async function handleShoppingListingGroups(args) {
+    const LG = require("./src/google-listing-groups");
+    const action  = args.action || "view";
+    const confirm = args.confirm === true;
+    const { match, error: acctErr } = resolveAccount(GOOGLE_ACCOUNTS, args.account_name, { confirmed: confirm });
+    if (!match) return { error: acctErr };
+    const [cid, info] = match;
+    const { token, error: authErr } = await getGoogleAccessToken(cid);
+    if (authErr) return { error: `Auth: ${authErr}` };
+
+    const campRows = await googleSearch(token, cid, info.mcc, `
+        SELECT campaign.id, campaign.name, campaign.status, campaign.bidding_strategy_type
+        FROM campaign
+        WHERE campaign.advertising_channel_type = 'SHOPPING' AND campaign.status != 'REMOVED'`);
+    const campaigns = campRows.map(r => ({ id: r.campaign.id, name: r.campaign.name, status: r.campaign.status, bidding: r.campaign.biddingStrategyType }));
+    const campSel = matchByName(campaigns, c => c.name, args.campaign_name, { confirmed: confirm, label: "campaign" });
+    if (!campSel.item) {
+        return campSel.error
+            ? { error: campSel.error, candidates: campSel.candidates }
+            : { error: `No Standard Shopping campaign matching '${args.campaign_name}'`, available: campaigns.map(c => c.name) };
+    }
+    const camp = campSel.item;
+
+    const agRows = await googleSearch(token, cid, info.mcc, `
+        SELECT ad_group.resource_name, ad_group.id, ad_group.name, ad_group.cpc_bid_micros
+        FROM ad_group
+        WHERE campaign.id = ${camp.id} AND ad_group.status != 'REMOVED'`);
+    const adGroups = agRows.map(r => ({ rn: r.adGroup.resourceName, id: r.adGroup.id, name: r.adGroup.name,
+        cpc_bid: r.adGroup.cpcBidMicros ? Number(r.adGroup.cpcBidMicros) / 1_000_000 : null }));
+    let adGroup;
+    if (args.ad_group_name) {
+        const agSel = matchByName(adGroups, g => g.name, args.ad_group_name, { confirmed: confirm, label: "ad group" });
+        if (!agSel.item) return { error: agSel.error || `No ad group matching '${args.ad_group_name}'`, available: adGroups.map(g => g.name) };
+        adGroup = agSel.item;
+    } else if (adGroups.length === 1) {
+        adGroup = adGroups[0];
+    } else {
+        return { error: `${camp.name} has ${adGroups.length} ad groups — pass ad_group_name.`, available: adGroups.map(g => g.name) };
+    }
+
+    const readTree = async () => LG.parseTree(await googleSearch(token, cid, info.mcc, `
+        SELECT ${LG.LISTING_GROUP_QUERY_FIELDS}
+        FROM ad_group_criterion
+        WHERE ad_group.id = ${adGroup.id}
+          AND ad_group_criterion.type = 'LISTING_GROUP'
+          AND ad_group_criterion.status != 'REMOVED'`));
+    const tree = await readTree();
+    const base = { account: info.name, campaign: camp.name, ad_group: adGroup.name, bidding_strategy: camp.bidding };
+
+    if (action === "view") return { ...base, ...LG.describeTree(tree) };
+
+    let plan;
+    const unmatched = [];
+    const resolved = [];
+    if (action === "split") {
+        if (!args.dimension) return { error: "dimension is required for split." };
+        const nodes = [];
+        const titleNodes = (args.nodes || []).filter(n => n.title_contains);
+        if (titleNodes.length && args.dimension !== "item_id") return { error: "title_contains only works with dimension=item_id." };
+        if (titleNodes.length) {
+            const rows = await googleSearch(token, cid, info.mcc, `
+                SELECT campaign.id, segments.product_item_id, segments.product_title, metrics.impressions
+                FROM shopping_performance_view
+                WHERE campaign.id = ${camp.id} AND segments.date ${resolveGaqlDateClause("LAST_90_DAYS")}`);
+            const lookups = LG.resolveTitles(rows, titleNodes.map(n => n.title_contains));
+            lookups.forEach((l, i) => {
+                const n = titleNodes[i];
+                if (!l.matches.length) unmatched.push(l.pattern);
+                for (const m of l.matches) {
+                    nodes.push({ value: m.item_id, exclude: n.exclude, cpc_bid: n.cpc_bid });
+                    resolved.push({ pattern: l.pattern, item_id: m.item_id, title: m.title });
+                }
+            });
+        }
+        for (const n of args.nodes || []) if (!n.title_contains) nodes.push(n);
+        if (!nodes.length) return { ...base, error: "No nodes to apply — no titles matched.", unmatched_patterns: unmatched };
+        plan = LG.planSplit({ tree, adGroupRn: adGroup.rn, adGroupCpcBid: adGroup.cpc_bid, dimension: args.dimension, nodes, othersCpcBid: args.others_cpc_bid });
+    } else if (action === "reset") {
+        plan = LG.planReset({ tree, adGroupRn: adGroup.rn, adGroupCpcBid: adGroup.cpc_bid, othersCpcBid: args.others_cpc_bid });
+    } else {
+        return { error: `Unknown action '${action}'. Use view, split or reset.` };
+    }
+    if (plan.error) return { ...base, error: plan.error, current: LG.describeTree(tree) };
+
+    const warnings = [...plan.warnings];
+    if (unmatched.length) warnings.push(`No product title matched: ${unmatched.join(", ")}`);
+    const bidsSet = plan.planned.some(n => !n.excluded && n.cpc_bid !== null);
+    if (camp.bidding !== "MANUAL_CPC" && bidsSet) {
+        warnings.push(`Campaign bids with ${camp.bidding}: unit CPC bids are ignored; only exclusions take effect.`);
+    }
+    const shared = { ...base, action, current: LG.describeTree(tree), planned: plan.planned,
+        ...(resolved.length ? { matched_products: resolved } : {}), ...(warnings.length ? { warnings } : {}) };
+
+    if (!confirm) {
+        await googleMutateOps(token, cid, info.mcc, plan.ops, { validateOnly: true });
+        return { dry_run: true, message: "DRY RUN — Google validated these changes without saving. Set confirm=true to apply.", ...shared };
+    }
+    await googleMutateOps(token, cid, info.mcc, plan.ops);
+    return { success: true, ...shared, after: LG.describeTree(await readTree()) };
 }
 
 // ── Shopping / product-level reporting ───────────────────────────────────────
@@ -7250,6 +7354,46 @@ function makeServer() {
                     top_n: { type: "integer", description: "Max listing group nodes to return per asset group, sorted by spend descending (default 50, max 500)" },
                 },
                 required: ["account_name"],
+            },
+        },
+        {
+            name: "manage_shopping_listing_groups",
+            description: "View or edit the product tree (listing groups) of a Standard Shopping campaign. " +
+                "action=view shows how products are partitioned, which are excluded, and unit bids. " +
+                "action=split rebuilds the tree one level deep by a dimension (item_id, product type, brand, custom label): each node excludes a value or sets its CPC bid, and an 'Everything else' unit keeps the catch-all bid. " +
+                "For item_id, a node can use title_contains instead of value to match every product whose title contains the text (only products that served in the last 90 days can be found). " +
+                "action=reset collapses the tree back to a single 'All products' unit. " +
+                "Unit bids only apply under Manual CPC; under Maximize Clicks or Target ROAS only exclusions take effect. " +
+                "Trees deeper than one level are refused. Dry run by default (validated by Google without saving) — set confirm=true to apply. For Performance Max, use get_pmax_listing_groups.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    account_name:  { type: "string", description: "Client name (exact name required with confirm=true)" },
+                    campaign_name: { type: "string", description: "Standard Shopping campaign name (exact name required with confirm=true)" },
+                    ad_group_name: { type: "string", description: "Ad group name — only needed when the campaign has more than one ad group" },
+                    action: { type: "string", enum: ["view", "split", "reset"], description: "view (default), split, or reset" },
+                    dimension: {
+                        type: "string",
+                        enum: ["item_id", "product_type_l1", "product_type_l2", "brand", "custom_label_0", "custom_label_1", "custom_label_2", "custom_label_3", "custom_label_4"],
+                        description: "split: the dimension to partition by",
+                    },
+                    nodes: {
+                        type: "array",
+                        description: "split: values to exclude or bid on. Each needs value (or title_contains for item_id) plus exclude=true or a cpc_bid.",
+                        items: {
+                            type: "object",
+                            properties: {
+                                value:          { type: "string", description: "Dimension value, e.g. an item ID or product type" },
+                                title_contains: { type: "string", description: "item_id only: match products whose title contains this text" },
+                                exclude:        { type: "boolean", description: "true to stop these products from serving" },
+                                cpc_bid:        { type: "number", description: "Unit CPC bid in dollars (Manual CPC only)" },
+                            },
+                        },
+                    },
+                    others_cpc_bid: { type: "number", description: "split/reset: bid for 'Everything else' / 'All products'. Defaults to the current catch-all bid." },
+                    confirm: { type: "boolean", description: "Set true to apply. Omit for a dry run." },
+                },
+                required: ["account_name", "campaign_name"],
             },
         },
         {
@@ -12281,6 +12425,9 @@ async function dispatchToolCall(name, args = {}) {
                 } catch (e) { result = { error: e.message }; }
             }
         }
+
+    } else if (name === "manage_shopping_listing_groups") {
+        result = await handleShoppingListingGroups(args);
 
     } else if (name === "get_performance_breakdown") {
         const search    = (args.account_name || "").toLowerCase();

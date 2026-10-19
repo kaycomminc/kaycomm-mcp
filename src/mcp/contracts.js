@@ -57,7 +57,7 @@ function validateArgs(tool, args) {
   // Enforce financial types before any provider call, including nested campaign/ad-set inputs.
   const moneyFields = new Set(['budget', 'nc_budget', 'daily_budget', 'lifetime_budget', 'spend_cap', 'bid_amount', 'roas_control',
     'daily_min_spend_target', 'daily_spend_cap', 'lifetime_min_spend_target', 'lifetime_spend_cap',
-    'target_cpa', 'target_roas', 'cpc_bid_ceiling']);
+    'target_cpa', 'target_roas', 'cpc_bid_ceiling', 'cpc_bid', 'others_cpc_bid']);
   const walk = (value, parent = '') => {
     if (!value || typeof value !== 'object') return;
     for (const [key, v] of Object.entries(value)) {
