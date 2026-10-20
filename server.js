@@ -3054,41 +3054,352 @@ async function resolveGeoTarget(token, mccId, locationString) {
 }
 
 // ── Geo targeting (campaign criteria) ─────────────────────────────────────────
+// A campaign's geo targeting is LOCATION criteria (geo target constants, can be
+// negative) plus PROXIMITY criteria (radius around a lat/lng or an address;
+// Google doesn't allow negative proximity). Specs below are what the tools
+// accept and return, so the output of one campaign can be fed to another.
 
-async function getCampaignGeoTargets(token, customerId, mccId, campaignResourceName) {
-    const rows = await googleSearch(token, customerId, mccId, `
-        SELECT campaign_criterion.resource_name,
-               campaign_criterion.location.geo_target_constant,
-               campaign_criterion.negative
-        FROM campaign_criterion
-        WHERE campaign_criterion.type = 'LOCATION'
-          AND campaign.resource_name = '${campaignResourceName}'`);
-    const geoIds = rows
-        .filter(r => !r.campaignCriterion.negative)
-        .map(r => r.campaignCriterion.location.geoTargetConstant);
-    if (!geoIds.length) return [];
-    const nameRows = await googleSearch(token, customerId, mccId, `
-        SELECT geo_target_constant.resource_name,
-               geo_target_constant.name,
-               geo_target_constant.canonical_name,
-               geo_target_constant.target_type
-        FROM geo_target_constant
-        WHERE geo_target_constant.resource_name IN (${geoIds.map(id => `'${id}'`).join(", ")})`);
-    const nameMap = {};
-    for (const r of nameRows) {
-        nameMap[r.geoTargetConstant.resourceName] = {
-            name: r.geoTargetConstant.name,
-            canonical_name: r.geoTargetConstant.canonicalName,
-            target_type: r.geoTargetConstant.targetType,
+const RADIUS_UNITS = { MILES: "MILES", MILE: "MILES", MI: "MILES", KILOMETERS: "KILOMETERS", KILOMETER: "KILOMETERS", KM: "KILOMETERS" };
+
+function geoConstantFrom(v) {
+    const s = String(v).trim();
+    if (/^\d+$/.test(s)) return `geoTargetConstants/${s}`;
+    if (/^geoTargetConstants\/\d+$/.test(s)) return s;
+    return null;
+}
+
+// "123 Main St, Charlotte, NC 28209" → AddressInfo. Objects pass through with
+// snake_case or camelCase keys.
+function parseProximityAddress(address) {
+    if (address && typeof address === "object") {
+        const a = {
+            streetAddress: address.street_address ?? address.streetAddress,
+            cityName:      address.city_name      ?? address.cityName ?? address.city,
+            provinceCode:  address.province_code  ?? address.provinceCode ?? address.state,
+            postalCode:    address.postal_code    ?? address.postalCode ?? address.zip,
+            countryCode:   address.country_code   ?? address.countryCode ?? "US",
         };
+        for (const k of Object.keys(a)) if (a[k] == null || a[k] === "") delete a[k];
+        if (!a.streetAddress && !a.cityName && !a.postalCode) throw new Error("Proximity address needs at least a street, city, or postal code.");
+        return a;
     }
-    return rows
-        .filter(r => !r.campaignCriterion.negative)
-        .map(r => ({
-            criterion_resource_name: r.campaignCriterion.resourceName,
-            geo_target_constant: r.campaignCriterion.location.geoTargetConstant,
-            ...(nameMap[r.campaignCriterion.location.geoTargetConstant] || {}),
-        }));
+    const s = String(address || "").trim();
+    const m = s.match(/^(.+?),\s*([^,]+?),\s*([A-Za-z]{2})(?:\s+(\d{5})(?:-\d{4})?)?(?:,\s*(US|USA))?$/i);
+    if (!m) throw new Error(`Can't parse address '${s}'. Use "street, city, ST zip", an address object, or lat/lng.`);
+    const a = { streetAddress: m[1], cityName: m[2], provinceCode: m[3].toUpperCase(), countryCode: "US" };
+    if (m[4]) a.postalCode = m[4];
+    return a;
+}
+
+// Normalize one geo target spec. Accepts:
+//   1021048 | "1021048" | "geoTargetConstants/1021048"
+//   "Charlotte, NC"                                    → { kind: "location", name } (needs resolveGeoTarget)
+//   { geo_target_constant | geo_constant | id | location, negative }
+//   { lat, lng, radius, units }   (also latitude/longitude, radius_units)
+//   { address, radius, units }
+// Returns { kind: "location", geo_target_constant | name, negative } or
+//         { kind: "proximity", lat, lng, address, radius, units }.
+function normalizeGeoTargetSpec(spec) {
+    if (typeof spec === "number" || typeof spec === "string") {
+        const gc = geoConstantFrom(spec);
+        if (gc) return { kind: "location", geo_target_constant: gc, negative: false };
+        if (typeof spec === "string" && spec.trim()) return { kind: "location", name: spec.trim(), negative: false };
+        throw new Error(`Invalid geo target: ${JSON.stringify(spec)}`);
+    }
+    if (!spec || typeof spec !== "object") throw new Error(`Invalid geo target: ${JSON.stringify(spec)}`);
+
+    const isProximity = spec.radius != null || spec.type === "PROXIMITY" || spec.address != null ||
+        spec.lat != null || spec.latitude != null;
+    if (isProximity) {
+        if (spec.negative) throw new Error("Google Ads doesn't support negative (excluded) radius targets.");
+        const radius = Number(spec.radius);
+        if (!Number.isFinite(radius) || radius <= 0) throw new Error(`Radius target needs a positive radius (got ${JSON.stringify(spec.radius)}).`);
+        const units = RADIUS_UNITS[String(spec.units ?? spec.radius_units ?? "MILES").toUpperCase()];
+        if (!units) throw new Error(`Radius units must be MILES or KILOMETERS (got ${JSON.stringify(spec.units ?? spec.radius_units)}).`);
+        const latRaw = spec.lat ?? spec.latitude, lngRaw = spec.lng ?? spec.lon ?? spec.longitude;
+        const out = { kind: "proximity", radius, units };
+        if (latRaw != null || lngRaw != null) {
+            const lat = Number(latRaw), lng = Number(lngRaw);
+            if (!Number.isFinite(lat) || !Number.isFinite(lng) || Math.abs(lat) > 90 || Math.abs(lng) > 180) {
+                throw new Error(`Radius target has invalid lat/lng (${latRaw}, ${lngRaw}).`);
+            }
+            out.lat = lat; out.lng = lng;
+        }
+        if (spec.address != null && spec.address !== "") out.address = parseProximityAddress(spec.address);
+        if (out.lat == null && !out.address) throw new Error("Radius target needs lat/lng or an address.");
+        return out;
+    }
+
+    const raw = spec.geo_target_constant ?? spec.geo_constant ?? spec.id ?? spec.location ?? spec.name;
+    if (raw == null) throw new Error(`Invalid geo target: ${JSON.stringify(spec)}`);
+    const base = normalizeGeoTargetSpec(raw);
+    return { ...base, negative: spec.negative === true };
+}
+
+// Resolve name-based location specs to geo target constants.
+async function resolveGeoTargetSpecs(token, mccId, specs) {
+    const out = [];
+    for (const s of specs) {
+        const n = normalizeGeoTargetSpec(s);
+        if (n.kind === "location" && !n.geo_target_constant) {
+            out.push({ ...n, geo_target_constant: await resolveGeoTarget(token, mccId, n.name) });
+        } else {
+            out.push(n);
+        }
+    }
+    return out;
+}
+
+// CampaignCriterion create payload for a normalized (and resolved) spec.
+function buildGeoCriterion(campaign, n) {
+    if (n.kind === "proximity") {
+        const proximity = { radius: n.radius, radiusUnits: n.units };
+        // geoPoint wins when present — sending both risks a geocode mismatch error
+        if (n.lat != null) {
+            proximity.geoPoint = {
+                latitudeInMicroDegrees:  Math.round(n.lat * 1e6),
+                longitudeInMicroDegrees: Math.round(n.lng * 1e6),
+            };
+        } else {
+            proximity.address = n.address;
+        }
+        return { campaign, proximity };
+    }
+    if (!n.geo_target_constant) throw new Error(`Location '${n.name}' not resolved to a geo target constant.`);
+    return { campaign, location: { geoTargetConstant: n.geo_target_constant }, ...(n.negative ? { negative: true } : {}) };
+}
+
+function geoCriterionOps(campaign, normalizedSpecs) {
+    return normalizedSpecs.map(n => ({ campaignCriterionOperation: { create: buildGeoCriterion(campaign, n) } }));
+}
+
+function formatRadius(radius, units) {
+    return `${radius} ${units === "KILOMETERS" ? "km" : "mi"}`;
+}
+
+function formatAddress(a) {
+    if (!a) return null;
+    const cityLine = [a.cityName, [a.provinceCode, a.postalCode].filter(Boolean).join(" ")].filter(Boolean).join(", ");
+    return [a.streetAddress, cityLine].filter(Boolean).join(", ") || null;
+}
+
+// Human label for a normalized spec (dry runs)
+function describeGeoSpec(n, nameMap = {}) {
+    if (n.kind === "proximity") {
+        const where = n.lat != null ? `${n.lat}, ${n.lng}` : formatAddress(n.address);
+        return `${formatRadius(n.radius, n.units)} radius around ${where}`;
+    }
+    const label = nameMap[n.geo_target_constant] || n.name || n.geo_target_constant;
+    return `${n.negative ? "EXCLUDE " : ""}${label}${n.geo_target_constant && label !== n.geo_target_constant ? ` (${n.geo_target_constant})` : ""}`;
+}
+
+// Stable key so copies can skip criteria the target already has
+function geoSpecKey(n) {
+    if (n.kind === "proximity") {
+        const where = n.lat != null ? `${n.lat.toFixed(6)},${n.lng.toFixed(6)}` : JSON.stringify(n.address);
+        return `P|${where}|${n.radius}|${n.units}`;
+    }
+    return `L|${n.geo_target_constant || n.name}|${n.negative ? 1 : 0}`;
+}
+
+// campaign_criterion rows (GAQL REST shape) → geo target list. Proximity rows
+// carry lat/lng/radius/address; location rows get names from nameMap.
+function shapeGeoCriteria(rows, nameMap = {}) {
+    return rows.map(r => {
+        const c = r.campaignCriterion;
+        const id = c.resourceName?.split("~").pop();
+        if (c.type === "PROXIMITY" || c.proximity) {
+            const p = c.proximity || {};
+            const gp = p.geoPoint || {};
+            const lat = gp.latitudeInMicroDegrees != null ? Number(gp.latitudeInMicroDegrees) / 1e6 : null;
+            const lng = gp.longitudeInMicroDegrees != null ? Number(gp.longitudeInMicroDegrees) / 1e6 : null;
+            const addr = p.address && Object.keys(p.address).length ? p.address : null;
+            const units = p.radiusUnits || "MILES";
+            return {
+                type: "PROXIMITY",
+                criterion: c.resourceName,
+                criterion_id: id,
+                negative: !!c.negative,
+                radius: p.radius != null ? Number(p.radius) : null,
+                radius_units: units,
+                lat, lng,
+                address: formatAddress(addr),
+                ...(addr ? { address_fields: addr } : {}),
+                name: `${formatRadius(p.radius, units)} radius around ${formatAddress(addr) || `${lat}, ${lng}`}`,
+            };
+        }
+        const gc = c.location?.geoTargetConstant;
+        const meta = nameMap[gc] || {};
+        return {
+            type: "LOCATION",
+            criterion: c.resourceName,
+            criterion_id: id,
+            negative: !!c.negative,
+            geo_target_constant: gc,
+            name: meta.canonical_name || meta.name || gc,
+            target_type: meta.target_type,
+        };
+    });
+}
+
+// Shaped target (from shapeGeoCriteria) → spec that normalizeGeoTargetSpec accepts
+function geoTargetToSpec(t) {
+    if (t.type === "PROXIMITY") {
+        return t.lat != null
+            ? { lat: t.lat, lng: t.lng, radius: t.radius, units: t.radius_units }
+            : { address: t.address_fields, radius: t.radius, units: t.radius_units };
+    }
+    return { geo_target_constant: t.geo_target_constant, negative: t.negative };
+}
+
+// All LOCATION + PROXIMITY criteria (negatives flagged) and the campaign's
+// presence/interest setting.
+async function getCampaignGeoTargets(token, customerId, mccId, campaignResourceName) {
+    const [rows, campRows] = await Promise.all([
+        googleSearch(token, customerId, mccId, `
+            SELECT campaign_criterion.resource_name,
+                   campaign_criterion.type,
+                   campaign_criterion.negative,
+                   campaign_criterion.location.geo_target_constant,
+                   campaign_criterion.proximity.radius,
+                   campaign_criterion.proximity.radius_units,
+                   campaign_criterion.proximity.geo_point.latitude_in_micro_degrees,
+                   campaign_criterion.proximity.geo_point.longitude_in_micro_degrees,
+                   campaign_criterion.proximity.address.street_address,
+                   campaign_criterion.proximity.address.city_name,
+                   campaign_criterion.proximity.address.province_code,
+                   campaign_criterion.proximity.address.postal_code,
+                   campaign_criterion.proximity.address.country_code
+            FROM campaign_criterion
+            WHERE campaign_criterion.type IN ('LOCATION', 'PROXIMITY')
+              AND campaign_criterion.status != 'REMOVED'
+              AND campaign.resource_name = '${campaignResourceName}'`),
+        googleSearch(token, customerId, mccId, `
+            SELECT campaign.geo_target_type_setting.positive_geo_target_type,
+                   campaign.geo_target_type_setting.negative_geo_target_type
+            FROM campaign
+            WHERE campaign.resource_name = '${campaignResourceName}'`),
+    ]);
+    const geoIds = [...new Set(rows.map(r => r.campaignCriterion.location?.geoTargetConstant).filter(Boolean))];
+    const nameMap = {};
+    if (geoIds.length) {
+        const nameRows = await googleSearch(token, customerId, mccId, `
+            SELECT geo_target_constant.resource_name,
+                   geo_target_constant.name,
+                   geo_target_constant.canonical_name,
+                   geo_target_constant.target_type
+            FROM geo_target_constant
+            WHERE geo_target_constant.resource_name IN (${geoIds.map(id => `'${id}'`).join(", ")})`);
+        for (const r of nameRows) {
+            nameMap[r.geoTargetConstant.resourceName] = {
+                name: r.geoTargetConstant.name,
+                canonical_name: r.geoTargetConstant.canonicalName,
+                target_type: r.geoTargetConstant.targetType,
+            };
+        }
+    }
+    const s = campRows[0]?.campaign?.geoTargetTypeSetting || {};
+    return {
+        targets: shapeGeoCriteria(rows, nameMap),
+        geo_target_type: {
+            positive: s.positiveGeoTargetType || null,
+            negative: s.negativeGeoTargetType || null,
+        },
+    };
+}
+
+// Look up a campaign (by name) in the same account and return its geo targets
+async function getGeoTargetsForCampaignName(token, customerId, mccId, campaignName, { confirmed = false, campaigns = null } = {}) {
+    const all = campaigns || await listGoogleCampaignsFull(token, customerId, mccId);
+    const sel = matchByName(all, c => c.name, String(campaignName || "").toLowerCase(), { confirmed, label: "campaign" });
+    if (!sel.item) {
+        throw new Error(sel.error || `No campaign matching '${campaignName}' to copy geo targeting from.`);
+    }
+    const geo = await getCampaignGeoTargets(token, customerId, mccId, sel.item.resource_name);
+    return { campaign: sel.item, ...geo };
+}
+
+// geo_targets + copy_geo_from_campaign (create_* tools) → resolved, de-duplicated specs
+async function prepareGeoTargetsForCreate(token, customerId, mccId, args) {
+    const specs = await resolveGeoTargetSpecs(token, mccId, args.geo_targets || []);
+    let copiedFrom = null;
+    if (args.copy_geo_from_campaign) {
+        const src = await getGeoTargetsForCampaignName(token, customerId, mccId, args.copy_geo_from_campaign, { confirmed: args.confirm === true });
+        copiedFrom = src.campaign.name;
+        specs.push(...src.targets.map(t => normalizeGeoTargetSpec(geoTargetToSpec(t))));
+    }
+    const seen = new Set();
+    const unique = specs.filter(n => { const k = geoSpecKey(n); if (seen.has(k)) return false; seen.add(k); return true; });
+    if (!unique.some(n => !n.negative)) throw new Error("At least one (non-excluded) geo target is required — pass geo_targets or copy_geo_from_campaign.");
+    return { specs: unique, copied_from: copiedFrom };
+}
+
+// Match a remove token against current geo targets: criterion resource name or
+// ID, geo constant, exact name, then (locations only) a name substring.
+function findGeoTargetToRemove(targets, token) {
+    const r = String(token).trim();
+    const rLower = r.toLowerCase();
+    const gc = geoConstantFrom(r);
+    return targets.find(t => t.criterion === r || t.criterion_id === r)
+        || (gc && targets.find(t => t.geo_target_constant === gc))
+        || targets.find(t => (t.name || "").toLowerCase() === rLower)
+        || targets.find(t => t.type === "LOCATION" && (t.name || "").toLowerCase().includes(rLower));
+}
+
+// Build the mutate ops for update_geo_targeting. Pure — inputs are already
+// fetched/resolved:
+//   current:  getCampaignGeoTargets() result for the target campaign
+//   add:      normalized + resolved specs
+//   remove:   raw remove tokens
+//   source:   getCampaignGeoTargets() result of copy_from_campaign, or null
+function planGeoTargetingChange({ campaignResource, current, add = [], remove = [], source = null, replaceExisting = false, geoTargetType = null }) {
+    const ops = [];
+    const removing = [];
+    for (const r of remove) {
+        const found = findGeoTargetToRemove(current.targets, r);
+        if (!found) {
+            throw new Error(`Cannot find current geo target matching '${r}'. Current targets: ${current.targets.map(t => `${t.name} [${t.criterion_id}]`).join(", ") || "(none)"}`);
+        }
+        if (!removing.includes(found)) removing.push(found);
+    }
+
+    const keyOf = t => geoSpecKey(normalizeGeoTargetSpec(geoTargetToSpec(t)));
+    const currentKeys = new Set(current.targets.filter(t => !removing.includes(t)).map(keyOf));
+    const adding = [];
+    const skipped = [];
+    const queue = [...add];
+    if (source) {
+        queue.push(...source.targets.map(t => normalizeGeoTargetSpec(geoTargetToSpec(t))));
+        if (replaceExisting) {
+            const sourceKeys = new Set(source.targets.map(keyOf));
+            for (const t of current.targets) {
+                if (!sourceKeys.has(keyOf(t)) && !removing.includes(t)) removing.push(t);
+            }
+            for (const t of removing) currentKeys.delete(keyOf(t));
+        }
+    }
+    const queued = new Set();
+    for (const n of queue) {
+        const k = geoSpecKey(n);
+        if (currentKeys.has(k) || queued.has(k)) { skipped.push(n); continue; }
+        queued.add(k);
+        adding.push(n);
+    }
+
+    for (const t of removing) ops.push({ campaignCriterionOperation: { remove: t.criterion } });
+    ops.push(...geoCriterionOps(campaignResource, adding));
+
+    const desiredType = geoTargetType || source?.geo_target_type?.positive || null;
+    const setGeoTargetType = desiredType && desiredType !== current.geo_target_type?.positive ? desiredType : null;
+    if (setGeoTargetType) {
+        ops.push({
+            campaignOperation: {
+                update: { resourceName: campaignResource, geoTargetTypeSetting: { positiveGeoTargetType: setGeoTargetType } },
+                updateMask: "geo_target_type_setting.positive_geo_target_type",
+            },
+        });
+    }
+    return { ops, removing, adding, skipped, set_geo_target_type: setGeoTargetType };
 }
 
 // ── Keyword planning ──────────────────────────────────────────────────────────
@@ -4500,17 +4811,8 @@ async function createGoogleCampaignFull(token, customerId, mccId, config) {
         },
     });
 
-    // Geo targeting
-    for (const geoId of (config.geo_targets || [])) {
-        mutateOperations.push({
-            campaignCriterionOperation: {
-                create: {
-                    campaign: campaignTempName,
-                    location: { geoTargetConstant: `geoTargetConstants/${geoId}` },
-                },
-            },
-        });
-    }
+    // Geo targeting — geo constant IDs and/or radius (proximity) specs
+    mutateOperations.push(...geoCriterionOps(campaignTempName, (config.geo_targets || []).map(normalizeGeoTargetSpec)));
 
     const doMutate = async (ops) => {
         const resp = await fetchFn(
@@ -4709,7 +5011,7 @@ async function createPmaxCampaignFull(token, customerId, mccId, config) {
     //   headlines: [{text}], long_headlines: [{text}], descriptions: [{text}],
     //   marketing_images: [resource_name], square_marketing_images: [resource_name],
     //   youtube_videos: [resource_name] (optional),
-    //   geo_targets: [int] (required),
+    //   geo_targets: [geo spec] (required — IDs or radius specs, see normalizeGeoTargetSpec),
     // }
     const mutateOperations = [];
     const budgetTemp   = `customers/${customerId}/campaignBudgets/-1`;
@@ -4818,13 +5120,7 @@ async function createPmaxCampaignFull(token, customerId, mccId, config) {
             create: { campaign: campaignTemp, language: { languageConstant: "languageConstants/1000" } },
         },
     });
-    for (const geoId of (config.geo_targets || [])) {
-        mutateOperations.push({
-            campaignCriterionOperation: {
-                create: { campaign: campaignTemp, location: { geoTargetConstant: `geoTargetConstants/${geoId}` } },
-            },
-        });
-    }
+    mutateOperations.push(...geoCriterionOps(campaignTemp, (config.geo_targets || []).map(normalizeGeoTargetSpec)));
 
     const resp = await fetchFn(
         `https://googleads.googleapis.com/${GOOGLE_API_VERSION}/customers/${customerId}/googleAds:mutate`,
@@ -4855,7 +5151,7 @@ async function createPmaxCampaignFull(token, customerId, mccId, config) {
 async function createVideoCampaignFull(token, customerId, mccId, config) {
     // config: {
     //   campaign_name, daily_budget, bidding_strategy (MANUAL_CPV|MAXIMIZE_CONVERSIONS|TARGET_CPM),
-    //   final_url, geo_targets: [int],
+    //   final_url, geo_targets: [geo spec],
     //   ad_groups: [{ name, youtube_video (asset resource name OR YouTube video ID/URL), headline, call_to_action }]
     // }
     const mutateOperations = [];
@@ -4975,13 +5271,7 @@ async function createVideoCampaignFull(token, customerId, mccId, config) {
     });
 
     // 5. Geo targeting
-    for (const geoId of (config.geo_targets || [])) {
-        mutateOperations.push({
-            campaignCriterionOperation: {
-                create: { campaign: campaignTemp, location: { geoTargetConstant: `geoTargetConstants/${geoId}` } },
-            },
-        });
-    }
+    mutateOperations.push(...geoCriterionOps(campaignTemp, (config.geo_targets || []).map(normalizeGeoTargetSpec)));
 
     const resp = await fetchFn(
         `https://googleads.googleapis.com/${GOOGLE_API_VERSION}/customers/${customerId}/googleAds:mutate`,
@@ -6055,6 +6345,34 @@ async function listCampaignNegatives(token, customerId, mccId, campaignFilters =
 }
 
 // ── MCP Server ────────────────────────────────────────────────────────────────
+// Geo target item accepted by create_* geo_targets and update_geo_targeting add
+const GEO_TARGET_SPEC_SCHEMA = {
+    anyOf: [
+        { type: "integer", description: "Geo target constant ID, e.g. 1021048 (Charlotte)" },
+        { type: "string", description: "Geo target constant ID / resource name, or a location name like 'Mesa, AZ'" },
+        {
+            type: "object",
+            description: "Location {geo_target_constant, negative} or radius {lat, lng, radius, units} / {address, radius, units}",
+            properties: {
+                geo_target_constant: { type: ["string", "integer"], description: "Geo constant ID, resource name, or location name" },
+                negative:  { type: "boolean", description: "Exclude this location (LOCATION only)" },
+                lat:       { type: "number" },
+                lng:       { type: "number" },
+                address:   { type: ["string", "object"], description: "\"street, city, ST zip\" or {street_address, city_name, province_code, postal_code, country_code}" },
+                radius:    { type: "number", description: "Radius size (makes this a PROXIMITY target)" },
+                units:     { type: "string", enum: ["MILES", "KILOMETERS"], description: "Default MILES" },
+            },
+        },
+    ],
+};
+const GEO_TARGETS_DESC = "Geo targets. Location IDs (2840=US, 2826=UK, 2124=Canada, 1021048=Charlotte NC), location names ('Mesa, AZ'), " +
+    "{geo_target_constant, negative:true} to exclude, or radius targets {lat, lng, radius, units} / {address, radius, units}. " +
+    "Required unless copy_geo_from_campaign is set.";
+const COPY_GEO_FROM_CAMPAIGN_PROP = {
+    type: "string",
+    description: "Copy all location + radius criteria (incl. exclusions) from this existing campaign in the same account. Combined with geo_targets if both given.",
+};
+
 // makeServer() builds a fresh Server instance with both handlers registered.
 // stdio mode and SSE mode share one module-level instance; the stateless
 // Streamable HTTP transport (see main()) gets a fresh instance per request.
@@ -6850,11 +7168,8 @@ function makeServer() {
                     merchant_id:       { type: "string", description: "SHOPPING only: linked Merchant Center ID to advertise from." },
                     default_cpc_bid:   { type: "number", description: "SHOPPING only: ad group / listing group CPC bid in dollars (default 1.00; used by Manual CPC, ignored by automated bidding)." },
                     bidding_strategy:  { type: "string", enum: ["MANUAL_CPC","MAXIMIZE_CLICKS","MAXIMIZE_CONVERSIONS"], description: "Bidding strategy (default: MANUAL_CPC). For TARGET_CPA/TARGET_ROAS, create with MAXIMIZE_CONVERSIONS then switch via set_bidding_strategy." },
-                    geo_targets: {
-                        type: "array",
-                        description: "Geo target location IDs (required). Common: 2840=US, 2826=UK, 2124=Canada, 2036=Australia. Use keyword_research or Google's geo target docs for other IDs.",
-                        items: { type: "integer" },
-                    },
+                    geo_targets: { type: "array", description: GEO_TARGETS_DESC, items: GEO_TARGET_SPEC_SCHEMA },
+                    copy_geo_from_campaign: COPY_GEO_FROM_CAMPAIGN_PROP,
                     ad_groups: {
                         type: "array",
                         description: "Ad groups to create",
@@ -6879,7 +7194,7 @@ function makeServer() {
                     },
                     confirm: { type: "boolean", description: "Set true to actually create. Omit for dry run." },
                 },
-                required: ["account_name", "campaign_name", "daily_budget", "ad_groups", "geo_targets"],
+                required: ["account_name", "campaign_name", "daily_budget", "ad_groups"],
             },
         },
         {
@@ -6917,11 +7232,8 @@ function makeServer() {
                     daily_budget:      { type: "number", description: "Daily budget in dollars" },
                     bidding_strategy:  { type: "string", enum: ["MAXIMIZE_CONVERSIONS", "MAXIMIZE_CONVERSION_VALUE"], description: "Bidding strategy (default: MAXIMIZE_CONVERSIONS)" },
                     final_url:         { type: "string", description: "Final URL / landing page for the asset group" },
-                    geo_targets: {
-                        type: "array",
-                        description: "Geo target location IDs (required). Common: 2840=US, 2826=UK, 2124=Canada.",
-                        items: { type: "integer" },
-                    },
+                    geo_targets: { type: "array", description: GEO_TARGETS_DESC, items: GEO_TARGET_SPEC_SCHEMA },
+                    copy_geo_from_campaign: COPY_GEO_FROM_CAMPAIGN_PROP,
                     business_name_asset: { type: "string", description: "Resource name of an existing text asset to use as business name (from list_account_assets)" },
                     logo_asset:          { type: "string", description: "Resource name of an existing image asset to use as campaign logo (from list_account_assets)" },
                     asset_group_name:    { type: "string", description: "Name for the asset group (defaults to campaign name)" },
@@ -6962,7 +7274,7 @@ function makeServer() {
                     },
                     confirm: { type: "boolean", description: "Set true to actually create. Omit for dry run." },
                 },
-                required: ["account_name", "campaign_name", "daily_budget", "final_url", "geo_targets",
+                required: ["account_name", "campaign_name", "daily_budget", "final_url",
                            "business_name_asset", "logo_asset", "headlines", "long_headlines", "descriptions",
                            "marketing_images", "square_marketing_images"],
             },
@@ -6981,11 +7293,8 @@ function makeServer() {
                     daily_budget:     { type: "number", description: "Daily budget in dollars" },
                     bidding_strategy: { type: "string", enum: ["TARGET_CPV", "MAXIMIZE_CONVERSIONS", "TARGET_CPM"], description: "Bidding strategy (default: TARGET_CPV). Use TARGET_CPV for views, MAXIMIZE_CONVERSIONS for action-oriented, TARGET_CPM for reach." },
                     final_url:        { type: "string", description: "Landing page URL for the video ads" },
-                    geo_targets: {
-                        type: "array",
-                        description: "Geo target location IDs (required). Common: 2840=US, 2826=UK, 2124=Canada.",
-                        items: { type: "integer" },
-                    },
+                    geo_targets: { type: "array", description: GEO_TARGETS_DESC, items: GEO_TARGET_SPEC_SCHEMA },
+                    copy_geo_from_campaign: COPY_GEO_FROM_CAMPAIGN_PROP,
                     ad_groups: {
                         type: "array",
                         description: "Ad groups to create, each with a YouTube video ad",
@@ -7017,7 +7326,7 @@ function makeServer() {
                     },
                     confirm: { type: "boolean", description: "Set true to actually create. Omit for dry run." },
                 },
-                required: ["account_name", "campaign_name", "daily_budget", "final_url", "geo_targets", "ad_groups"],
+                required: ["account_name", "campaign_name", "daily_budget", "final_url", "ad_groups"],
             },
         },
         {
@@ -7099,10 +7408,12 @@ function makeServer() {
         },
         {
             name: "update_geo_targeting",
-            description: "View or update the geo (location) targeting on a Google Ads campaign. " +
-                "Omit add/remove to preview current targets. " +
-                "Pass add and/or remove arrays to change targeting. " +
-                "Accepts geo target constant IDs (e.g. 2840 for US) or location names (e.g. 'Mesa, AZ'). " +
+            description: "View or update the geo targeting on a Google Ads campaign: locations, exclusions, and radius (proximity) targets, " +
+                "plus the presence vs presence-or-interest setting. " +
+                "Omit add/remove/copy_from_campaign to preview current targets. " +
+                "add accepts geo constant IDs (2840 = US), location names ('Mesa, AZ'), {geo_target_constant, negative:true} exclusions, " +
+                "or radius targets {lat, lng, radius, units} / {address, radius, units}. " +
+                "copy_from_campaign clones another campaign's location + radius criteria. " +
                 "Dry run by default — set confirm=true to apply.",
             inputSchema: {
                 type: "object",
@@ -7111,13 +7422,26 @@ function makeServer() {
                     campaign_name: { type: "string", description: "Campaign name (partial match ok)" },
                     add: {
                         type: "array",
-                        items: { type: "string" },
-                        description: "Geo targets to add — IDs (e.g. '2840') or names (e.g. 'Mesa, AZ', 'Arizona')",
+                        items: GEO_TARGET_SPEC_SCHEMA,
+                        description: "Geo targets to add — IDs ('2840'), names ('Mesa, AZ'), {geo_target_constant, negative:true}, or radius {lat, lng, radius, units} / {address, radius, units}",
                     },
                     remove: {
                         type: "array",
                         items: { type: "string" },
-                        description: "Geo targets to remove — IDs (e.g. '2840'), names, or criterion resource names from the current list",
+                        description: "Targets to remove — criterion resource names or criterion IDs from the preview (required for radius targets), geo constant IDs, or location names",
+                    },
+                    copy_from_campaign: {
+                        type: "string",
+                        description: "Clone all location + radius criteria (incl. exclusions) and the presence/interest setting from this campaign in the same account. Criteria already on the target are skipped.",
+                    },
+                    replace_existing: {
+                        type: "boolean",
+                        description: "With copy_from_campaign: also remove target criteria that the source campaign doesn't have, so targeting matches exactly.",
+                    },
+                    geo_target_type: {
+                        type: "string",
+                        enum: ["PRESENCE", "PRESENCE_OR_INTEREST"],
+                        description: "Set who is targeted: PRESENCE (people in the locations) or PRESENCE_OR_INTEREST (in or interested in). Overrides the setting copied by copy_from_campaign.",
                     },
                     confirm: { type: "boolean", description: "Set true to apply. Omit for dry run / preview." },
                 },
@@ -10318,8 +10642,8 @@ async function dispatchToolCall(name, args = {}) {
         const search  = (args.account_name || "").toLowerCase();
         const confirm = args.confirm === true;
 
-        if (!args.campaign_name || !args.daily_budget || !args.ad_groups?.length || !args.geo_targets?.length) {
-            result = { error: "campaign_name, daily_budget, at least one ad_group, and at least one geo_target are required." };
+        if (!args.campaign_name || !args.daily_budget || !args.ad_groups?.length || (!args.geo_targets?.length && !args.copy_geo_from_campaign)) {
+            result = { error: "campaign_name, daily_budget, at least one ad_group, and geo_targets (or copy_geo_from_campaign) are required." };
         } else {
             const { match: match, error: matchErr } = resolveAccount(GOOGLE_ACCOUNTS, search, { confirmed: args.confirm === true });
             if (!match) {
@@ -10327,14 +10651,19 @@ async function dispatchToolCall(name, args = {}) {
             } else {
                 const [cid, info] = match;
                 const { token, error: authErr } = await getGoogleAccessToken(cid);
+                let geo = null;
+                if (!authErr) {
+                    try { geo = await prepareGeoTargetsForCreate(token, cid, info.mcc, args); }
+                    catch (e) { result = { error: e.message }; }
+                }
                 if (authErr) { result = { error: `Auth: ${authErr}` }; }
-                else {
+                else if (geo) {
                     const config = {
                         campaign_name:    args.campaign_name,
                         daily_budget:     args.daily_budget,
                         campaign_type:    args.campaign_type || "SEARCH",
                         bidding_strategy: args.bidding_strategy || "MANUAL_CPC",
-                        geo_targets:      args.geo_targets,
+                        geo_targets:      geo.specs,
                         ad_groups:        args.ad_groups,
                         merchant_id:      args.merchant_id,
                         default_cpc_bid:  args.default_cpc_bid,
@@ -10365,7 +10694,8 @@ async function dispatchToolCall(name, args = {}) {
                                 bidding_strategy: config.bidding_strategy,
                                 status:           "PAUSED (default for new campaigns)",
                                 language:         config.campaign_type === "SHOPPING" ? "From feed (en)" : "English",
-                                geo_targets:      config.geo_targets.map(id => `geoTargetConstants/${id}`),
+                                geo_targets:      config.geo_targets.map(n => describeGeoSpec(n)),
+                                ...(geo.copied_from ? { geo_copied_from: geo.copied_from } : {}),
                                 geo_targeting:    "PRESENCE (people in your targeted locations)",
                                 search_partners:  "OFF",
                                 ...(config.campaign_type === "SHOPPING" ? { merchant_id: config.merchant_id, default_cpc_bid: "$" + (config.default_cpc_bid || 1).toFixed(2), listing_groups: "All products (one root unit per ad group)" } : {}),
@@ -10432,7 +10762,7 @@ async function dispatchToolCall(name, args = {}) {
         else if (!args.business_name_asset) { result = { error: "business_name_asset (resource name of text asset) is required." }; }
         else if (!args.logo_asset) { result = { error: "logo_asset (resource name of image asset) is required." }; }
         else if (!args.final_url) { result = { error: "final_url is required." }; }
-        else if (!args.geo_targets?.length) { result = { error: "At least one geo_target is required." }; }
+        else if (!args.geo_targets?.length && !args.copy_geo_from_campaign) { result = { error: "geo_targets (or copy_geo_from_campaign) is required." }; }
         else {
             const { match: match, error: matchErr } = resolveAccount(GOOGLE_ACCOUNTS, search, { confirmed: args.confirm === true });
             if (!match) {
@@ -10440,14 +10770,19 @@ async function dispatchToolCall(name, args = {}) {
             } else {
                 const [cid, info] = match;
                 const { token, error: authErr } = await getGoogleAccessToken(cid);
+                let geo = null;
+                if (!authErr) {
+                    try { geo = await prepareGeoTargetsForCreate(token, cid, info.mcc, args); }
+                    catch (e) { result = { error: e.message }; }
+                }
                 if (authErr) { result = { error: `Auth: ${authErr}` }; }
-                else {
+                else if (geo) {
                     const config = {
                         campaign_name:          args.campaign_name,
                         daily_budget:           args.daily_budget,
                         bidding_strategy:       args.bidding_strategy || "MAXIMIZE_CONVERSIONS",
                         final_url:              args.final_url,
-                        geo_targets:            args.geo_targets,
+                        geo_targets:            geo.specs,
                         business_name_asset:    args.business_name_asset,
                         logo_asset:             args.logo_asset,
                         asset_group_name:       args.asset_group_name || args.campaign_name,
@@ -10472,7 +10807,8 @@ async function dispatchToolCall(name, args = {}) {
                                 bidding_strategy: config.bidding_strategy,
                                 final_url:        config.final_url,
                                 language:         "English",
-                                geo_targets:      config.geo_targets.map(id => `geoTargetConstants/${id}`),
+                                geo_targets:      config.geo_targets.map(n => describeGeoSpec(n)),
+                                ...(geo.copied_from ? { geo_copied_from: geo.copied_from } : {}),
                                 status:           "PAUSED (default for new campaigns)",
                                 business_name:    config.business_name_asset,
                                 logo:             config.logo_asset,
@@ -10508,8 +10844,8 @@ async function dispatchToolCall(name, args = {}) {
         const search  = (args.account_name || "").toLowerCase();
         const confirm = args.confirm === true;
 
-        if (!args.campaign_name || !args.daily_budget || !args.final_url || !args.ad_groups?.length || !args.geo_targets?.length) {
-            result = { error: "campaign_name, daily_budget, final_url, at least one ad_group, and at least one geo_target are required." };
+        if (!args.campaign_name || !args.daily_budget || !args.final_url || !args.ad_groups?.length || (!args.geo_targets?.length && !args.copy_geo_from_campaign)) {
+            result = { error: "campaign_name, daily_budget, final_url, at least one ad_group, and geo_targets (or copy_geo_from_campaign) are required." };
         } else {
             const missingVideo = args.ad_groups.find(ag => !ag.youtube_video && !ag.youtube_videos?.length);
             if (missingVideo) {
@@ -10521,14 +10857,19 @@ async function dispatchToolCall(name, args = {}) {
                 } else {
                     const [cid, info] = match;
                     const { token, error: authErr } = await getGoogleAccessToken(cid);
+                    let geo = null;
+                    if (!authErr) {
+                        try { geo = await prepareGeoTargetsForCreate(token, cid, info.mcc, args); }
+                        catch (e) { result = { error: e.message }; }
+                    }
                     if (authErr) { result = { error: `Auth: ${authErr}` }; }
-                    else {
+                    else if (geo) {
                         const config = {
                             campaign_name:    args.campaign_name,
                             daily_budget:     args.daily_budget,
                             bidding_strategy: args.bidding_strategy || "MANUAL_CPV",
                             final_url:        args.final_url,
-                            geo_targets:      args.geo_targets,
+                            geo_targets:      geo.specs,
                             ad_groups:        args.ad_groups,
                         };
 
@@ -10545,7 +10886,8 @@ async function dispatchToolCall(name, args = {}) {
                                     bidding_strategy: config.bidding_strategy,
                                     final_url:        config.final_url,
                                     language:         "English",
-                                    geo_targets:      config.geo_targets.map(id => `geoTargetConstants/${id}`),
+                                    geo_targets:      config.geo_targets.map(n => describeGeoSpec(n)),
+                                    ...(geo.copied_from ? { geo_copied_from: geo.copied_from } : {}),
                                     status:           "PAUSED (default for new campaigns)",
                                     ad_groups:        config.ad_groups.map(ag => ({
                                         name:           ag.name,
@@ -10748,112 +11090,88 @@ async function dispatchToolCall(name, args = {}) {
                     } else {
                         const current = await getCampaignGeoTargets(token, cid, info.mcc, camp.resource_name);
 
-                        if (!toAdd.length && !toRemove.length) {
+                        if (!toAdd.length && !toRemove.length && !args.copy_from_campaign && !args.geo_target_type) {
                             result = {
                                 account: info.name,
                                 campaign: camp.name,
-                                message: "Current geo targets — pass add/remove arrays to change",
-                                geo_targets: current.map(g => ({
-                                    criterion: g.criterion_resource_name,
-                                    geo_constant: g.geo_target_constant,
-                                    name: g.canonical_name || g.name,
-                                    type: g.target_type,
-                                })),
+                                message: "Current geo targets — pass add/remove/copy_from_campaign to change",
+                                geo_target_type: current.geo_target_type,
+                                geo_targets: current.targets,
                             };
                         } else {
-                            const ops = [];
-
-                            // Resolve removals — match by criterion resource name, geo constant, ID, or name
-                            const removeMatched = [];
-                            for (const r of toRemove) {
-                                const rLower = r.toLowerCase();
-                                const found = current.find(g =>
-                                    g.criterion_resource_name === r ||
-                                    g.geo_target_constant === r ||
-                                    g.geo_target_constant === `geoTargetConstants/${r}` ||
-                                    (g.name && g.name.toLowerCase() === rLower) ||
-                                    (g.canonical_name && g.canonical_name.toLowerCase().includes(rLower))
-                                );
-                                if (found) {
-                                    removeMatched.push(found);
-                                    ops.push({
-                                        campaignCriterionOperation: {
-                                            remove: found.criterion_resource_name,
-                                        },
-                                    });
-                                } else {
-                                    throw new Error(`Cannot find current geo target matching '${r}'. Current targets: ${current.map(g => g.canonical_name || g.name || g.geo_target_constant).join(", ")}`);
-                                }
+                            const addResolved = await resolveGeoTargetSpecs(token, info.mcc, toAdd);
+                            let source = null;
+                            if (args.copy_from_campaign) {
+                                source = await getGeoTargetsForCampaignName(token, cid, info.mcc, args.copy_from_campaign, { confirmed: confirm, campaigns });
+                                if (source.campaign.resource_name === camp.resource_name) throw new Error("copy_from_campaign is the same campaign being updated.");
                             }
+                            const plan = planGeoTargetingChange({
+                                campaignResource: camp.resource_name,
+                                current,
+                                add: addResolved,
+                                remove: toRemove,
+                                source,
+                                replaceExisting: args.replace_existing === true,
+                                geoTargetType: args.geo_target_type || null,
+                            });
 
-                            // Resolve additions — resolve to geo constant and look up name
-                            const addResolved = [];
-                            for (const a of toAdd) {
-                                const isId = /^\d+$/.test(a);
-                                let geoConstant;
-                                if (isId) {
-                                    geoConstant = `geoTargetConstants/${a}`;
-                                } else if (a.startsWith("geoTargetConstants/")) {
-                                    geoConstant = a;
-                                } else {
-                                    geoConstant = await resolveGeoTarget(token, info.mcc, a);
-                                }
-                                addResolved.push({ geo_constant: geoConstant, input: a });
-                                ops.push({
-                                    campaignCriterionOperation: {
-                                        create: {
-                                            campaign: camp.resource_name,
-                                            location: { geoTargetConstant: geoConstant },
-                                        },
-                                    },
-                                });
-                            }
-
-                            // Resolve human names for additions
-                            const addGeoIds = addResolved.map(a => a.geo_constant);
-                            let addNameMap = {};
-                            if (addGeoIds.length) {
+                            // Resolve human names for added locations (best-effort)
+                            const addGeoIds = [...new Set(plan.adding.map(n => n.geo_target_constant).filter(Boolean))];
+                            const addNameMap = {};
+                            for (const t of source?.targets || []) if (t.geo_target_constant) addNameMap[t.geo_target_constant] = t.name;
+                            const unnamed = addGeoIds.filter(id => !addNameMap[id]);
+                            if (unnamed.length) {
                                 try {
                                     const nameRows = await googleSearch(token, cid, info.mcc, `
                                         SELECT geo_target_constant.resource_name,
                                                geo_target_constant.canonical_name
                                         FROM geo_target_constant
-                                        WHERE geo_target_constant.resource_name IN (${addGeoIds.map(id => `'${id}'`).join(", ")})`);
+                                        WHERE geo_target_constant.resource_name IN (${unnamed.map(id => `'${id}'`).join(", ")})`);
                                     for (const r of nameRows) {
                                         addNameMap[r.geoTargetConstant.resourceName] = r.geoTargetConstant.canonicalName;
                                     }
                                 } catch (_) { /* name lookup is best-effort */ }
                             }
-                            const addDisplay = addResolved.map(a => ({
-                                geo_constant: a.geo_constant,
-                                name: addNameMap[a.geo_constant] || a.input,
-                            }));
+                            const summary = {
+                                account: info.name,
+                                campaign: camp.name,
+                                ...(source ? { copied_from: source.campaign.name } : {}),
+                                removing: plan.removing.map(t => `${t.negative ? "EXCLUDE " : ""}${t.name}`),
+                                adding: plan.adding.map(n => describeGeoSpec(n, addNameMap)),
+                                ...(plan.skipped.length ? { skipped_already_present: plan.skipped.map(n => describeGeoSpec(n, addNameMap)) } : {}),
+                                ...(plan.set_geo_target_type ? { geo_target_type_change: `${current.geo_target_type.positive} → ${plan.set_geo_target_type}` } : {}),
+                            };
 
-                            if (!confirm) {
+                            if (!plan.ops.length) {
+                                result = { ...summary, message: "Nothing to change — targeting already matches.", geo_targets: current.targets };
+                            } else if (!confirm) {
+                                // validateOnly: Google checks the ops, nothing is changed
+                                let validation;
+                                try {
+                                    await googleMutateOps(token, cid, info.mcc, plan.ops, { validateOnly: true });
+                                    validation = { status: "PASSES" };
+                                } catch (e) {
+                                    validation = { status: "FAILS", error: e.message };
+                                }
                                 result = {
+                                    validation,
                                     dry_run: true,
                                     message: "DRY RUN — set confirm=true to apply",
-                                    account: info.name,
-                                    campaign: camp.name,
-                                    current_targets: current.map(g => g.canonical_name || g.name || g.geo_target_constant),
-                                    removing: removeMatched.map(g => g.canonical_name || g.name || g.geo_target_constant),
-                                    adding: addDisplay,
-                                    operations: ops.length,
+                                    ...summary,
+                                    current_targets: current.targets.map(t => `${t.negative ? "EXCLUDE " : ""}${t.name}`),
+                                    current_geo_target_type: current.geo_target_type,
+                                    operations: plan.ops.length,
                                 };
                             } else {
-                                await googleMutateOps(token, cid, info.mcc, ops);
+                                await googleMutateOps(token, cid, info.mcc, plan.ops);
                                 const updated = await getCampaignGeoTargets(token, cid, info.mcc, camp.resource_name);
                                 result = {
                                     success: true,
-                                    account: info.name,
-                                    campaign: camp.name,
-                                    removed: removeMatched.length,
-                                    added: addDisplay.length,
-                                    new_geo_targets: updated.map(g => ({
-                                        geo_constant: g.geo_target_constant,
-                                        name: g.canonical_name || g.name,
-                                        type: g.target_type,
-                                    })),
+                                    ...summary,
+                                    removed: plan.removing.length,
+                                    added: plan.adding.length,
+                                    geo_target_type: updated.geo_target_type,
+                                    new_geo_targets: updated.targets,
                                 };
                             }
                         }
@@ -13875,6 +14193,8 @@ module.exports = {
     resolveAccount, buildAccountContext, addDays,
     collectPolicyViolations, googleAdsError, createGoogleCampaignFull, addKeywordsToAdGroup,
     buildCampaignBudgetLines,
+    normalizeGeoTargetSpec, buildGeoCriterion, shapeGeoCriteria, geoTargetToSpec, planGeoTargetingChange,
+    describeGeoSpec, parseProximityAddress, createPmaxCampaignFull, createVideoCampaignFull,
 };
 
 if (require.main === module && !process.env.MCP_TEST) main().catch(console.error);
