@@ -167,12 +167,75 @@
     },
     "9694376492": {
       "name": "Enzoic",
-      "budget": 1800,
+      "budget": 2100,
       "mcc": "9694376492",
       "health": {
         "conversion_type": "lead",
         "impression_share_floor": 40
-      }
+      },
+      "budget_schedule": [
+        {
+          "from": "2027-01-01",
+          "budget": 1800
+        }
+      ],
+      "campaign_budgets": [
+        {
+          "label": "US/Canada Core",
+          "campaigns": [
+            "Identity Security",
+            "MFA",
+            "Password Reset",
+            "Credentials Risk Report",
+            "Try Now - Branded",
+            "Search_Account_Takeover",
+            "AD Lite",
+            "08222024_Exposed_Password_Monitoring",
+            "08222024_Performance Max - Retargeting",
+            "08222024_Search_Active_Directory_P1",
+            "08222024_Search_Active_Directory_P2",
+            "08222024_Search_Active_Directory_P3",
+            "08222024_Search_Active_Directory_P4",
+            "08222024_Search_Brand",
+            "08222024_Security_Data_Parners",
+            "AI & AD",
+            "Account Takeover",
+            "Compliance",
+            "Enterprise Security Protection",
+            "Performance Max - Retargeting",
+            "Quarter Century of AD",
+            "SANS Report",
+            "Search_Active_Directory",
+            "Search_Active_Directory_LITE",
+            "Search_Brand",
+            "Search_Competitor",
+            "Security Data Parterships - Password Breach Monitoring"
+          ],
+          "budget": 1800
+        },
+        {
+          "label": "Japan Test",
+          "campaigns": [
+            "AD Lite - Japan",
+            "Password Reset - Japan",
+            "Try Now - Branded - Japan"
+          ],
+          "budget": 300,
+          "start": "2026-10-22"
+        }
+      ],
+      "notes": [
+        {
+          "text": "Japan test launched 2026-10-22: AD Lite - Japan ($3/day), Password Reset - Japan ($4/day), Try Now - Branded - Japan ($2/day), English ads, Japan presence-only. $300/mo is ON TOP of the $1,800 base (total $2,100). Test runs through 2026-12-31; pause all three Japan campaigns on 12/31 (no end date set in Google Ads). Budget reverts to $1,800 on 2027-01-01. Low early volume in Japan is expected.",
+          "added": "2026-10-22",
+          "expires": "2027-01-01"
+        },
+        {
+          "text": "Budget split is strict: $1,800 US/Canada Core and $300 Japan Test are separate client budgets. Never shift money between them (don't use Japan underspend to top up US or vice versa). Pace and recommend per line.",
+          "added": "2026-10-22",
+          "expires": "2027-01-01"
+        }
+      ]
     },
     "9040402786": {
       "name": "Alderwood Psychological",

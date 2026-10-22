@@ -5364,6 +5364,54 @@ async function addCampaignExtensions(token, customerId, mccId, campaignResourceN
     return { assets_created: assetResults.length, links_created: linkResults.length, asset_resources: assetResults };
 }
 
+// get_ad_extensions — sitelinks, callouts and structured snippets linked at the
+// campaign and account level, returned in the same shape add_ad_extension takes
+async function fetchAdExtensions(token, customerId, mccId) {
+    const fields = `asset.id, asset.final_urls,
+               asset.sitelink_asset.link_text, asset.sitelink_asset.description1, asset.sitelink_asset.description2,
+               asset.callout_asset.callout_text,
+               asset.structured_snippet_asset.header, asset.structured_snippet_asset.values`;
+    const types = "('SITELINK', 'CALLOUT', 'STRUCTURED_SNIPPET')";
+    const [campRows, custRows] = await Promise.all([
+        googleSearch(token, customerId, mccId, `
+            SELECT campaign.name, campaign.status, campaign_asset.field_type, campaign_asset.status, ${fields}
+            FROM campaign_asset
+            WHERE campaign_asset.field_type IN ${types}
+              AND campaign_asset.status != 'REMOVED'
+              AND campaign.status != 'REMOVED'`),
+        googleSearch(token, customerId, mccId, `
+            SELECT customer_asset.field_type, customer_asset.status, ${fields}
+            FROM customer_asset
+            WHERE customer_asset.field_type IN ${types}
+              AND customer_asset.status != 'REMOVED'`),
+    ]);
+
+    const toAsset = (fieldType, a) => {
+        if (fieldType === "SITELINK") {
+            const s = a.sitelinkAsset || {};
+            return { link_text: s.linkText, description1: s.description1 || "", description2: s.description2 || "", url: (a.finalUrls || [])[0] || "" };
+        }
+        if (fieldType === "CALLOUT") return { text: a.calloutAsset?.calloutText };
+        const ss = a.structuredSnippetAsset || {};
+        return { header: ss.header, values: ss.values || [] };
+    };
+    const group = (rows, linkKey) => {
+        const out = { SITELINK: [], CALLOUT: [], STRUCTURED_SNIPPET: [] };
+        for (const r of rows) {
+            const ft = r[linkKey].fieldType;
+            out[ft]?.push({ asset_id: r.asset.id, link_status: r[linkKey].status, ...toAsset(ft, r.asset) });
+        }
+        return out;
+    };
+
+    const byCampaign = {};
+    for (const r of campRows) (byCampaign[r.campaign.name] ||= { status: r.campaign.status, rows: [] }).rows.push(r);
+    return {
+        campaigns: Object.entries(byCampaign).map(([name, c]) => ({ campaign: name, status: c.status, ...group(c.rows, "campaignAsset") })),
+        account_level: group(custRows, "customerAsset"),
+    };
+}
+
 // ── Helpers for new tools ─────────────────────────────────────────────────────
 
 // list_ad_groups — all non-removed ad groups, optionally filtered by campaign name
@@ -7469,6 +7517,20 @@ function makeServer() {
                     confirm: { type: "boolean", description: "Set true to apply. Omit for dry run." },
                 },
                 required: ["account_name", "campaign_name", "extension_type", "assets"],
+            },
+        },
+        {
+            name: "get_ad_extensions",
+            description: "Read sitelinks, callouts, and structured snippets in a Google Ads account — linked per campaign and at the account level. Read-only. " +
+                "Assets come back in the same shape add_ad_extension takes, so they can be copied to another campaign as-is. " +
+                "Account-level extensions already apply to every campaign and don't need copying.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    account_name:  { type: "string", description: "Client name (partial match ok)" },
+                    campaign_name: { type: "string", description: "Filter to campaigns whose name contains this (case-insensitive). Omit for all campaigns." },
+                },
+                required: ["account_name"],
             },
         },
         {
@@ -11176,6 +11238,24 @@ async function dispatchToolCall(name, args = {}) {
                             }
                         }
                     }
+                } catch (e) { result = { error: e.message }; }
+            }
+        }
+
+    } else if (name === "get_ad_extensions") {
+        const { match, error: matchErr } = resolveAccount(GOOGLE_ACCOUNTS, (args.account_name || "").toLowerCase());
+        if (!match) {
+            result = { error: matchErr };
+        } else {
+            const [cid, info] = match;
+            const { token, error: authErr } = await getGoogleAccessToken(cid);
+            if (authErr) { result = { error: `Auth: ${authErr}` }; }
+            else {
+                try {
+                    const ext = await fetchAdExtensions(token, cid, info.mcc);
+                    const campSearch = (args.campaign_name || "").toLowerCase();
+                    if (campSearch) ext.campaigns = ext.campaigns.filter(c => c.campaign.toLowerCase().includes(campSearch));
+                    result = { account: info.name, ...ext };
                 } catch (e) { result = { error: e.message }; }
             }
         }

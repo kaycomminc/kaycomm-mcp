@@ -162,9 +162,9 @@ async function flushHttp() {
   await new Promise(resolve => setImmediate(resolve));
 }
 
-test('registered catalog contains 92 tools with annotations and output schemas', async () => {
+test('registered catalog contains 93 tools with annotations and output schemas', async () => {
   const listed = await listHandler({ method: 'tools/list', params: {} }, {});
-  assert.equal(listed.tools.length, 92);
+  assert.equal(listed.tools.length, 93);
   for (const tool of listed.tools) {
     assert.ok(tool.annotations, `${tool.name} is missing annotations`);
     assert.equal(typeof tool.annotations.readOnlyHint, 'boolean');
