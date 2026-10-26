@@ -353,6 +353,11 @@
           "text": "Meta managed for Grova Creative (G Williams), runs through 2026-12-31. Meta media $950 Oct (7 ad sets + LASIK, lifetime budgets), $700/mo from 11/1. FLORIDA ONLY: no Georgia targeting (GA test postponed per G 10/9). Geos = areas around the 4 offices (Tallahassee, Perry, Quincy, Crawfordville) plus small/seasonal towns without advanced eye care (Blountstown, Apalachicola, etc.).",
           "added": "2026-10-10",
           "expires": "2026-12-31"
+        },
+        {
+          "text": "Conversion events: because of the health-domain block, Meta optimizes ViewContent (phone tap) on all ad sets and Search (form fill) on the LASIK Subdomain ad set — no Lead event. get_campaign_performance shows 0 leads by design; count conversions as fb_pixel_view_content + fb_pixel_search via get_meta_insights. Events are firing in Events Manager, but very few are attributed to ads (1 ViewContent, 0 Search on $705 as of 10/25).",
+          "added": "2026-10-25",
+          "expires": "2026-12-31"
         }
       ],
       "budget_schedule": [
