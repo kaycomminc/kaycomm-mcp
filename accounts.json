@@ -339,18 +339,16 @@
     },
     "act_691815912715665": {
       "name": "Eye Associates of NF",
-      "budget": 950,
-      "flight_start": "2026-10-10",
-      "flight_end": "2026-10-31",
+      "budget": 700,
       "page_id": "699487180071887",
       "notes": [
         {
-          "text": "Ad account reused from old Bella Coastal client — paused 'Bella Coastal' campaigns are not EANF; ignore. EANF Oct flight: single campaign 'EANF | Leads | Oct 2026' (OUTCOME_LEADS, ABO, optimizes pixel 951776337528814 Lead event), $950 net across 8 ad sets w/ lifetime budgets (Cataracts $170, Surgery Patients FL $130, Caregivers $80, Myopia $120, Optical Style+College $120, Optical FSA $130, Website RT 180d $120, LASIK Active <45 $80 — added 10/11), 10/10–10/31. Small per-ad-set budgets mean slow learning/few leads — expected. From Nov 1: $700/mo Meta media (budget_schedule) through 12/31 — flight_start/flight_end must be removed on 11/1 so monthly pacing applies.",
+          "text": "Ad account reused from old Bella Coastal client — paused 'Bella Coastal' campaigns are not EANF; ignore. EANF Oct flight (ended 10/31): single campaign 'EANF | Leads | Oct 2026' (OUTCOME_LEADS, ABO, optimizes pixel 951776337528814 Lead event), $950 net across 8 ad sets w/ lifetime budgets (Cataracts $170, Surgery Patients FL $130, Caregivers $80, Myopia $120, Optical Style+College $120, Optical FSA $130, Website RT 180d $120, LASIK Active <45 $80 — added 10/11), 10/10–10/31. Small per-ad-set budgets mean slow learning/few leads — expected.",
           "added": "2026-10-09",
           "expires": "2026-11-01"
         },
         {
-          "text": "Meta managed for Grova Creative (G Williams), runs through 2026-12-31. Meta media $950 Oct (7 ad sets + LASIK, lifetime budgets), $700/mo from 11/1. FLORIDA ONLY: no Georgia targeting (GA test postponed per G 10/9). Geos = areas around the 4 offices (Tallahassee, Perry, Quincy, Crawfordville) plus small/seasonal towns without advanced eye care (Blountstown, Apalachicola, etc.).",
+          "text": "Meta managed for Grova Creative (G Williams), runs through 2026-12-31. Meta media $950 Oct flight (10/10–10/31); $700/mo monthly pacing from 11/1. FLORIDA ONLY: no Georgia targeting (GA test postponed per G 10/9). Geos = areas around the 4 offices (Tallahassee, Perry, Quincy, Crawfordville) plus small/seasonal towns without advanced eye care (Blountstown, Apalachicola, etc.).",
           "added": "2026-10-10",
           "expires": "2026-12-31"
         },
@@ -358,12 +356,6 @@
           "text": "Conversion events: because of the health-domain block, Meta optimizes ViewContent (phone tap) on all ad sets and Search (form fill) on the LASIK Subdomain ad set — no Lead event. get_campaign_performance shows 0 leads by design; count conversions as fb_pixel_view_content + fb_pixel_search via get_meta_insights. Events are firing in Events Manager, but very few are attributed to ads (1 ViewContent, 0 Search on $705 as of 10/25).",
           "added": "2026-10-25",
           "expires": "2026-12-31"
-        }
-      ],
-      "budget_schedule": [
-        {
-          "from": "2026-11-01",
-          "budget": 700
         }
       ]
     }
