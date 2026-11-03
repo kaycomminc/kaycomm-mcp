@@ -112,6 +112,11 @@
           "text": "2026-10-05: Budget raised $1,125→$1,725 (+$600 Downtown, client request: $300 Events & Catering Downtown + $300 Online Ordering Downtown, both $9.25/day, launched 10/5). Per-request budgets tracked in campaign_budgets — pace each line, not just the account. Downtown Branded paused: another party runs La Loma Downtown ads.",
           "added": "2026-10-05",
           "expires": "2026-11-05"
+        },
+        {
+          "text": "2026-11-03: Parker expansion (+$1,500/mo, client test through 2027-01-31, then reassess). Built PAUSED, target enable Wed 11/4: V9 - Online Ordering Parker $20/day, V9 - Happy Hour Parker $15/day, V9 - Special Occasions Parker $14/day ($49/day). Max Clicks w/ caps ($2.50/$2.50/$3.00), 6 ZIPs (80015, 80016, 80112, 80124, 80134, 80138; 80046 is a PO-box ZIP that Google can't target). Goal = 'Online Ordering' custom goal. Once enabled, pause the 'Online Ordering - Parker' ad group in V9 - Online Ordering DTC/Parker. Shift money toward whatever converts; Special Occasions volume is thin, so expect it to underspend. Do NOT change DTC, Parker catering/private events, or Downtown (test through 12/31). Account budget should go $1,725→$3,225 (needs a local-server update). Fee tiers were sent to V9 on 10/30.",
+          "added": "2026-11-02",
+          "expires": "2027-01-31"
         }
       ],
       "campaign_budgets": [
