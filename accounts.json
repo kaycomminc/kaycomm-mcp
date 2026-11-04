@@ -119,7 +119,7 @@
           "expires": "2027-01-31"
         },
         {
-          "text": "2026-11-04: Parker expansion LIVE (Online Ordering Parker, Happy Hour Parker, Special Occasions Parker enabled). 'Online Ordering - Parker' ad group in V9 - Online Ordering DTC/Parker paused (DTC ad group still live). Parker is pickup only: delivery keywords paused, delivery negatives added, no delivery copy. No churro/green chile copy (not client-approved). Happy Hour ad schedule Mon-Fri. Week 1: check search terms for Aurora/Lone Tree keywords (Lone Tree overlaps DTC) and expect Special Occasions to underspend.",
+          "text": "2026-11-04: Parker expansion LIVE (Online Ordering Parker, Happy Hour Parker, Special Occasions Parker enabled), all 3 with end date 2027-01-31 (if the client extends, clear end dates before then). 'Online Ordering - Parker' ad group in the old shared campaign paused; that campaign renamed 'V9 - Online Ordering DTC' (DTC only now). Parker is pickup only: delivery keywords paused, delivery negatives added, no delivery copy. No churro/green chile copy (not client-approved). Happy Hour should run Mon-Fri, weekends off (ad schedule set in UI, not verifiable via API). Week 1: check search terms for Aurora/Lone Tree keywords (Lone Tree overlaps DTC) and expect Special Occasions to underspend.",
           "added": "2026-11-03",
           "expires": "2026-12-04"
         }
@@ -148,7 +148,7 @@
             "V9 - Catering Parker",
             "V9 - Private Events DTC",
             "V9 - Private Events Parker",
-            "V9 - Online Ordering DTC/Parker",
+            "V9 - Online Ordering DTC",
             "V9 - La Loma - Downtown Branded"
           ],
           "budget": 1125
