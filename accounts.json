@@ -101,7 +101,7 @@
     },
     "4206275101": {
       "name": "La Loma",
-      "budget": 1725,
+      "budget": 3075,
       "mcc": "7631184147",
       "notes": [
         {
@@ -114,12 +114,12 @@
           "expires": "2026-11-05"
         },
         {
-          "text": "2026-11-03: Parker expansion (+$1,500/mo, client test through 2027-01-31, then reassess). Built PAUSED, target enable Wed 11/4: V9 - Online Ordering Parker $20/day, V9 - Happy Hour Parker $15/day, V9 - Special Occasions Parker $14/day ($49/day). Max Clicks w/ caps ($2.50/$2.50/$3.00), 6 ZIPs (80015, 80016, 80112, 80124, 80134, 80138; 80046 is a PO-box ZIP that Google can't target). Goal = 'Online Ordering' custom goal. Once enabled, pause the 'Online Ordering - Parker' ad group in V9 - Online Ordering DTC/Parker. Shift money toward whatever converts; Special Occasions volume is thin, so expect it to underspend. Do NOT change DTC, Parker catering/private events, or Downtown (test through 12/31). Account budget should go $1,725→$3,225 (needs a local-server update). Fee tiers were sent to V9 on 10/30.",
+          "text": "2026-11-03: Parker expansion (+$1,500/mo, client test through 2027-01-31, then reassess). Built PAUSED, target enable Wed 11/4: V9 - Online Ordering Parker $20/day, V9 - Happy Hour Parker $15/day, V9 - Special Occasions Parker $14/day ($49/day). Max Clicks w/ caps ($2.50/$2.50/$3.00), 6 ZIPs (80015, 80016, 80112, 80124, 80134, 80138; 80046 is a PO-box ZIP that Google can't target). Goal = 'Online Ordering' custom goal. Once enabled, pause the 'Online Ordering - Parker' ad group in V9 - Online Ordering DTC/Parker. Shift money toward whatever converts; Special Occasions volume is thin, so expect it to underspend. Do NOT change DTC, Parker catering/private events, or Downtown (test through 12/31). Account budget: Nov $3,075 ($1,725 + $1,500 prorated from 11/4), $3,225/mo from 12/1. Parker line tracked in campaign_budgets as 'Parker Expansion (test thru 1/31)': $1,500/mo, ~$20 OO / $15 HH / $14 SO per day. Fee tiers were sent to V9 on 10/30.",
           "added": "2026-11-02",
           "expires": "2027-01-31"
         },
         {
-          "text": "2026-11-04: Parker expansion LIVE (Online Ordering Parker, Happy Hour Parker, Special Occasions Parker enabled). 'Online Ordering - Parker' ad group in V9 - Online Ordering DTC/Parker paused (DTC ad group still live). Parker is pickup only: delivery keywords paused, delivery negatives added, no delivery copy. No churro/green chile copy (not client-approved). Happy Hour ad schedule Mon-Fri. Week 1: check search terms for Aurora/Lone Tree keywords (Lone Tree overlaps DTC) and expect Special Occasions to underspend.",
+          "text": "2026-11-04: Parker expansion LIVE (Online Ordering Parker, Happy Hour Parker, Special Occasions Parker enabled), all 3 with end date 2027-01-31 (if the client extends, clear end dates before then). 'Online Ordering - Parker' ad group in the old shared campaign paused; that campaign renamed 'V9 - Online Ordering DTC' (DTC only now). Parker is pickup only: delivery keywords paused, delivery negatives added, no delivery copy. No churro/green chile copy (not client-approved). Happy Hour should run Mon-Fri, weekends off (ad schedule set in UI, not verifiable via API). Week 1: check search terms for Aurora/Lone Tree keywords (Lone Tree overlaps DTC) and expect Special Occasions to underspend.",
           "added": "2026-11-03",
           "expires": "2026-12-04"
         }
@@ -148,10 +148,26 @@
             "V9 - Catering Parker",
             "V9 - Private Events DTC",
             "V9 - Private Events Parker",
-            "V9 - Online Ordering DTC/Parker",
+            "V9 - Online Ordering DTC",
             "V9 - La Loma - Downtown Branded"
           ],
           "budget": 1125
+        },
+        {
+          "label": "Parker Expansion (test thru 1/31)",
+          "campaigns": [
+            "V9 - Online Ordering Parker",
+            "V9 - Happy Hour Parker",
+            "V9 - Special Occasions Parker"
+          ],
+          "budget": 1500,
+          "start": "2026-11-04"
+        }
+      ],
+      "budget_schedule": [
+        {
+          "from": "2026-12-01",
+          "budget": 3225
         }
       ]
     },
