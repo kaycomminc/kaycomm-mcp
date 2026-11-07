@@ -52,6 +52,11 @@
           "text": "Client ended contract (notified 2026-10-08). Last day of management is 2026-10-31. Continue normal management/pacing through 10/31 at $1,000/mo. From 2026-11-01: cease all ads management — no optimizations, budget changes, or recommendations; mark account inactive.",
           "added": "2026-10-08",
           "expires": "2026-11-01"
+        },
+        {
+          "text": "Contract ended 2026-10-31. Jason said stop tracking CTSC (2026-11-06). Exclude from pacing, health checks and recommendations. Inactive flag still needs setting from the Mac.",
+          "added": "2026-11-06",
+          "expires": "2027-01-31"
         }
       ]
     },
