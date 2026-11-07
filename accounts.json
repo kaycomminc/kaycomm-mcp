@@ -122,6 +122,11 @@
           "text": "2026-11-04: Parker expansion LIVE (Online Ordering Parker, Happy Hour Parker, Special Occasions Parker enabled). 'Online Ordering - Parker' ad group in V9 - Online Ordering DTC/Parker paused (DTC ad group still live). Parker is pickup only: delivery keywords paused, delivery negatives added, no delivery copy. No churro/green chile copy (not client-approved). Happy Hour ad schedule Mon-Fri. Week 1: check search terms for Aurora/Lone Tree keywords (Lone Tree overlaps DTC) and expect Special Occasions to underspend.",
           "added": "2026-11-03",
           "expires": "2026-12-04"
+        },
+        {
+          "text": "Budget is $3,225/mo from Nov 2026 ($1,725 base + $1,500 Parker expansion live 11/4; Online Ordering Parker, Happy Hour Parker, Special Occasions Parker). accounts.json still shows $1,725 until updated from the Mac. Pace La Loma against $3,225, with the expansion prorated to about $1,350 for November.",
+          "added": "2026-11-06",
+          "expires": "2026-12-01"
         }
       ],
       "campaign_budgets": [
