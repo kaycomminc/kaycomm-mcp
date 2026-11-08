@@ -41,33 +41,6 @@
         "conversion_type": "sale"
       }
     },
-    "2275371078": {
-      "name": "Childrens Therapy Services of Colorado",
-      "budget": 1000,
-      "mcc": "7631184147",
-      "health": {
-        "conversion_type": "lead",
-        "pacing_tolerance_pct": 10
-      },
-      "budget_schedule": [
-        {
-          "from": "2026-11-01",
-          "budget": 0
-        }
-      ],
-      "notes": [
-        {
-          "text": "Client ended contract (notified 2026-10-08). Last day of management is 2026-10-31. Continue normal management/pacing through 10/31 at $1,000/mo. From 2026-11-01: cease all ads management — no optimizations, budget changes, or recommendations; mark account inactive.",
-          "added": "2026-10-08",
-          "expires": "2026-11-01"
-        },
-        {
-          "text": "Contract ended 2026-10-31. Jason said stop tracking CTSC (2026-11-06). Exclude from pacing, health checks and recommendations. Inactive flag still needs setting from the Mac.",
-          "added": "2026-11-06",
-          "expires": "2027-01-31"
-        }
-      ]
-    },
     "2908157845": {
       "name": "Boulevard Carroll",
       "budget": 4000,
@@ -95,26 +68,17 @@
           "text": "2026-10-08 location split: 7 onsite-shipping states (AK, DE, MT, NH, NC, OR, VA) → Search_G_Brand_OnsiteStates ($10, /our-products/) + Shopping_G_Standard ($15, re-enabled, Max Clicks $1.25 cap). Other 43 states + DC → Search_G_Brand_Charlies_US_Other ($52, $1.50 cap, BWP page) + PMax_G_US_All products ($60). PMax_Non Brand ($13) kept on 2-week watch (97% YouTube). BWP conversion tracking broken since ~9/2 and cookie banner since 9/25 — low conversions are a known tracking gap, not a new break. Search_G_NonBrand_BWP-States ($15, 43 states + DC, BWP page, Max Clicks $1.50 cap, 3 exact-match ad groups) built PAUSED 10/8 awaiting enable.",
           "added": "2026-10-08",
           "expires": "2026-11-08"
-        }
-      ]
-    },
-    "3340507097": {
-      "name": "FAMU Online",
-      "budget": 1250,
-      "mcc": "8621281595",
-      "flight_start": "2026-09-01",
-      "flight_end": "2026-10-31",
-      "notes": [
+        },
         {
-          "text": "FAMU Online is currently only running YouTube and Meta — no Search campaigns active.",
-          "added": "2026-09-25",
-          "expires": "2026-10-25"
+          "text": "2026-10-26: Search_G_Amazon_US (ID 24405048409) built PAUSED. $90/day, Max Clicks, 44 non-onsite states (geo copied from Brand_US_Other), 8 product ad groups → Amazon product pages, 57 keywords. Liza (V9) is making Amazon Attribution links from keyword IDs; do NOT reword or rebuild keywords (that changes the IDs). Don't launch until Liza approves. Swap in attribution URLs when received.",
+          "added": "2026-10-26",
+          "expires": "2026-11-30"
         }
       ]
     },
     "4206275101": {
       "name": "La Loma",
-      "budget": 1725,
+      "budget": 3225,
       "mcc": "7631184147",
       "notes": [
         {
@@ -137,9 +101,9 @@
           "expires": "2026-12-04"
         },
         {
-          "text": "Budget is $3,225/mo from Nov 2026 ($1,725 base + $1,500 Parker expansion live 11/4; Online Ordering Parker, Happy Hour Parker, Special Occasions Parker). accounts.json still shows $1,725 until updated from the Mac. Pace La Loma against $3,225, with the expansion prorated to about $1,350 for November.",
+          "text": "2026-11-03: Parker expansion launched (+$1,500/mo, partner request 10/29): V9 - Online Ordering Parker ($20/day, split out of DTC/Parker), V9 - Happy Hour Parker ($15), V9 - Special Occasions Parker ($14), Parker-area zips. Budget now $3,225 = $1,125 DTC/Parker + $600 Downtown + $1,500 Parker Expansion; Nov Parker line prorated from 11/3 (~$1,400). Pace each campaign_budgets line separately. Happy Hour Parker ads are APPROVED_LIMITED (alcohol), so low delivery there is expected.",
           "added": "2026-11-06",
-          "expires": "2026-12-01"
+          "expires": "2026-12-31"
         }
       ],
       "campaign_budgets": [
@@ -166,10 +130,20 @@
             "V9 - Catering Parker",
             "V9 - Private Events DTC",
             "V9 - Private Events Parker",
-            "V9 - Online Ordering DTC/Parker",
+            "V9 - Online Ordering DTC",
             "V9 - La Loma - Downtown Branded"
           ],
           "budget": 1125
+        },
+        {
+          "label": "Parker Expansion",
+          "campaigns": [
+            "V9 - Online Ordering Parker",
+            "V9 - Happy Hour Parker",
+            "V9 - Special Occasions Parker"
+          ],
+          "budget": 1500,
+          "start": "2026-11-03"
         }
       ]
     },
@@ -300,7 +274,14 @@
       "mcc": "8621281595",
       "health": {
         "conversion_type": "lead"
-      }
+      },
+      "notes": [
+        {
+          "text": "2026-10-26: Lead form confirmed working by Jason. Low/zero Google conversions after the 10/20 care-type split were a reach problem (5 campaigns ~7 impr/day, rank-limited at $5 cap, QS 1-3), not a tracking break. Reverted: 5 care-type campaigns PAUSED; 'PHQ - Search' re-enabled at $30/day, Max Clicks $7 cap, Independent Living ad group paused; Brand $8/day. Oct lands ~$740 of $765. From 11/1 drop to ~$24/day total ($765/mo). Revisit care-type split once care-type landing pages are live.",
+          "added": "2026-10-26",
+          "expires": "2026-11-30"
+        }
+      ]
     },
     "6754409854": {
       "name": "Axis Office",
@@ -371,13 +352,6 @@
         }
       ],
       "page_id": "180157065330926"
-    },
-    "act_1172134603935325": {
-      "name": "FAMU Online",
-      "budget": 2900,
-      "flight_start": "2026-07-01",
-      "flight_end": "2026-09-30",
-      "page_id": "626075927259136"
     },
     "act_547352620606461": {
       "name": "PHQ",
