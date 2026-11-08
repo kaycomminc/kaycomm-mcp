@@ -1,0 +1,373 @@
+{
+  "health_defaults": {
+    "pacing_tolerance_pct": 5,
+    "conversion_dry_spell_hours": 72,
+    "cpa_tolerance_pct": 25,
+    "roas_tolerance_pct": 20,
+    "spend_spike_pct": 75,
+    "spend_drop_pct": -60,
+    "ctr_degradation_pct": -20,
+    "ctr_lookback_days": 30,
+    "quality_score_floor": 5,
+    "zero_spend_days_threshold": 7,
+    "budget_exhaustion_is_lost_pct": 20,
+    "campaign_delivery_drop_pct": -60,
+    "campaign_underdelivery_pct": 25
+  },
+  "routine_rules": [
+    {
+      "id": "r1",
+      "text": "The most recent 2 days of conversions are incomplete (conversion lag). Never call a conversion drop, dry spell, or CPA spike based only on those days.",
+      "applies_to": [
+        "all"
+      ],
+      "added": "2026-09-22"
+    }
+  ],
+  "google": {
+    "1481569045": {
+      "name": "Woca Woodcare",
+      "budget": 2500,
+      "mcc": "7631184147",
+      "health": {
+        "conversion_type": "sale"
+      }
+    },
+    "2275371078": {
+      "name": "Childrens Therapy Services of Colorado",
+      "budget": 1000,
+      "mcc": "7631184147",
+      "health": {
+        "conversion_type": "lead",
+        "pacing_tolerance_pct": 10
+      },
+      "budget_schedule": [
+        {
+          "from": "2026-11-01",
+          "budget": 0
+        }
+      ],
+      "notes": [
+        {
+          "text": "Client ended contract (notified 2026-10-08). Last day of management is 2026-10-31. Continue normal management/pacing through 10/31 at $1,000/mo. From 2026-11-01: cease all ads management — no optimizations, budget changes, or recommendations; mark account inactive.",
+          "added": "2026-10-08",
+          "expires": "2026-11-01"
+        }
+      ]
+    },
+    "2908157845": {
+      "name": "Boulevard Carroll",
+      "budget": 4000,
+      "mcc": "7631184147",
+      "nc_budget": 1000,
+      "health": {
+        "conversion_type": "sale",
+        "conversion_dry_spell_hours": 48
+      }
+    },
+    "2944254697": {
+      "name": "Charlie's Soap",
+      "budget": 5500,
+      "mcc": "7631184147",
+      "health": {
+        "conversion_type": "sale"
+      },
+      "notes": [
+        {
+          "text": "Google API access fixed 2026-09-17 (MCC corrected to 7631184147), so permission errors are now real failures. $5,500 budget = $3K Google base + $2.5K redirected from Meta while the Meta account is disabled (per Liza Hammon, 2026-07-29); revert to $3K when Meta is restored.",
+          "added": "2026-09-22",
+          "expires": "2026-10-31"
+        },
+        {
+          "text": "2026-10-08 location split: 7 onsite-shipping states (AK, DE, MT, NH, NC, OR, VA) → Search_G_Brand_OnsiteStates ($10, /our-products/) + Shopping_G_Standard ($15, re-enabled, Max Clicks $1.25 cap). Other 43 states + DC → Search_G_Brand_Charlies_US_Other ($52, $1.50 cap, BWP page) + PMax_G_US_All products ($60). PMax_Non Brand ($13) kept on 2-week watch (97% YouTube). BWP conversion tracking broken since ~9/2 and cookie banner since 9/25 — low conversions are a known tracking gap, not a new break. Search_G_NonBrand_BWP-States ($15, 43 states + DC, BWP page, Max Clicks $1.50 cap, 3 exact-match ad groups) built PAUSED 10/8 awaiting enable.",
+          "added": "2026-10-08",
+          "expires": "2026-11-08"
+        }
+      ]
+    },
+    "3340507097": {
+      "name": "FAMU Online",
+      "budget": 1250,
+      "mcc": "8621281595",
+      "flight_start": "2026-09-01",
+      "flight_end": "2026-10-31",
+      "notes": [
+        {
+          "text": "FAMU Online is currently only running YouTube and Meta — no Search campaigns active.",
+          "added": "2026-09-25",
+          "expires": "2026-10-25"
+        }
+      ]
+    },
+    "4206275101": {
+      "name": "La Loma",
+      "budget": 1725,
+      "mcc": "7631184147",
+      "notes": [
+        {
+          "text": "Daily budgets reset 2026-09-23 to a client-agreed 75/25 split favoring catering form fills: Catering DTC $15.25, Catering Parker $7.50 (catering = $22.75/day); Private Events DTC $2.50, Private Events Parker $1.75, Downtown Branded $1.75, Online Ordering $1.50 (other = $7.50/day). Total $30.25/day, sized so September lands on the $1,125 budget. The low non-catering budgets and any 'limited by budget' status on them are intentional. Don't recommend rebalancing toward private events, branded, or online ordering. Judge performance by catering form fills. October allocation still to be decided.",
+          "added": "2026-09-23"
+        },
+        {
+          "text": "2026-10-05: Budget raised $1,125→$1,725 (+$600 Downtown, client request: $300 Events & Catering Downtown + $300 Online Ordering Downtown, both $9.25/day, launched 10/5). Per-request budgets tracked in campaign_budgets — pace each line, not just the account. Downtown Branded paused: another party runs La Loma Downtown ads.",
+          "added": "2026-10-05",
+          "expires": "2026-11-05"
+        }
+      ],
+      "campaign_budgets": [
+        {
+          "label": "Downtown Events & Catering",
+          "campaigns": [
+            "V9 - Events & Catering Downtown"
+          ],
+          "budget": 300,
+          "start": "2026-10-05"
+        },
+        {
+          "label": "Downtown Online Ordering",
+          "campaigns": [
+            "V9 - Online Ordering Downtown"
+          ],
+          "budget": 300,
+          "start": "2026-10-05"
+        },
+        {
+          "label": "DTC & Parker (original budget)",
+          "campaigns": [
+            "V9 - Catering DTC",
+            "V9 - Catering Parker",
+            "V9 - Private Events DTC",
+            "V9 - Private Events Parker",
+            "V9 - Online Ordering DTC/Parker",
+            "V9 - La Loma - Downtown Branded"
+          ],
+          "budget": 1125
+        }
+      ]
+    },
+    "9547060400": {
+      "name": "Eye Associates of NF",
+      "budget": 2500,
+      "mcc": "9547060400",
+      "health": {
+        "conversion_type": "lead",
+        "conversion_dry_spell_hours": 48,
+        "cpa_target": 75,
+        "cpa_tolerance_pct": 25,
+        "impression_share_floor": 50
+      }
+    },
+    "5976116321": {
+      "name": "Nationwide Southwest",
+      "budget": 1000,
+      "mcc": "7631184147",
+      "health": {
+        "conversion_type": "lead"
+      }
+    },
+    "9694376492": {
+      "name": "Enzoic",
+      "budget": 2100,
+      "mcc": "9694376492",
+      "health": {
+        "conversion_type": "lead",
+        "impression_share_floor": 40
+      },
+      "budget_schedule": [
+        {
+          "from": "2027-01-01",
+          "budget": 1800
+        }
+      ],
+      "campaign_budgets": [
+        {
+          "label": "US/Canada Core",
+          "campaigns": [
+            "Identity Security",
+            "MFA",
+            "Password Reset",
+            "Credentials Risk Report",
+            "Try Now - Branded",
+            "Search_Account_Takeover",
+            "AD Lite",
+            "08222024_Exposed_Password_Monitoring",
+            "08222024_Performance Max - Retargeting",
+            "08222024_Search_Active_Directory_P1",
+            "08222024_Search_Active_Directory_P2",
+            "08222024_Search_Active_Directory_P3",
+            "08222024_Search_Active_Directory_P4",
+            "08222024_Search_Brand",
+            "08222024_Security_Data_Parners",
+            "AI & AD",
+            "Account Takeover",
+            "Compliance",
+            "Enterprise Security Protection",
+            "Performance Max - Retargeting",
+            "Quarter Century of AD",
+            "SANS Report",
+            "Search_Active_Directory",
+            "Search_Active_Directory_LITE",
+            "Search_Brand",
+            "Search_Competitor",
+            "Security Data Parterships - Password Breach Monitoring"
+          ],
+          "budget": 1800
+        },
+        {
+          "label": "Japan Test",
+          "campaigns": [
+            "AD Lite - Japan",
+            "Password Reset - Japan",
+            "Try Now - Branded - Japan"
+          ],
+          "budget": 300,
+          "start": "2026-10-22"
+        }
+      ],
+      "notes": [
+        {
+          "text": "Japan test launched 2026-10-22: AD Lite - Japan ($3/day), Password Reset - Japan ($4/day), Try Now - Branded - Japan ($2/day), English ads, Japan presence-only. $300/mo is ON TOP of the $1,800 base (total $2,100). Test runs through 2026-12-31; pause all three Japan campaigns on 12/31 (no end date set in Google Ads). Budget reverts to $1,800 on 2027-01-01. Low early volume in Japan is expected.",
+          "added": "2026-10-22",
+          "expires": "2027-01-01"
+        },
+        {
+          "text": "Budget split is strict: $1,800 US/Canada Core and $300 Japan Test are separate client budgets. Never shift money between them (don't use Japan underspend to top up US or vice versa). Pace and recommend per line.",
+          "added": "2026-10-22",
+          "expires": "2027-01-01"
+        }
+      ]
+    },
+    "9040402786": {
+      "name": "Alderwood Psychological",
+      "budget": 650,
+      "mcc": "7631184147",
+      "health": {
+        "conversion_type": "lead",
+        "conversion_dry_spell_hours": 48
+      }
+    },
+    "8459391760": {
+      "name": "Outside The Breadbox",
+      "budget": 375,
+      "mcc": "7631184147",
+      "health": {
+        "conversion_type": "sale",
+        "conversion_dry_spell_hours": 120
+      }
+    },
+    "6631800329": {
+      "name": "Summit Express",
+      "budget": 0,
+      "mcc": "7631184147",
+      "health": {
+        "conversion_type": "sale",
+        "roas_target": 5,
+        "roas_tolerance_pct": 20,
+        "impression_share_floor": 60
+      }
+    },
+    "7681141633": {
+      "name": "PHQ",
+      "budget": 765,
+      "mcc": "8621281595",
+      "health": {
+        "conversion_type": "lead"
+      }
+    },
+    "6754409854": {
+      "name": "Axis Office",
+      "budget": 10000,
+      "mcc": "7631184147",
+      "notes": [
+        {
+          "text": "Launched Oct 2026 ($10K/mo confirmed). New Search campaigns (FL DMAs) live; 'New - Shopping - All Products' built 10/7 PAUSED, $80/day, US, MC 5860008444. Old Shopping/PMax campaigns use old MC 747740521 — keep paused. Mgmt fee $1,500/mo billed via V9.",
+          "added": "2026-10-07",
+          "expires": "2026-11-07"
+        }
+      ]
+    },
+    "4399982656": {
+      "name": "Contractor's Recycling",
+      "budget": 2000,
+      "refresh_token_env": "GOOGLE_REFRESH_TOKEN_3",
+      "health": {},
+      "mcc": "4399982656",
+      "notes": [
+        {
+          "text": "LIVE ~10/17. Jason wants the FULL $2K spent in October. On 10/18 daily budgets were raised to $130/day total (Rental Yards $75, Commercial Dumping $50, Brand $5) to catch up from $116 MTD. On Nov 1, drop back to $65/day (Yards $36, Dumping $24, Brand $5). Early lost impression share is mostly rank (54–69%), not budget, so Oct may still under-deliver; if so, consider widening geo/keywords rather than more budget. Yard search volume is very low. If budget is tight, V9 prefers tightening geo over cutting a campaign.",
+          "added": "2026-10-18",
+          "expires": "2026-11-03"
+        }
+      ]
+    }
+  },
+  "meta": {
+    "act_287139600343581": {
+      "name": "Nationwide Southwest",
+      "budget": 1000,
+      "health": {
+        "frequency_cap": 3
+      },
+      "page_id": "102186224932802"
+    },
+    "act_482088457883195": {
+      "name": "Summit Express",
+      "budget": 0,
+      "health": {
+        "frequency_cap": 3
+      },
+      "notes": [
+        {
+          "text": "Meta reports conversions with $0.00 conversion value (known, not a new tracking break).",
+          "added": "2026-09-22",
+          "expires": "2026-12-31"
+        }
+      ],
+      "page_id": "180157065330926"
+    },
+    "act_1172134603935325": {
+      "name": "FAMU Online",
+      "budget": 2900,
+      "flight_start": "2026-07-01",
+      "flight_end": "2026-09-30",
+      "page_id": "626075927259136"
+    },
+    "act_547352620606461": {
+      "name": "PHQ",
+      "budget": 510,
+      "page_id": "513620928749165"
+    },
+    "act_691815912715665": {
+      "name": "Eye Associates of NF",
+      "budget": 950,
+      "flight_start": "2026-10-10",
+      "flight_end": "2026-10-31",
+      "page_id": "699487180071887",
+      "notes": [
+        {
+          "text": "Ad account reused from old Bella Coastal client — paused 'Bella Coastal' campaigns are not EANF; ignore. EANF Oct flight: single campaign 'EANF | Leads | Oct 2026' (OUTCOME_LEADS, ABO, optimizes pixel 951776337528814 Lead event), $950 net across 8 ad sets w/ lifetime budgets (Cataracts $170, Surgery Patients FL $130, Caregivers $80, Myopia $120, Optical Style+College $120, Optical FSA $130, Website RT 180d $120, LASIK Active <45 $80 — added 10/11), 10/10–10/31. Small per-ad-set budgets mean slow learning/few leads — expected. From Nov 1: $700/mo Meta media (budget_schedule) through 12/31 — flight_start/flight_end must be removed on 11/1 so monthly pacing applies.",
+          "added": "2026-10-09",
+          "expires": "2026-11-01"
+        },
+        {
+          "text": "Meta managed for Grova Creative (G Williams), runs through 2026-12-31. Meta media $950 Oct (7 ad sets + LASIK, lifetime budgets), $700/mo from 11/1. FLORIDA ONLY: no Georgia targeting (GA test postponed per G 10/9). Geos = areas around the 4 offices (Tallahassee, Perry, Quincy, Crawfordville) plus small/seasonal towns without advanced eye care (Blountstown, Apalachicola, etc.).",
+          "added": "2026-10-10",
+          "expires": "2026-12-31"
+        },
+        {
+          "text": "Conversion events: because of the health-domain block, Meta optimizes ViewContent (phone tap) on all ad sets and Search (form fill) on the LASIK Subdomain ad set — no Lead event. get_campaign_performance shows 0 leads by design; count conversions as fb_pixel_view_content + fb_pixel_search via get_meta_insights. Events are firing in Events Manager, but very few are attributed to ads (1 ViewContent, 0 Search on $705 as of 10/25).",
+          "added": "2026-10-25",
+          "expires": "2026-12-31"
+        }
+      ],
+      "budget_schedule": [
+        {
+          "from": "2026-11-01",
+          "budget": 700
+        }
+      ]
+    }
+  },
+  "stackadapt": {},
+  "linkedin": {}
+}

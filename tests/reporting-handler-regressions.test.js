@@ -1,4 +1,6 @@
 process.env.MCP_TEST = "1";
+// Frozen config: these tests use FAMU Online, which is no longer in live accounts.json.
+process.env.ACCOUNTS_FILE = require("node:path").join(__dirname, "fixtures", "accounts-2026-10-25.json");
 const test = require("node:test");
 const assert = require("node:assert/strict");
 

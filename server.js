@@ -80,7 +80,8 @@ const API_VERSION_INFO = {
 // NOTE: on Railway the filesystem is ephemeral. With ACCOUNTS_GITHUB_TOKEN set,
 // Railway commits note/rule changes to git itself (see accountsSync below);
 // everything else is edited on the Mac and committed by hand.
-const ACCOUNTS_FILE = path.join(__dirname, "accounts.json");
+// Tests can point at a frozen fixture so they don't depend on live client config.
+const ACCOUNTS_FILE = (process.env.MCP_TEST && process.env.ACCOUNTS_FILE) || path.join(__dirname, "accounts.json");
 let GOOGLE_ACCOUNTS = {};
 let META_ACCOUNTS = {};
 let STACKADAPT_ADVERTISERS = {};
