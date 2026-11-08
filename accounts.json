@@ -327,6 +327,25 @@
           "expires": "2026-11-03"
         }
       ]
+    },
+    "6269893539": {
+      "name": "FLHSMV",
+      "budget": 3000,
+      "mcc": "8621281595",
+      "flight_start": "2026-11-08",
+      "flight_end": "2026-12-31",
+      "notes": [
+        {
+          "text": "Arrive Alive via ADELE (Valerie). YouTube budget is NET: $3K net ($6K gross); total campaign $15K gross, billed $15K to ADELE. YouTube live ~11/15; guarantee 120K completed :15 views (CPV, no :06 bumpers). DELIVERABLES outrank net budget — flag if 120K views needs >$3K net. 15 FL counties, ages 20-55, EN+ES, utm_ArriveAlive2026, no TikTok.",
+          "added": "2026-11-03",
+          "expires": "2026-12-03"
+        },
+        {
+          "text": "YouTube flight start moved up from 11/15 to 11/8 (set in Ads UI by Jason, 2026-11-08); campaigns ENABLED. Earlier note saying 'live ~11/15' is superseded.",
+          "added": "2026-11-08",
+          "expires": "2026-12-08"
+        }
+      ]
     }
   },
   "meta": {
@@ -389,6 +408,20 @@
           "text": "Nov: campaign 'EANF | Leads | Nov 2026' (120252231300520542), copy of live Oct campaign, 11/1–11/30, $700 lifetime across 9 ad sets (RT $127, Cataracts $114, Myopia $88, FSA $86, Style $85, Patients $84, Caregivers $51, LASIK Subdomain $35, LASIK Active $30 — Meta min ~$29.43). 6 stale copied ad sets archived. Old 10/10 build renamed 'EANF | Leads | Oct 2026 (old)'. Dec needs a new campaign/budgets before 12/1.",
           "added": "2026-11-01",
           "expires": "2026-12-01"
+        }
+      ]
+    },
+    "act_718316027195517": {
+      "name": "FLHSMV",
+      "budget": 4500,
+      "flight_start": "2026-11-02",
+      "flight_end": "2026-12-31",
+      "page_id": "128186000582950",
+      "notes": [
+        {
+          "text": "Arrive Alive via ADELE (Valerie). Budget is NET: Meta $4.5K net ($9K gross); total campaign $15K gross, billed $15K to ADELE. Ad account renamed from Southern Quality 11/3 — any old Southern Quality campaigns are not FLHSMV. Static carousels EN+ES approved; flight 11/2-12/31, Meta target ~1.39M impressions. DELIVERABLES outrank net budget — flag if impressions pacing needs >$4.5K net. 15 FL counties, ages 20-55, EN+ES, utm_ArriveAlive2026, no TikTok.",
+          "added": "2026-11-03",
+          "expires": "2026-12-03"
         }
       ]
     }
