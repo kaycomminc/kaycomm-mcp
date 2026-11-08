@@ -125,6 +125,9 @@ function buildRetaggedCreative(source, urlTags) {
   }
 
   stripLabelIds(creative);
+  // Meta returns both image_url and image_hash on video_data but rejects creation with both.
+  const videoData = creative.object_story_spec?.video_data;
+  if (videoData && videoData.image_url && videoData.image_hash) delete videoData.image_url;
   creative.url_tags = tags;
   creative.name = retagName(source);
   return creative;

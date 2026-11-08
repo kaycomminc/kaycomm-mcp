@@ -304,8 +304,46 @@ async function reviewSpecialAdCategoryTargeting({ categories, targeting = {}, sp
     return { categories: restricted, issues, dropped_detailed_targeting: dropped };
 }
 
+// ── Targeting defaults ───────────────────────────────────────────────────────
+// House defaults for every new ad set: English (US) locale, no audience
+// expansion, no Advantage+ audience, and mobile+desktop on manual placements.
+// A key already in the spec wins; a key set to null in the input omits it.
+
+const TARGETING_DEFAULTS = {
+    locales: [6],
+    targeting_relaxation_types: { lookalike: 0, custom_audience: 0 },
+    targeting_automation: { advantage_audience: 0 },
+};
+const MANUAL_PLACEMENT_DEFAULTS = { device_platforms: ['mobile', 'desktop'] };
+
+// Merge a verbatim targeting object over the built spec (null deletes a key),
+// then fill in house defaults for keys still missing.
+function applyTargetingDefaults(spec, { targeting = {}, raw = null } = {}) {
+    const out = { ...spec };
+    const omitted = new Set();
+    for (const [k, v] of Object.entries(targeting)) if (v === null) omitted.add(k);
+    for (const [k, v] of Object.entries(raw || {})) {
+        if (v === null) { delete out[k]; omitted.add(k); } else out[k] = v;
+    }
+    const manual = targeting.placements === 'manual' || !!out.publisher_platforms?.length;
+    const defaults = { ...TARGETING_DEFAULTS, ...(manual ? MANUAL_PLACEMENT_DEFAULTS : {}) };
+    for (const [k, v] of Object.entries(defaults)) {
+        if (out[k] === undefined && !omitted.has(k)) out[k] = structuredClone(v);
+    }
+    return out;
+}
+
+// ABO ad sets that carry their own budget need an explicit bid strategy, or
+// Meta rejects with subcode 2490487 "Bid amount or bid constraints required".
+function resolveAdSetBidStrategy(adSetDef, { cbo }) {
+    if (adSetDef.bid_strategy) return adSetDef.bid_strategy;
+    if (!cbo && (adSetDef.daily_budget || adSetDef.lifetime_budget)) return 'LOWEST_COST_WITHOUT_CAP';
+    return null;
+}
+
 module.exports = {
     resolveMetaPageId, resolveMetaGeos, parseGeoName, US_STATES,
     COPY_LIMITS, AD_FORMATS, copyLengthWarnings, validateAdSetCreatives, buildAssetFeedSpec,
     reviewSpecialAdCategoryTargeting, RESTRICTED_CATEGORIES,
+    applyTargetingDefaults, resolveAdSetBidStrategy, TARGETING_DEFAULTS,
 };

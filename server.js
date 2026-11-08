@@ -1889,7 +1889,7 @@ async function resolveMetaBehaviorsByName(names) {
     return { resolved, unresolved };
 }
 
-async function buildMetaTargetingSpec(targeting) {
+async function buildMetaTargetingSpec(targeting, raw = null) {
     const spec = {};
     const warnings = [];
     const errors = [];
@@ -1968,15 +1968,16 @@ async function buildMetaTargetingSpec(targeting) {
     // Pass through any additional targeting fields not handled above
     const handled = new Set(["geo", "geo_radius", "geo_raw", "geos", "countries", "age_min", "age_max", "genders",
         "interests", "behaviors", "custom_audiences", "excluded_audiences", "excluded_interests",
-        "placements", "publisher_platforms", "facebook_positions", "instagram_positions"]);
+        "placements", "publisher_platforms", "facebook_positions", "instagram_positions", "targeting_raw"]);
     for (const [k, v] of Object.entries(targeting)) {
         if (!handled.has(k) && v != null) spec[k] = v;
     }
 
-    // Meta requires an explicit Advantage+ audience flag on new ad sets; default off (no AI features).
-    if (!spec.targeting_automation) spec.targeting_automation = { advantage_audience: 0 };
+    // targeting_raw merges verbatim over the built spec; then house defaults fill gaps
+    // (locales, no audience expansion, Advantage+ audience off, mobile+desktop on manual placements).
+    const finalSpec = metaBuild.applyTargetingDefaults(spec, { targeting, raw: raw || targeting.targeting_raw });
 
-    return { spec, warnings, errors, geo_resolution: geoResolution };
+    return { spec: finalSpec, warnings, errors, geo_resolution: geoResolution };
 }
 
 // Upload raw image bytes to the account's image library.
@@ -2095,7 +2096,7 @@ async function createMetaCampaignFull(accountId, pageId, config, instagramAccoun
         const existingAdsetId = adSetDef.existing_adset_id || (adSetDef.name?.startsWith("existing:") ? adSetDef.name.split(":")[1] : null);
         let targetingSpec = {};
         if (!existingAdsetId) {
-            targetingSpec = config.targeting_specs?.[adSetIndex] || (await buildMetaTargetingSpec(adSetDef.targeting || {})).spec;
+            targetingSpec = config.targeting_specs?.[adSetIndex] || (await buildMetaTargetingSpec(adSetDef.targeting || {}, adSetDef.targeting_raw)).spec;
         }
 
         const adSetBody = {
@@ -2112,7 +2113,8 @@ async function createMetaCampaignFull(accountId, pageId, config, instagramAccoun
         if (!config.cbo && adSetDef.lifetime_budget) {
             adSetBody.lifetime_budget = Math.round(adSetDef.lifetime_budget * 100);
         }
-        if (adSetDef.bid_strategy) adSetBody.bid_strategy = adSetDef.bid_strategy;
+        const adSetBidStrategy = metaBuild.resolveAdSetBidStrategy(adSetDef, { cbo: config.cbo });
+        if (adSetBidStrategy) adSetBody.bid_strategy = adSetBidStrategy;
         if (adSetDef.bid_amount)   adSetBody.bid_amount   = Math.round(adSetDef.bid_amount * 100);
         if (adSetDef.roas_control) adSetBody.roas_control  = adSetDef.roas_control;
         if (adSetDef.start_time) adSetBody.start_time = adSetDef.start_time;
@@ -5148,6 +5150,17 @@ async function createPmaxCampaignFull(token, customerId, mccId, config) {
     };
 }
 
+const VIDEO_LANGUAGES = { en: ["English", "1000"], es: ["Spanish", "1003"], fr: ["French", "1002"], de: ["German", "1001"], pt: ["Portuguese", "1014"], it: ["Italian", "1004"], zh: ["Chinese (simplified)", "1017"], ja: ["Japanese", "1005"], ko: ["Korean", "1012"] };
+function resolveVideoLanguage(input) {
+    const raw = String(input || "en").trim().toLowerCase();
+    if (/^\d+$/.test(raw)) return { code: raw, id: raw, name: `languageConstants/${raw}` };
+    const byCode = VIDEO_LANGUAGES[raw];
+    if (byCode) return { code: raw, id: byCode[1], name: byCode[0] };
+    const hit = Object.entries(VIDEO_LANGUAGES).find(([, v]) => v[0].toLowerCase() === raw);
+    if (hit) return { code: hit[0], id: hit[1][1], name: hit[1][0] };
+    throw new Error(`Unsupported language '${input}'. Use a code (${Object.keys(VIDEO_LANGUAGES).join(", ")}), a name, or a numeric languageConstants ID.`);
+}
+
 async function createVideoCampaignFull(token, customerId, mccId, config) {
     // config: {
     //   campaign_name, daily_budget, bidding_strategy (MANUAL_CPV|MAXIMIZE_CONVERSIONS|TARGET_CPM),
@@ -5192,7 +5205,9 @@ async function createVideoCampaignFull(token, customerId, mccId, config) {
             create: {
                 resourceName:    budgetTemp,
                 name:            `${config.campaign_name} Budget`,
-                amountMicros:    String(Math.round(config.daily_budget * 1_000_000)),
+                ...(config.lifetime_budget
+                    ? { period: "CUSTOM_PERIOD", totalAmountMicros: String(Math.round(config.lifetime_budget * 1_000_000)) }
+                    : { amountMicros: String(Math.round(config.daily_budget * 1_000_000)) }),
                 deliveryMethod:  "STANDARD",
                 explicitlyShared: false,
             },
@@ -5202,6 +5217,8 @@ async function createVideoCampaignFull(token, customerId, mccId, config) {
     // 2. Campaign
     const strategy = (config.bidding_strategy || "TARGET_CPM").toUpperCase();
     let biddingFields;
+    // NOTE: API v24 rejects manualCpv on campaign create, so CPV strategies fall back to Target CPM.
+    // Switch to CPV in the Google Ads UI after creation if a true CPV buy is needed.
     if (strategy === "TARGET_CPM" || strategy === "MANUAL_CPV" || strategy === "TARGET_CPV")
         biddingFields = { targetCpm: {} };
     else if (strategy === "MAXIMIZE_CONVERSIONS") biddingFields = { maximizeConversions: {} };
@@ -5216,6 +5233,8 @@ async function createVideoCampaignFull(token, customerId, mccId, config) {
                 advertisingChannelType: "VIDEO",
                 campaignBudget:         budgetTemp,
                 containsEuPoliticalAdvertising: "DOES_NOT_CONTAIN_EU_POLITICAL_ADVERTISING",
+                ...(config.start_date ? { startDateTime: `${config.start_date} 00:00:00` } : {}),
+                ...(config.end_date   ? { endDateTime:   `${config.end_date} 23:59:59` } : {}),
                 ...biddingFields,
             },
         },
@@ -5263,10 +5282,11 @@ async function createVideoCampaignFull(token, customerId, mccId, config) {
         }
     }
 
-    // 4. Language targeting (English)
+    // 4. Language targeting (default English)
+    const vidLang = resolveVideoLanguage(config.language);
     mutateOperations.push({
         campaignCriterionOperation: {
-            create: { campaign: campaignTemp, language: { languageConstant: "languageConstants/1000" } },
+            create: { campaign: campaignTemp, language: { languageConstant: `languageConstants/${vidLang.id}` } },
         },
     });
 
@@ -5283,11 +5303,12 @@ async function createVideoCampaignFull(token, customerId, mccId, config) {
                 "login-customer-id": mccId,
                 "Content-Type":      "application/json",
             },
-            body: JSON.stringify({ mutateOperations }),
+            body: JSON.stringify({ mutateOperations, ...(config.validate_only ? { validateOnly: true } : {}) }),
         }
     );
     const data = await resp.json();
     if (!resp.ok) throw new Error(googleAdsError(data));
+    if (config.validate_only) return { validated: true };
 
     const results = data.mutateOperationResponses || [];
     return {
@@ -5561,6 +5582,93 @@ async function googleMutateOps(token, customerId, mccId, mutateOperations, { val
     const data = await resp.json();
     if (!resp.ok) throw new Error(googleAdsError(data));
     return data.mutateOperationResponses || [];
+}
+
+// ── Campaign cleanup tools (remove_negative_keywords, remove_ad_extension,
+// update_ad_schedule, audit_campaign_settings). Planning in
+// src/google-campaign-settings.js; writes are validateOnly unless confirm=true.
+async function handleCampaignSettingsTool(name, args) {
+    const CS = require("./src/google-campaign-settings");
+    const confirm = args.confirm === true;
+    const { match, error: acctErr } = resolveAccount(GOOGLE_ACCOUNTS, (args.account_name || "").toLowerCase(), { confirmed: confirm });
+    if (!match) return { error: acctErr };
+    const [cid, info] = match;
+    const { token, error: authErr } = await getGoogleAccessToken(cid);
+    if (authErr) return { error: `Auth: ${authErr}` };
+    try {
+        if (name === "audit_campaign_settings") {
+            const audit = await CS.auditCampaignSettings(
+                { googleSearch, fetchConversionGoals, getCampaignGeoTargets },
+                token, cid, info.mcc,
+                { campaignFilter: args.campaign_name, includeAccount: args.include_account !== false });
+            return { account: info.name, ...audit };
+        }
+
+        const campaigns = await listGoogleCampaignsFull(token, cid, info.mcc);
+        const campSel = matchByName(campaigns, c => c.name, (args.campaign_name || "").toLowerCase(), { confirmed: confirm, label: "campaign" });
+        const camp = campSel.item;
+        if (!camp) {
+            return campSel.error
+                ? { error: campSel.error, candidates: campSel.candidates }
+                : { error: `No campaign matching '${args.campaign_name}'`, available: campaigns.map(c => c.name) };
+        }
+        const campId = camp.resource_name.split("/").pop();
+        let plan, extra = {};
+
+        if (name === "remove_negative_keywords") {
+            const rows = (await googleSearch(token, cid, info.mcc, `
+                SELECT campaign_criterion.resource_name, campaign_criterion.keyword.text, campaign_criterion.keyword.match_type
+                FROM campaign_criterion
+                WHERE campaign.id = ${campId} AND campaign_criterion.type = 'KEYWORD'
+                  AND campaign_criterion.negative = TRUE AND campaign_criterion.status != 'REMOVED'`))
+                .map(r => ({ resource_name: r.campaignCriterion.resourceName, text: r.campaignCriterion.keyword.text, match_type: r.campaignCriterion.keyword.matchType }));
+            const p = CS.planRemoveNegatives(rows, args.keywords || [], args.match_type);
+            plan = p; extra = { removing: p.removing, not_found: p.not_found };
+        } else if (name === "remove_ad_extension") {
+            if (!(args.asset_ids || []).length && !(args.texts || []).length) return { error: "Provide asset_ids and/or texts." };
+            const rows = (await googleSearch(token, cid, info.mcc, `
+                SELECT campaign.id, campaign_asset.resource_name, campaign_asset.field_type, asset.id,
+                       asset.callout_asset.callout_text, asset.sitelink_asset.link_text
+                FROM campaign_asset
+                WHERE campaign.id = ${campId} AND campaign_asset.status != 'REMOVED'`))
+                .map(r => ({ resource_name: r.campaignAsset.resourceName, field_type: r.campaignAsset.fieldType, asset_id: r.asset.id,
+                    text: r.asset.calloutAsset?.calloutText || r.asset.sitelinkAsset?.linkText || null }));
+            const p = CS.planUnlinkAssets(rows, { assetIds: args.asset_ids || [], texts: args.texts || [] });
+            plan = p; extra = { unlinking: p.unlinking, not_found: p.not_found, note: "Link removed only; assets are not deleted." };
+        } else { // update_ad_schedule
+            const [tzRows, schedRows] = await Promise.all([
+                googleSearch(token, cid, info.mcc, `SELECT customer.time_zone FROM customer`),
+                googleSearch(token, cid, info.mcc, `
+                    SELECT campaign_criterion.resource_name, campaign_criterion.bid_modifier,
+                           campaign_criterion.ad_schedule.day_of_week, campaign_criterion.ad_schedule.start_hour,
+                           campaign_criterion.ad_schedule.start_minute, campaign_criterion.ad_schedule.end_hour,
+                           campaign_criterion.ad_schedule.end_minute
+                    FROM campaign_criterion
+                    WHERE campaign.id = ${campId} AND campaign_criterion.type = 'AD_SCHEDULE' AND campaign_criterion.status != 'REMOVED'`),
+            ]);
+            const tz = tzRows[0]?.customer?.timeZone;
+            const existing = CS.mapScheduleRows(schedRows);
+            if (!(args.days || []).length && !(args.remove_days || []).length && !args.replace_existing) {
+                return { account: info.name, campaign: camp.name, time_zone: tz, ad_schedule: existing.map(CS.fmtSlot), message: "Current schedule — pass days+start_time+end_time / remove_days / replace_existing to change" };
+            }
+            if ((args.days || []).length && (!args.start_time || !args.end_time)) return { error: "start_time and end_time are required with days." };
+            const p = CS.planAdSchedule({ campaignResource: camp.resource_name, existing, days: args.days, start: args.start_time, end: args.end_time,
+                replaceExisting: args.replace_existing === true, removeDays: args.remove_days });
+            plan = p; extra = { time_zone: tz, adding: p.adding, removing: p.removing, skipped_already_present: p.skipped,
+                schedule_before: existing.map(CS.fmtSlot) };
+        }
+
+        const summary = { account: info.name, campaign: camp.name, campaign_status: camp.status, ...extra, operations: plan.ops.length };
+        if (!plan.ops.length) return { ...summary, message: "Nothing to change." };
+        if (!confirm) {
+            let validation;
+            try { await googleMutateOps(token, cid, info.mcc, plan.ops, { validateOnly: true }); validation = { status: "PASSES" }; }
+            catch (e) { validation = { status: "FAILS", error: e.message }; }
+            return { validation, dry_run: true, message: "DRY RUN — set confirm=true to apply", ...summary };
+        }
+        await googleMutateOps(token, cid, info.mcc, plan.ops);
+        return { success: true, ...summary };
+    } catch (e) { return { error: e.message }; }
 }
 
 // ── Standard Shopping listing groups (manage_shopping_listing_groups) ────────
@@ -7338,8 +7446,12 @@ function makeServer() {
                 properties: {
                     account_name:     { type: "string", description: "Client name (partial match ok)" },
                     campaign_name:    { type: "string", description: "Name for the new campaign" },
-                    daily_budget:     { type: "number", description: "Daily budget in dollars" },
-                    bidding_strategy: { type: "string", enum: ["TARGET_CPV", "MAXIMIZE_CONVERSIONS", "TARGET_CPM"], description: "Bidding strategy (default: TARGET_CPV). Use TARGET_CPV for views, MAXIMIZE_CONVERSIONS for action-oriented, TARGET_CPM for reach." },
+                    daily_budget:     { type: "number", description: "Daily budget in dollars. Give this OR lifetime_budget." },
+                    lifetime_budget:  { type: "number", description: "Total campaign budget in dollars over the flight (custom-period budget). Requires start_date and end_date. Give this OR daily_budget." },
+                    start_date:       { type: "string", description: "Campaign start date YYYY-MM-DD (starts 00:00 account time). Required with lifetime_budget." },
+                    end_date:         { type: "string", description: "Campaign end date YYYY-MM-DD (ends 23:59:59). Required with lifetime_budget." },
+                    language:         { type: "string", description: "Language targeting: code (en, es, fr, de, pt, it, zh, ja, ko), name (e.g. 'Spanish'), or numeric languageConstants ID. Default: en." },
+                    bidding_strategy: { type: "string", enum: ["TARGET_CPV", "MAXIMIZE_CONVERSIONS", "TARGET_CPM"], description: "Bidding strategy (default: TARGET_CPM). TARGET_CPV currently creates Target CPM (API rejects CPV on create) — switch to CPV in the UI. MAXIMIZE_CONVERSIONS for action-oriented, TARGET_CPM for reach." },
                     final_url:        { type: "string", description: "Landing page URL for the video ads" },
                     geo_targets: { type: "array", description: GEO_TARGETS_DESC, items: GEO_TARGET_SPEC_SCHEMA },
                     copy_geo_from_campaign: COPY_GEO_FROM_CAMPAIGN_PROP,
@@ -7374,7 +7486,7 @@ function makeServer() {
                     },
                     confirm: { type: "boolean", description: "Set true to actually create. Omit for dry run." },
                 },
-                required: ["account_name", "campaign_name", "daily_budget", "final_url", "ad_groups"],
+                required: ["account_name", "campaign_name", "final_url", "ad_groups"],
             },
         },
         {
@@ -7494,6 +7606,74 @@ function makeServer() {
                     confirm: { type: "boolean", description: "Set true to apply. Omit for dry run / preview." },
                 },
                 required: ["account_name", "campaign_name"],
+            },
+        },
+        {
+            name: "remove_negative_keywords",
+            description: "Remove campaign-level negative keywords (exact text match, case-insensitive; never substring). " +
+                "Omit match_type to remove every match type of that text. Shared-list negatives are not touched. " +
+                "Dry run by default (validated with Google validateOnly) — set confirm=true to apply.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    account_name:  { type: "string", description: "Client name (partial match ok)" },
+                    campaign_name: { type: "string", description: "Campaign name (partial match ok)" },
+                    keywords:      { type: "array", items: { type: "string" }, description: "Negative keyword texts to remove" },
+                    match_type:    { type: "string", enum: ["EXACT", "PHRASE", "BROAD"], description: "Only remove this match type (default: all)" },
+                    confirm:       { type: "boolean", description: "Set true to apply. Omit for dry run." },
+                },
+                required: ["account_name", "campaign_name", "keywords"],
+            },
+        },
+        {
+            name: "remove_ad_extension",
+            description: "Unlink callouts/sitelinks/snippets from ONE campaign (removes the campaign_asset link only; the asset is not deleted and other campaigns keep it). " +
+                "Identify by asset_ids and/or exact texts. Dry run by default (validateOnly) — set confirm=true to apply.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    account_name:  { type: "string", description: "Client name (partial match ok)" },
+                    campaign_name: { type: "string", description: "Campaign name (partial match ok)" },
+                    asset_ids:     { type: "array", items: { type: "string" }, description: "Asset IDs to unlink (see get_ad_extensions)" },
+                    texts:         { type: "array", items: { type: "string" }, description: "Exact callout text / sitelink link text to unlink (case-insensitive)" },
+                    confirm:       { type: "boolean", description: "Set true to apply. Omit for dry run." },
+                },
+                required: ["account_name", "campaign_name"],
+            },
+        },
+        {
+            name: "update_ad_schedule",
+            description: "View or edit a Google Ads campaign's ad schedule. No days/remove_days/replace_existing = view (also shows the account time zone). " +
+                "days accepts MONDAY..SUNDAY, WEEKDAYS, WEEKENDS, ALL; times are 24h HH:MM in the ACCOUNT time zone (minutes 00/15/30/45). " +
+                "Dry run by default (validateOnly) — set confirm=true to apply.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    account_name:     { type: "string", description: "Client name (partial match ok)" },
+                    campaign_name:    { type: "string", description: "Campaign name (partial match ok)" },
+                    days:             { type: "array", items: { type: "string" }, description: "Days to add, e.g. [\"WEEKDAYS\"]" },
+                    start_time:       { type: "string", description: "HH:MM, required with days" },
+                    end_time:         { type: "string", description: "HH:MM (24:00 ok), required with days" },
+                    remove_days:      { type: "array", items: { type: "string" }, description: "Remove existing entries on these days" },
+                    replace_existing: { type: "boolean", description: "Remove all existing entries first" },
+                    confirm:          { type: "boolean", description: "Set true to apply. Omit for dry run." },
+                },
+                required: ["account_name", "campaign_name"],
+            },
+        },
+        {
+            name: "audit_campaign_settings",
+            description: "Read-only settings audit for Google Ads campaigns: networks, geo target type + locations, language, end date, ad rotation, AI Max, " +
+                "asset automation, broad-match keywords, conversion goal, attached shared negative lists, ad schedule. " +
+                "With include_account (default true): time zone, auto-tagging, auto-apply recommendation subscriptions, account-level assets.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    account_name:    { type: "string", description: "Client name (partial match ok)" },
+                    campaign_name:   { type: "string", description: "Filter to campaigns whose name contains this (case-insensitive). Omit for all." },
+                    include_account: { type: "boolean", description: "Include account-level settings (default true)" },
+                },
+                required: ["account_name"],
             },
         },
         {
@@ -7998,7 +8178,7 @@ function makeServer() {
                                 bid_strategy: {
                                     type: "string",
                                     enum: ["LOWEST_COST_WITHOUT_CAP", "COST_CAP", "BID_CAP", "LOWEST_COST_WITH_MIN_ROAS"],
-                                    description: "Bid strategy for this ad set (default: inherited from campaign). COST_CAP requires bid_amount as cost target. BID_CAP requires bid_amount as max bid. LOWEST_COST_WITH_MIN_ROAS requires roas_control.",
+                                    description: "Bid strategy for this ad set (default: inherited from campaign; ABO ad sets with their own budget default to LOWEST_COST_WITHOUT_CAP). COST_CAP requires bid_amount as cost target. BID_CAP requires bid_amount as max bid. LOWEST_COST_WITH_MIN_ROAS requires roas_control.",
                                 },
                                 bid_amount: { type: "number", description: "Bid/cost cap in dollars (for COST_CAP or BID_CAP strategies). Converted to cents for the API." },
                                 roas_control: { type: "number", description: "Minimum ROAS target (for LOWEST_COST_WITH_MIN_ROAS). E.g. 2.0 means $2 revenue per $1 spent." },
@@ -8013,7 +8193,9 @@ function makeServer() {
                                         "age_min, age_max, interests (array of names), behaviors (array of names), " +
                                         "custom_audiences (array of IDs), excluded_audiences (array of IDs), " +
                                         "placements ('advantage_plus' or 'manual' — default: advantage_plus). " +
-                                        "For manual placements, also provide publisher_platforms, facebook_positions, instagram_positions arrays.",
+                                        "For manual placements, also provide publisher_platforms, facebook_positions, instagram_positions arrays. " +
+                                        "Defaults added unless overridden here (or set to null to omit): locales [6] (English US), targeting_relaxation_types {lookalike: 0, custom_audience: 0}, " +
+                                        "targeting_automation {advantage_audience: 0}, and device_platforms ['mobile','desktop'] on manual placements. Other Meta targeting keys pass through as-is.",
                                     properties: {
                                         geos: {
                                             type: "array",
@@ -8046,6 +8228,13 @@ function makeServer() {
                                         facebook_positions:  { type: "array", items: { type: "string" }, description: "For manual placements: ['feed', 'story', 'reels', etc.]" },
                                         instagram_positions: { type: "array", items: { type: "string" }, description: "For manual placements: ['stream', 'story', 'reels', 'explore']" },
                                     },
+                                },
+                                targeting_raw: {
+                                    type: "object",
+                                    description: "Raw Meta targeting spec merged verbatim over the spec built from `targeting` (keys here win; null removes a key). " +
+                                        "Use for fields the simplified object doesn't model (family_statuses, income, education_statuses, work_positions, flexible_spec with IDs) " +
+                                        "or to copy an existing ad set's targeting as-is. House defaults (locales [6], targeting_relaxation_types off, " +
+                                        "advantage_audience 0, device_platforms mobile+desktop on manual placements) still fill any keys it leaves out.",
                                 },
                                 promoted_object: { type: "object", description: "Required for OFFSITE_CONVERSIONS. Example: {pixel_id: '123', custom_event_type: 'Lead'}" },
                                 start_time: { type: "string", description: "ISO 8601 start time (optional)" },
@@ -8097,6 +8286,21 @@ function makeServer() {
                                                         image_hash: { type: "string", description: "Optional thumbnail; defaults to the video's auto-generated thumbnail." },
                                                     },
                                                     required: ["video_id", "placements"],
+                                                },
+                                            },
+                                            carousel_cards: {
+                                                type: "array", minItems: 2, maxItems: 10,
+                                                description: "Carousel (multi-image) ad: one card per image. Uses the ad's primary_text, headline, description, cta and url unless a card overrides headline/description/cta/url. Not allowed with image_hash, video_id, asset_feed_spec, object_story_id, creative_id or placement_videos.",
+                                                items: {
+                                                    type: "object",
+                                                    properties: {
+                                                        image_hash:  { type: "string", description: "Image hash from the Media Library" },
+                                                        headline:    { type: "string" },
+                                                        description: { type: "string" },
+                                                        cta:         { type: "string", enum: ["LEARN_MORE", "SHOP_NOW", "SIGN_UP", "APPLY_NOW", "BUY_TICKETS", "BOOK_NOW", "CONTACT_US", "GET_OFFER", "NO_BUTTON"] },
+                                                        url:         { type: "string" },
+                                                    },
+                                                    required: ["image_hash"],
                                                 },
                                             },
                                             url_tags: { type: "string", description: "UTM query string appended to the destination URL, e.g. 'utm_source=facebook&utm_medium=paid_social&utm_campaign={{campaign.name}}&utm_content={{ad.name}}'. Falls back to the ad set's url_tags, then a default with {{campaign.name}}/{{adset.name}}/{{ad.name}}/{{placement}} macros." },
@@ -10906,8 +11110,18 @@ async function dispatchToolCall(name, args = {}) {
         const search  = (args.account_name || "").toLowerCase();
         const confirm = args.confirm === true;
 
-        if (!args.campaign_name || !args.daily_budget || !args.final_url || !args.ad_groups?.length || (!args.geo_targets?.length && !args.copy_geo_from_campaign)) {
-            result = { error: "campaign_name, daily_budget, final_url, at least one ad_group, and geo_targets (or copy_geo_from_campaign) are required." };
+        const dateRe = /^\d{4}-\d{2}-\d{2}$/;
+        let vidLangResolved = null, vidInputErr = null;
+        try { vidLangResolved = resolveVideoLanguage(args.language); } catch (e) { vidInputErr = e.message; }
+        if (!vidInputErr && args.daily_budget && args.lifetime_budget) vidInputErr = "Give daily_budget OR lifetime_budget, not both.";
+        if (!vidInputErr && args.lifetime_budget && !(args.start_date && args.end_date)) vidInputErr = "lifetime_budget requires start_date and end_date (YYYY-MM-DD).";
+        if (!vidInputErr && ((args.start_date && !dateRe.test(args.start_date)) || (args.end_date && !dateRe.test(args.end_date)))) vidInputErr = "start_date/end_date must be YYYY-MM-DD.";
+        if (!vidInputErr && args.start_date && args.end_date && args.end_date < args.start_date) vidInputErr = "end_date is before start_date.";
+        if (!vidInputErr && args.end_date && args.end_date < new Date().toISOString().slice(0, 10)) vidInputErr = "end_date is in the past.";
+        if (vidInputErr) {
+            result = { error: vidInputErr };
+        } else if (!args.campaign_name || !(args.daily_budget || args.lifetime_budget) || !args.final_url || !args.ad_groups?.length || (!args.geo_targets?.length && !args.copy_geo_from_campaign)) {
+            result = { error: "campaign_name, daily_budget or lifetime_budget, final_url, at least one ad_group, and geo_targets (or copy_geo_from_campaign) are required." };
         } else {
             const missingVideo = args.ad_groups.find(ag => !ag.youtube_video && !ag.youtube_videos?.length);
             if (missingVideo) {
@@ -10929,25 +11143,38 @@ async function dispatchToolCall(name, args = {}) {
                         const config = {
                             campaign_name:    args.campaign_name,
                             daily_budget:     args.daily_budget,
-                            bidding_strategy: args.bidding_strategy || "MANUAL_CPV",
+                            lifetime_budget:  args.lifetime_budget,
+                            start_date:       args.start_date,
+                            end_date:         args.end_date,
+                            language:         vidLangResolved.code,
+                            bidding_strategy: args.bidding_strategy || "TARGET_CPM",
                             final_url:        args.final_url,
                             geo_targets:      geo.specs,
                             ad_groups:        args.ad_groups,
                         };
 
                         if (!confirm) {
+                            let validation;
+                            try { await createVideoCampaignFull(token, cid, info.mcc, { ...JSON.parse(JSON.stringify(config)), validate_only: true }); validation = { status: "PASSES Google validateOnly" }; }
+                            catch (e) { validation = { status: "FAILS Google validateOnly", error: e.message }; }
                             result = {
                                 dry_run: true,
+                                validation,
                                 message: "DRY RUN — set confirm=true to create. Campaign will start PAUSED.",
                                 account: info.name,
                                 planned_campaign: {
                                     name:             config.campaign_name,
                                     type:             "VIDEO (YouTube)",
                                     ad_format:        "Skippable in-stream",
-                                    daily_budget:     "$" + config.daily_budget.toFixed(2),
+                                    ...(config.lifetime_budget
+                                        ? { lifetime_budget: "$" + config.lifetime_budget.toFixed(2) }
+                                        : { daily_budget: "$" + config.daily_budget.toFixed(2) }),
+                                    start_date:       config.start_date || "immediately when enabled",
+                                    end_date:         config.end_date || "none",
                                     bidding_strategy: config.bidding_strategy,
+                                    ...(/CPV/.test(String(config.bidding_strategy).toUpperCase()) ? { bidding_warning: "CPV is not supported on create via API (v24): campaign is created with Target CPM. Switch to CPV in the Google Ads UI." } : {}),
                                     final_url:        config.final_url,
-                                    language:         "English",
+                                    language:         vidLangResolved.name,
                                     geo_targets:      config.geo_targets.map(n => describeGeoSpec(n)),
                                     ...(geo.copied_from ? { geo_copied_from: geo.copied_from } : {}),
                                     status:           "PAUSED (default for new campaigns)",
@@ -11259,6 +11486,9 @@ async function dispatchToolCall(name, args = {}) {
                 } catch (e) { result = { error: e.message }; }
             }
         }
+
+    } else if (["remove_negative_keywords", "remove_ad_extension", "update_ad_schedule", "audit_campaign_settings"].includes(name)) {
+        result = await handleCampaignSettingsTool(name, args);
 
     } else if (name === "add_ad_extension") {
         const search     = (args.account_name || "").toLowerCase();
@@ -11773,7 +12003,7 @@ async function dispatchToolCall(name, args = {}) {
                                 plan.push({ spec: null, geo_resolution: null, sac: null });
                                 continue;
                             }
-                            const built = await buildMetaTargetingSpec(adSetDef.targeting || {});
+                            const built = await buildMetaTargetingSpec(adSetDef.targeting || {}, adSetDef.targeting_raw);
                             warnings.push(...built.warnings.map(w => `${where}: ${w}`));
                             validationErrors.push(...built.errors.map(e => `${where}: ${e}`));
                             const sac = restricted ? await metaBuild.reviewSpecialAdCategoryTargeting({
@@ -11861,7 +12091,7 @@ async function dispatchToolCall(name, args = {}) {
                                     optimization_goal: adSetDef.optimization_goal || "LINK_CLICKS",
                                     daily_budget: !cbo && adSetDef.daily_budget ? `$${adSetDef.daily_budget.toFixed(2)}` : "(CBO)",
                                     lifetime_budget: !cbo && adSetDef.lifetime_budget ? `$${adSetDef.lifetime_budget.toFixed(2)}` : undefined,
-                                    bid_strategy: adSetDef.bid_strategy || "(campaign default)",
+                                    bid_strategy: metaBuild.resolveAdSetBidStrategy(adSetDef, { cbo }) || "(campaign default)",
                                     bid_amount: adSetDef.bid_amount ? `$${adSetDef.bid_amount.toFixed(2)}` : null,
                                     roas_control: adSetDef.roas_control || null,
                                     is_dynamic_creative: !!adSetDef.is_dynamic_creative,

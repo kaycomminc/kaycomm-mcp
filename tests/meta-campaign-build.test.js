@@ -276,3 +276,47 @@ test('SAC: failed lookalike lookup is reported, not swallowed', async () => {
     const r = await reviewSpecialAdCategoryTargeting({ categories: ['CREDIT'], spec: { custom_audiences: [{ id: '5' }] }, getAudience: async () => { throw new Error('perm'); } });
     assert.match(r.issues[0].message, /Couldn't check whether audience 5 is a lookalike \(perm\)/);
 });
+
+// ── Targeting defaults + ABO bid strategy ────────────────────────────────────
+
+const { applyTargetingDefaults, resolveAdSetBidStrategy } = require('../src/meta-campaign-build');
+
+test('targeting defaults: locales, relaxation off, advantage audience off; no device_platforms on Advantage+ placements', () => {
+    const s = applyTargetingDefaults({ geo_locations: { countries: ['US'] } });
+    assert.deepEqual(s.locales, [6]);
+    assert.deepEqual(s.targeting_relaxation_types, { lookalike: 0, custom_audience: 0 });
+    assert.deepEqual(s.targeting_automation, { advantage_audience: 0 });
+    assert.equal(s.device_platforms, undefined);
+});
+
+test('targeting defaults: manual placements add mobile + desktop', () => {
+    const s = applyTargetingDefaults({ publisher_platforms: ['facebook'] }, { targeting: { placements: 'manual' } });
+    assert.deepEqual(s.device_platforms, ['mobile', 'desktop']);
+});
+
+test('targeting defaults: explicit values win and null omits a default', () => {
+    const s = applyTargetingDefaults({ locales: [24], device_platforms: ['mobile'] },
+        { targeting: { placements: 'manual', targeting_relaxation_types: null } });
+    assert.deepEqual(s.locales, [24]);
+    assert.deepEqual(s.device_platforms, ['mobile']);
+    assert.equal('targeting_relaxation_types' in s, false);
+});
+
+test('targeting_raw: merges verbatim over the built spec, null deletes, defaults fill the rest', () => {
+    const s = applyTargetingDefaults({ age_min: 18, genders: [1] }, {
+        raw: { age_min: 35, family_statuses: [{ id: '6002714398172' }], genders: null, publisher_platforms: ['instagram'] },
+    });
+    assert.equal(s.age_min, 35);
+    assert.deepEqual(s.family_statuses, [{ id: '6002714398172' }]);
+    assert.equal('genders' in s, false);
+    assert.deepEqual(s.device_platforms, ['mobile', 'desktop']);
+    assert.deepEqual(s.locales, [6]);
+});
+
+test('bid strategy: ABO ad set with budget defaults to LOWEST_COST_WITHOUT_CAP; CBO and explicit values untouched', () => {
+    assert.equal(resolveAdSetBidStrategy({ daily_budget: 20 }, { cbo: false }), 'LOWEST_COST_WITHOUT_CAP');
+    assert.equal(resolveAdSetBidStrategy({ lifetime_budget: 500 }, { cbo: false }), 'LOWEST_COST_WITHOUT_CAP');
+    assert.equal(resolveAdSetBidStrategy({ daily_budget: 20, bid_strategy: 'COST_CAP' }, { cbo: false }), 'COST_CAP');
+    assert.equal(resolveAdSetBidStrategy({ daily_budget: 20 }, { cbo: true }), null);
+    assert.equal(resolveAdSetBidStrategy({}, { cbo: false }), null);
+});

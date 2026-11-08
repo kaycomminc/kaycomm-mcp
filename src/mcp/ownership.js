@@ -27,6 +27,7 @@ const GOOGLE_TOOLS = new Set([
   'update_ad_url', 'update_geo_targeting', 'add_ad_extension',
   'add_negative_keywords', 'manage_negative_lists', 'set_conversion_goals',
   'update_custom_conversion_goal', 'manage_shopping_listing_groups',
+  'remove_negative_keywords', 'remove_ad_extension', 'update_ad_schedule',
 ]);
 
 const META_ACTIONS = {
