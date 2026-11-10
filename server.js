@@ -69,7 +69,8 @@ const API_VERSION_INFO = {
 // Google fields: name, budget, mcc (login-customer-id), nc_budget?, ga4?,
 //                budget_schedule? [{from, budget, nc_budget?}], flight_start?, flight_end?,
 //                campaign_budgets? [{label, campaigns: [exact names], budget, start?}] — per-campaign client budgets,
-//                health? (object of threshold overrides, or false to exclude from health checks)
+//                health? (object of threshold overrides, or false to exclude from health checks),
+//                cpv_goal? (number, $ per view — get_google_pacing shows VIDEO-campaign CPV vs goal)
 // Meta fields:   name, budget, budget_schedule?, flight_start?, flight_end?, health?
 // Both:          inactive? ("<reason>" skips API calls), notes? [{text, added, expires?}]
 //                — notes are the shared "known context" every routine reads via
@@ -113,7 +114,7 @@ const BUILTIN_HEALTH_DEFAULTS = {
 const KNOWN_ACCOUNT_KEYS = new Set([
     "name", "budget", "mcc", "nc_budget", "ga4", "health", "refresh_token_env",
     "flight_start", "flight_end", "budget_schedule", "campaign_budgets",
-    "page_id", "instagram_account_id", "inactive", "notes",
+    "page_id", "instagram_account_id", "inactive", "notes", "cpv_goal",
 ]);
 
 // Per-account health overrides beyond BUILTIN_HEALTH_DEFAULTS that
@@ -142,6 +143,9 @@ function validateAccounts(data) {
             }
             if (platform === "google" && !info.mcc && !info.refresh_token_env) {
                 warn(id, `google entry missing "mcc" (standalone accounts need "refresh_token_env")`);
+            }
+            if (info.cpv_goal !== undefined && !(typeof info.cpv_goal === "number" && info.cpv_goal > 0)) {
+                warn(id, `"cpv_goal" must be a positive number of dollars per view (got ${JSON.stringify(info.cpv_goal)})`);
             }
             if (info.health !== undefined && info.health !== false && typeof info.health !== "object") {
                 warn(id, `"health" must be false or an object (got ${JSON.stringify(info.health)})`);
@@ -246,7 +250,7 @@ function manageAccounts(args) {
             } else {
                 const entry = { name: args.name, budget: args.budget };
                 if (platform === "google") entry.mcc = args.mcc || id;
-                for (const f of ["ga4", "nc_budget", "flight_start", "flight_end", "budget_schedule", "campaign_budgets", "health", "page_id"]) {
+                for (const f of ["ga4", "nc_budget", "flight_start", "flight_end", "budget_schedule", "campaign_budgets", "health", "page_id", "cpv_goal"]) {
                     if (args[f] != null) entry[f] = args[f];
                 }
                 if (!confirm) {
@@ -263,7 +267,7 @@ function manageAccounts(args) {
                 result = { error: `${id} not found in ${platform} accounts.`, available: Object.entries(store).map(([k, a]) => `${k} (${a.name})`) };
             } else {
                 const changes = {};
-                for (const f of ["name", "budget", "mcc", "ga4", "nc_budget", "flight_start", "flight_end", "budget_schedule", "campaign_budgets", "health", "page_id"]) {
+                for (const f of ["name", "budget", "mcc", "ga4", "nc_budget", "flight_start", "flight_end", "budget_schedule", "campaign_budgets", "health", "page_id", "cpv_goal"]) {
                     if (args[f] != null) changes[f] = args[f];
                 }
                 if (args.inactive != null) changes.inactive = args.inactive || null;
@@ -274,7 +278,7 @@ function manageAccounts(args) {
                     changes.notes = notes.length ? notes : null;
                 }
                 if (!Object.keys(changes).length) {
-                    result = { error: "No fields to update. Provide name, budget, mcc, ga4, nc_budget, flight_start, flight_end, budget_schedule, campaign_budgets, health, page_id, inactive, add_note, or clear_notes." };
+                    result = { error: "No fields to update. Provide name, budget, mcc, ga4, nc_budget, flight_start, flight_end, budget_schedule, campaign_budgets, health, page_id, cpv_goal, inactive, add_note, or clear_notes." };
                 } else if (!confirm) {
                     result = { dry_run: true, message: "DRY RUN — set confirm=true to save", platform, id, current: store[id], changes };
                 } else {
@@ -1218,6 +1222,41 @@ function selectDetailAccounts(search) {
 }
 
 async function buildGoogleRow(defaultToken, pace_dom, dim, today, monthStart, yesterday, cid, info) {
+    const row = await buildGoogleRowCore(defaultToken, pace_dom, dim, today, monthStart, yesterday, cid, info);
+    if (info.cpv_goal == null || row.skipped || row.error) return row;
+    return attachVideoGoal(row, info, defaultToken, cid, monthStart, yesterday);
+}
+
+// VIDEO-campaign CPV over the pacing window (flight or MTD) vs info.cpv_goal.
+async function attachVideoGoal(row, info, defaultToken, cid, monthStart, yesterday) {
+    const from  = info.flight_start && info.flight_end ? info.flight_start : monthStart;
+    const until = info.flight_end && yesterday > info.flight_end ? info.flight_end : yesterday;
+    const goal  = Number(info.cpv_goal);
+    if (emptyWindow(from, until)) { row.video = { cpv_goal: goal, views: 0, cpv: null, note: "No complete days in window yet" }; return row; }
+    try {
+        let token = defaultToken;
+        if (info.refresh_token_env) {
+            const r = await getGoogleAccessToken(cid);
+            if (r.error) throw new Error(`Auth failed: ${r.error}`);
+            token = r.token;
+        }
+        const rows = await fetchGoogleVideoRows(token, cid, info.mcc, `BETWEEN '${from}' AND '${until}'`);
+        const agg = rows.reduce((a, r) => addVideoAgg(a, r.metrics || {}), emptyVideoAgg());
+        const v = shapeVideoAgg(agg);
+        row.video = {
+            window: `${from} → ${until}`,
+            video_spend: Math.round(agg.spend * 100) / 100,
+            views: v.views, view_rate: v.view_rate,
+            cpv: v.cpv, cpv_goal: goal,
+            cpv_vs_goal: v.cpv != null && goal > 0 ? ((v.cpv / goal - 1) * 100 >= 0 ? "+" : "") + ((v.cpv / goal - 1) * 100).toFixed(1) + "%" : null,
+            cpv_status: v.cpv == null ? "NO_VIEWS" : v.cpv <= goal ? "AT_OR_BELOW_GOAL" : "ABOVE_GOAL",
+            quartile_p100: v.quartile_p100,
+        };
+    } catch (e) { row.video = { cpv_goal: goal, error: e.message }; }
+    return row;
+}
+
+async function buildGoogleRowCore(defaultToken, pace_dom, dim, today, monthStart, yesterday, cid, info) {
         if (info.inactive) return skippedRow(info);
         let token = defaultToken;
         if (info.refresh_token_env) {
@@ -2398,6 +2437,58 @@ async function fetchGA4Report(token, propertyId, dateRange, breakdownBy = "chann
 }
 
 // ── Campaign performance ──────────────────────────────────────────────────────
+// ── YouTube / VIDEO metrics ──────────────────────────────────────────────────
+// API v24 names: video_trueview_views / video_trueview_view_rate /
+// trueview_average_cpv (the old video_views / video_view_rate / average_cpv are
+// UNRECOGNIZED_FIELD in v24). Pulled in a separate query restricted to VIDEO
+// campaigns so Search/Shopping/PMax queries are untouched.
+const VIDEO_METRIC_FIELDS = `metrics.cost_micros, metrics.impressions,
+       metrics.video_trueview_views, metrics.video_trueview_view_rate, metrics.trueview_average_cpv,
+       metrics.video_quartile_p25_rate, metrics.video_quartile_p50_rate,
+       metrics.video_quartile_p75_rate, metrics.video_quartile_p100_rate`;
+
+async function fetchGoogleVideoRows(token, customerId, mccId, dateClause, extraSelect = "") {
+    return googleSearch(token, customerId, mccId, `
+        SELECT campaign.name${extraSelect ? ", " + extraSelect : ""},
+               ${VIDEO_METRIC_FIELDS}
+        FROM campaign
+        WHERE segments.date ${dateClause}
+          AND campaign.advertising_channel_type = 'VIDEO'
+          AND metrics.impressions > 0`);
+}
+
+// Aggregate video rows: counts sum; rates are impression-weighted; avg CPV is
+// view-weighted (matches Google's cost/views definition).
+function emptyVideoAgg() { return { spend: 0, impressions: 0, views: 0, cpvMicrosXViews: 0, vr: 0, q25: 0, q50: 0, q75: 0, q100: 0 }; }
+function addVideoAgg(a, m) {
+    const impr  = parseInt(m.impressions || 0);
+    const views = parseInt(m.videoTrueviewViews || 0);
+    a.spend          += parseInt(m.costMicros || 0) / 1_000_000;
+    a.impressions    += impr;
+    a.views          += views;
+    a.cpvMicrosXViews += parseFloat(m.trueviewAverageCpv || 0) * views;
+    a.vr   += parseFloat(m.videoTrueviewViewRate || 0) * impr;
+    a.q25  += parseFloat(m.videoQuartileP25Rate || 0) * impr;
+    a.q50  += parseFloat(m.videoQuartileP50Rate || 0) * impr;
+    a.q75  += parseFloat(m.videoQuartileP75Rate || 0) * impr;
+    a.q100 += parseFloat(m.videoQuartileP100Rate || 0) * impr;
+    return a;
+}
+// Output shape: views, view_rate %, avg_cpv $ (Google's, from micros), cpv $ (spend/views), quartile %s.
+function shapeVideoAgg(a, spend = a.spend) {
+    const pct = x => a.impressions > 0 ? (x / a.impressions * 100).toFixed(2) + "%" : null;
+    return {
+        views:        a.views,
+        view_rate:    pct(a.vr),
+        avg_cpv:      a.views > 0 ? Math.round(a.cpvMicrosXViews / a.views / 1_000_000 * 10000) / 10000 : null,
+        cpv:          a.views > 0 ? Math.round(spend / a.views * 10000) / 10000 : null,
+        quartile_p25:  pct(a.q25),
+        quartile_p50:  pct(a.q50),
+        quartile_p75:  pct(a.q75),
+        quartile_p100: pct(a.q100),
+    };
+}
+
 async function fetchGoogleCampaignPerf(token, customerId, mccId, dateRange, startDate, endDate, segmentBy) {
     const dateClause = resolveGaqlDateClause(dateRange, startDate, endDate);
     // all_conversion_action uses all_conversions so secondary (non-bidding) actions show up too
@@ -2453,7 +2544,7 @@ async function fetchGoogleCampaignPerf(token, customerId, mccId, dateRange, star
         return Object.values(byCampaign);
     }
 
-    const rows = await googleSearch(token, customerId, mccId, `
+    const [rows, videoRows] = await Promise.all([googleSearch(token, customerId, mccId, `
         SELECT campaign.name, campaign.status, campaign.advertising_channel_type,
                metrics.cost_micros, metrics.clicks, metrics.impressions,
                metrics.conversions, metrics.conversions_value,
@@ -2470,7 +2561,14 @@ async function fetchGoogleCampaignPerf(token, customerId, mccId, dateRange, star
         FROM campaign
         WHERE segments.date ${dateClause}
           AND metrics.impressions > 0
-        ORDER BY metrics.cost_micros DESC`);
+        ORDER BY metrics.cost_micros DESC`),
+        // Video query failing must never break the main report
+        fetchGoogleVideoRows(token, customerId, mccId, dateClause).catch(e => ({ error: e.message }))]);
+
+    const videoByCampaign = {};
+    if (Array.isArray(videoRows)) {
+        for (const v of videoRows) videoByCampaign[v.campaign.resourceName] = v.metrics || {};
+    }
 
     return rows.map(row => {
         const spend   = parseInt(row.metrics.costMicros || 0) / 1_000_000;
@@ -2478,11 +2576,15 @@ async function fetchGoogleCampaignPerf(token, customerId, mccId, dateRange, star
         const convVal = parseFloat(row.metrics.conversionsValue || 0);
         const cpa     = convs > 0 ? Math.round((spend / convs) * 100) / 100 : null;
         const roas    = spend > 0 && convVal > 0 ? Math.round((convVal / spend) * 100) / 100 : null;
+        const vm      = videoByCampaign[row.campaign.resourceName];
+        const video   = vm ? shapeVideoAgg(addVideoAgg(emptyVideoAgg(), vm), spend) : {};
+        if (!vm && row.campaign.advertisingChannelType === "VIDEO" && videoRows?.error) video.video_metrics_error = videoRows.error;
         return {
             campaign:         row.campaign.name,
             status:           row.campaign.status,
             type:             row.campaign.advertisingChannelType,
             spend:            Math.round(spend * 100) / 100,
+            ...video,
             clicks:           parseInt(row.metrics.clicks || 0),
             impressions:      parseInt(row.metrics.impressions || 0),
             ctr:              (parseFloat(row.metrics.ctr || 0) * 100).toFixed(2) + "%",
@@ -6351,14 +6453,25 @@ async function fetchPerformanceBreakdown(token, customerId, mccId, segment, date
                    : BREAKDOWN_SEGMENTS[segment];
     // LOCATION_OF_PRESENCE = where the user physically was; mixing in
     // AREA_OF_INTEREST rows would double-count spend.
-    const rows = await googleSearch(token, customerId, mccId, `
+    const [rows, videoRows] = await Promise.all([googleSearch(token, customerId, mccId, `
         SELECT ${segField}, campaign.name,
                metrics.cost_micros, metrics.impressions, metrics.clicks,
                metrics.conversions, metrics.conversions_value
         FROM ${isGeo ? "geographic_view" : "campaign"}
         WHERE segments.date ${dateClause}
           AND metrics.impressions > 0
-          ${isGeo ? "AND geographic_view.location_type = 'LOCATION_OF_PRESENCE'" : ""}`);
+          ${isGeo ? "AND geographic_view.location_type = 'LOCATION_OF_PRESENCE'" : ""}`),
+        // VIDEO-campaign metrics per date (date segment only); failure → no video fields
+        segment === "date"
+            ? fetchGoogleVideoRows(token, customerId, mccId, dateClause, "segments.date").catch(() => [])
+            : []]);
+
+    const videoByDate = {};
+    for (const v of videoRows) {
+        if (campaignSearch && !v.campaign.name.toLowerCase().includes(campaignSearch.toLowerCase())) continue;
+        const d = v.segments?.date;
+        addVideoAgg(videoByDate[d] = videoByDate[d] || emptyVideoAgg(), v.metrics || {});
+    }
 
     const byKey = {};
     for (const r of rows) {
@@ -6403,6 +6516,8 @@ async function fetchPerformanceBreakdown(token, customerId, mccId, segment, date
         conversions: Math.round(b.conversions * 10) / 10,
         conv_value:  Math.round(b.conv_value * 100) / 100,
         cpa:         b.conversions > 0 ? "$" + (Math.round((b.spend / b.conversions) * 100) / 100) : null,
+        // Video fields only on dates with VIDEO-campaign delivery; cpv uses video spend only
+        ...(videoByDate[key] ? { video_spend: Math.round(videoByDate[key].spend * 100) / 100, ...shapeVideoAgg(videoByDate[key]) } : {}),
     }));
 
     // Sensible ordering: hours/dates/weekdays in natural order, otherwise by spend
@@ -6545,7 +6660,8 @@ function makeServer() {
         {
             name: "get_google_pacing",
             description: "Pull Google Ads MTD spend and pacing for all client accounts, including Boulevard Carroll NC/non-NC breakdown. " +
-                "Each account includes a daily_budget block comparing current enabled daily budgets to the per-day spend needed to land on budget, with a RAISE/LOWER/ON_TRACK recommendation.",
+                "Each account includes a daily_budget block comparing current enabled daily budgets to the per-day spend needed to land on budget, with a RAISE/LOWER/ON_TRACK recommendation. " +
+                "Accounts with cpv_goal set (manage_accounts) also get a video block: VIDEO-campaign views, view_rate, cpv (spend / views) vs cpv_goal over the flight/MTD window, with cpv_vs_goal % and AT_OR_BELOW_GOAL/ABOVE_GOAL status.",
             inputSchema: { type: "object", properties: {}, required: [] },
         },
         {
@@ -6638,7 +6754,8 @@ function makeServer() {
         },
         {
             name: "get_campaign_performance",
-            description: "Pull full campaign-level performance metrics — spend, clicks, impressions, CTR, CPC, conversions, CPA, ROAS — for Google Ads, Meta, and/or StackAdapt accounts. Supports YTD and custom date ranges.",
+            description: "Pull full campaign-level performance metrics — spend, clicks, impressions, CTR, CPC, conversions, CPA, ROAS — for Google Ads, Meta, and/or StackAdapt accounts. Supports YTD and custom date ranges. " +
+                "Google VIDEO (YouTube) campaigns also return views, view_rate (%), avg_cpv ($, Google's TrueView avg CPV), cpv ($ = spend / views) and quartile_p25/p50/p75/p100 completion rates (%); other campaign types omit these fields.",
             inputSchema: {
                 type: "object",
                 properties: {
@@ -7106,6 +7223,7 @@ function makeServer() {
                     ga4:      { type: "string", description: "Google only: GA4 property ID" },
                     page_id:  { type: "string", pattern: "^[0-9]+$", description: "Meta only: Facebook Page ID ads run as (used by create_meta_campaign and manage_meta_leads). Can be set from the cloud server." },
                     nc_budget: { type: "number", description: "Google only: NC sub-budget (Boulevard Carroll pattern)" },
+                    cpv_goal:  { type: "number", description: "Google only: CPV goal in $ per view (e.g. 0.025) for YouTube/VIDEO accounts — get_google_pacing shows actual CPV vs this goal" },
                     flight_start: { type: "string", description: "YYYY-MM-DD — set with flight_end for flight-based pacing instead of monthly" },
                     flight_end:   { type: "string", description: "YYYY-MM-DD — last day of the flight" },
                     budget_schedule: {
@@ -7967,6 +8085,7 @@ function makeServer() {
             name: "get_performance_breakdown",
             description: "Break down Google Ads performance by geo (state), device, hour of day, day of week, or date. " +
                 "Returns spend, clicks, impressions, CTR, CPC, conversions, CPA per segment. " +
+                "segment=date also adds YouTube/VIDEO metrics on dates with video delivery: video_spend, views, view_rate (%), avg_cpv ($), cpv ($ = video_spend / views), quartile_p25/p50/p75/p100 (%). " +
                 "Use for questions like 'where are the leads coming from', 'which device converts best', or 'what hours should we dayparts'.",
             inputSchema: {
                 type: "object",
@@ -14506,6 +14625,7 @@ module.exports = {
     buildCampaignBudgetLines,
     normalizeGeoTargetSpec, buildGeoCriterion, shapeGeoCriteria, geoTargetToSpec, planGeoTargetingChange,
     describeGeoSpec, parseProximityAddress, createPmaxCampaignFull, createVideoCampaignFull,
+    googleSearch, getGoogleAccessToken,
 };
 
 if (require.main === module && !process.env.MCP_TEST) main().catch(console.error);
