@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "kaycomm-cloud": {
+      "command": "bash",
+      "args": ["scripts/cloud-mcp.sh"]
+    }
+  }
+}
