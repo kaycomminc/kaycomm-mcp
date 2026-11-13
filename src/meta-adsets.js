@@ -205,7 +205,8 @@ function existingCreativePreview(ad) {
 // ── duplicate_meta_campaign with an objective override ───────────────────────
 // Meta refuses objective changes once a campaign has ad sets, so the copy is a
 // fresh campaign; ad sets are re-created from their read spec (not /copies)
-// so optimization_goal can change, and ads are /copies'd into them.
+// so optimization_goal can change, and ads are rebuilt on their source
+// creatives (Meta rejects /copies of an ad across objectives).
 
 const SOURCE_CAMPAIGN_FIELDS = 'name,objective,status,special_ad_categories,special_ad_category_country,' +
   'bid_strategy,daily_budget,lifetime_budget,start_time,stop_time';
@@ -292,7 +293,7 @@ function planObjectiveDuplicate(tree, { objective, optimization_goal, billing_ev
       source_id: s.id, name: s.name,
       optimization_goal: { from: s.optimization_goal || null, to: goal },
       body, dropped,
-      ads: (s.ads || []).map(a => ({ id: a.id, name: a.name })),
+      ads: (s.ads || []).map(a => ({ id: a.id, name: a.name, creative_id: a.creative?.id || a.creative_id || null })),
     };
   });
 

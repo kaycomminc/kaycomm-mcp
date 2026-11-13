@@ -79,7 +79,7 @@ global.fetch = async (input, options = {}) => {
         }
         if (parts[0] === 'c1' && parts.length === 1) return json({ name: 'NSW | Prospecting | November 2026', objective: 'OUTCOME_LEADS', status: 'ACTIVE', special_ad_categories: [], daily_budget: '5000', bid_strategy: 'COST_CAP' });
         if (parts[0] === 'c1' && parts[1] === 'adsets') return json({ data: [{ id: 'as1', name: 'Lookalike 1%', status: 'ACTIVE', targeting: LAL_TARGETING, optimization_goal: 'OFFSITE_CONVERSIONS', billing_event: 'IMPRESSIONS', promoted_object: { pixel_id: 'px', custom_event_type: 'CONTACT' }, attribution_spec: [{ event_type: 'CLICK_THROUGH', window_days: 7 }] }] });
-        if (parts[0] === 'as1' && parts[1] === 'ads') return json({ data: [{ id: 'ad1', name: 'Ad 1', status: 'ACTIVE' }] });
+        if (parts[0] === 'as1' && parts[1] === 'ads') return json({ data: [{ id: 'ad1', name: 'Ad 1', status: 'ACTIVE', creative: { id: 'cr9' } }] });
         if (parts[1] === 'promote_pages') return json({ data: [{ id: '555', name: 'Page' }] });
         return json({ id: parts[0], account_id: 'act_nsw' });
     }
@@ -258,10 +258,12 @@ test('duplicate_meta_campaign objective override confirm: campaign + adset creat
         objective: 'OUTCOME_TRAFFIC', optimization_goal: 'LANDING_PAGE_VIEWS', new_name: 'NSW | Traffic', confirm: true,
     });
     const posts = calls.filter(c => c.method === 'POST');
-    assert.deepEqual(posts.map(p => p.path.split('/').slice(2).join('/')), ['act_nsw/campaigns', 'act_nsw/adsets', 'ad1/copies']);
+    assert.deepEqual(posts.map(p => p.path.split('/').slice(2).join('/')), ['act_nsw/campaigns', 'act_nsw/adsets', 'act_nsw/ads']);
     assert.equal(posts[0].body.objective, 'OUTCOME_TRAFFIC');
     assert.equal(posts[1].body.campaign_id, 'new_act_nsw_campaigns');
     assert.equal(posts[1].body.optimization_goal, 'LANDING_PAGE_VIEWS');
     assert.equal(posts[2].body.adset_id, 'new_act_nsw_adsets');
+    assert.deepEqual(posts[2].body.creative, { creative_id: 'cr9' });
+    assert.equal(posts[2].body.status, 'PAUSED');
     assert.equal(r.success, true);
 });

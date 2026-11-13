@@ -1563,17 +1563,17 @@ async function metaDuplicateCampaign(campaignId, newName, status, opts = {}) {
     return { new_campaign_id: newCampaignId, new_name: newName, id_map: idMap, failures };
 }
 // Duplicate under a new objective: fresh campaign, ad sets re-created from
-// their read spec with the optimization_goal override, ads /copies'd in.
+// their read spec with the optimization_goal override, ads rebuilt on their creatives.
 async function metaReadObjectiveDuplicateTree(campaignId) {
     const campaign = await metaGet(campaignId, { fields: metaAdsets.SOURCE_CAMPAIGN_FIELDS });
     const adsets = await metaGetAll(`${campaignId}/adsets`, { fields: metaAdsets.SOURCE_ADSET_FIELDS, limit: 200 });
     for (const adset of adsets) {
-        adset.ads = await metaGetAll(`${adset.id}/ads`, { fields: "id,name,status", limit: 200 });
+        adset.ads = await metaGetAll(`${adset.id}/ads`, { fields: "id,name,status,creative{id}", limit: 200 });
     }
     return { campaign, adsets };
 }
 
-async function metaDuplicateCampaignWithObjective(accountId, plan, adStatus) {
+async function metaDuplicateCampaignWithObjective(accountId, plan) {
     const COPY_DELAY_MS = 300;
     const budgetErr = validateBudgets({
         ...(plan.campaign.body.daily_budget ? { daily_budget: plan.campaign.body.daily_budget / 100 } : {}),
@@ -1595,7 +1595,12 @@ async function metaDuplicateCampaignWithObjective(accountId, plan, adStatus) {
         }
         for (const ad of s.ads) {
             try {
-                const newAdId = await metaCopyOne(ad.id, adStatus, { adset_id: newAdsetId });
+                // /copies is rejected across objectives ("Invalid parameter"), so
+                // build a fresh ad on the source creative instead.
+                if (!ad.creative_id) throw new Error("source ad has no creative id");
+                const newAdId = (await metaPost(`${metaActId(accountId)}/ads`, {
+                    name: ad.name, adset_id: newAdsetId, creative: { creative_id: ad.creative_id }, status: plan.campaign.body.status,
+                })).id;
                 idMap.ads.push({ source_id: ad.id, source_name: ad.name, new_id: newAdId, adset_source: s.source_id, adset_new: newAdsetId });
                 await new Promise(r => setTimeout(r, COPY_DELAY_MS));
             } catch (e) {
@@ -7969,7 +7974,7 @@ function makeServer() {
                     daily_budget:     { type: "number", description: "Daily budget in dollars for the new campaign. Omit to inherit from source." },
                     lifetime_budget:  { type: "number", description: "Lifetime budget in dollars for the new campaign. Omit to inherit from source." },
                     objective:        { type: "string", enum: ["OUTCOME_TRAFFIC", "OUTCOME_LEADS", "OUTCOME_SALES", "OUTCOME_AWARENESS", "OUTCOME_ENGAGEMENT", "OUTCOME_APP_PROMOTION"],
-                                        description: "Objective override. Builds a NEW campaign with this objective (Meta won't change objective on a campaign with ad sets), re-creates each ad set in it, and copies the ads. Pair with optimization_goal." },
+                                        description: "Objective override. Builds a NEW campaign with this objective (Meta won't change objective on a campaign with ad sets), re-creates each ad set in it, and rebuilds each ad on its existing creative. Pair with optimization_goal." },
                     optimization_goal: { type: "string", description: "With objective: optimization goal for every copied ad set (e.g. LANDING_PAGE_VIEWS for OUTCOME_TRAFFIC). Omit to keep each source goal." },
                     billing_event:    { type: "string", description: "With objective: billing event for copied ad sets (default IMPRESSIONS when the goal changes)." },
                     confirm:          { type: "boolean", description: "Set true to create the copy. Omit for dry-run preview." },
@@ -11815,14 +11820,14 @@ async function dispatchToolCall(name, args = {}) {
                                 message: "DRY RUN — set confirm=true to build the new-objective copy",
                                 account: acctInfo.name,
                                 source:  { id: camp.id, name: camp.name, status: camp.status, objective: plan.campaign.from_objective },
-                                mode:    "objective_override (new campaign; ad sets re-created, ads copied)",
+                                mode:    "objective_override (new campaign; ad sets re-created, ads rebuilt on source creatives)",
                                 new_campaign: plan.campaign.body,
                                 objects_to_create: { campaigns: 1, ad_sets: plan.adsets.length, ads: totalAdsObj },
                                 ad_sets: adsetView,
                                 ...(plan.warnings.length ? { warnings: plan.warnings } : {}),
                             };
                         } else {
-                            const res = await metaDuplicateCampaignWithObjective(accountId, plan, dupStatus);
+                            const res = await metaDuplicateCampaignWithObjective(accountId, plan);
                             const hasFailures = res.failures.length > 0;
                             result = {
                                 success: !hasFailures, partial: hasFailures,
