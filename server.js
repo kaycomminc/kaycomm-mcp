@@ -20,6 +20,7 @@ const { FileWriteStore, PostgresWriteStore, assertReserved } = require("./src/mc
 const { sameSecret, readJson, safeHttpHandler } = require("./src/mcp/http");
 const { createAccountsSync, syncedWriteAllowed } = require("./src/accounts-github");
 const metaBuild = require("./src/meta-campaign-build");
+const metaAdsets = require("./src/meta-adsets");
 const metaForecast = require("./src/meta-forecast");
 const metaMedia = require("./src/meta-media");
 const metaBilling = require("./src/meta-billing");
@@ -1561,6 +1562,50 @@ async function metaDuplicateCampaign(campaignId, newName, status, opts = {}) {
 
     return { new_campaign_id: newCampaignId, new_name: newName, id_map: idMap, failures };
 }
+// Duplicate under a new objective: fresh campaign, ad sets re-created from
+// their read spec with the optimization_goal override, ads /copies'd in.
+async function metaReadObjectiveDuplicateTree(campaignId) {
+    const campaign = await metaGet(campaignId, { fields: metaAdsets.SOURCE_CAMPAIGN_FIELDS });
+    const adsets = await metaGetAll(`${campaignId}/adsets`, { fields: metaAdsets.SOURCE_ADSET_FIELDS, limit: 200 });
+    for (const adset of adsets) {
+        adset.ads = await metaGetAll(`${adset.id}/ads`, { fields: "id,name,status", limit: 200 });
+    }
+    return { campaign, adsets };
+}
+
+async function metaDuplicateCampaignWithObjective(accountId, plan, adStatus) {
+    const COPY_DELAY_MS = 300;
+    const budgetErr = validateBudgets({
+        ...(plan.campaign.body.daily_budget ? { daily_budget: plan.campaign.body.daily_budget / 100 } : {}),
+        ...(plan.campaign.body.lifetime_budget ? { lifetime_budget: plan.campaign.body.lifetime_budget / 100 } : {}),
+    });
+    if (budgetErr) throw new Error("Budget validation failed: " + budgetErr.join(" | "));
+    const camp = await metaPost(`${metaActId(accountId)}/campaigns`, plan.campaign.body);
+    const idMap = { adsets: [], ads: [] };
+    const failures = [];
+    for (const s of plan.adsets) {
+        let newAdsetId;
+        try {
+            newAdsetId = (await metaPost(`${metaActId(accountId)}/adsets`, { ...s.body, campaign_id: camp.id })).id;
+            idMap.adsets.push({ source_id: s.source_id, source_name: s.name, new_id: newAdsetId });
+            await new Promise(r => setTimeout(r, COPY_DELAY_MS));
+        } catch (e) {
+            failures.push({ level: "adset", source_id: s.source_id, source_name: s.name, error: e.message });
+            continue;
+        }
+        for (const ad of s.ads) {
+            try {
+                const newAdId = await metaCopyOne(ad.id, adStatus, { adset_id: newAdsetId });
+                idMap.ads.push({ source_id: ad.id, source_name: ad.name, new_id: newAdId, adset_source: s.source_id, adset_new: newAdsetId });
+                await new Promise(r => setTimeout(r, COPY_DELAY_MS));
+            } catch (e) {
+                failures.push({ level: "ad", source_id: ad.id, source_name: ad.name, parent_adset: s.name, error: e.message });
+            }
+        }
+    }
+    return { new_campaign_id: camp.id, id_map: idMap, failures };
+}
+
 async function metaGet(path, extraParams = {}) {
     const params = new URLSearchParams({ access_token: META_ACCESS_TOKEN, ...extraParams });
     const resp = await fetchWithRetry(`https://graph.facebook.com/${META_API_VERSION}/${path}?${params}`);
@@ -1799,34 +1844,69 @@ async function getMetaAdsets(accountId) {
         fields: "id,name,status,effective_status,start_time,end_time,daily_budget,lifetime_budget,campaign_id,campaign{name},targeting",
         limit: 200,
     });
-    return rows.map(s => {
-        const t = s.targeting || {};
-        const interests = (t.flexible_spec || []).flatMap(fs => (fs.interests || []).map(i => ({ id: i.id, name: i.name })));
-        const behaviors = (t.flexible_spec || []).flatMap(fs => (fs.behaviors || []).map(b => ({ id: b.id, name: b.name })));
-        return {
-            id: s.id, name: s.name, status: s.status,
-            effective_status: s.effective_status || null,
-            delivery: metaDelivery(s.effective_status, metaEnded(s.end_time)),
-            start_time: s.start_time || null,
-            end_time: s.end_time || null,
-            campaign: s.campaign?.name || s.campaign_id,
-            daily_budget:    s.daily_budget    ? parseFloat(s.daily_budget) / 100    : null,
-            lifetime_budget: s.lifetime_budget ? parseFloat(s.lifetime_budget) / 100 : null,
-            targeting: {
-                age_min: t.age_min || null,
-                age_max: t.age_max || null,
-                geo_locations: t.geo_locations || null,
-                interests: interests.length ? interests : null,
-                behaviors: behaviors.length ? behaviors : null,
-                publisher_platforms: t.publisher_platforms || null,
-                facebook_positions: t.facebook_positions || null,
-                instagram_positions: t.instagram_positions || null,
-                audience_network_positions: t.audience_network_positions || null,
-                messenger_positions: t.messenger_positions || null,
-            },
-            level: "adset",
-        };
+    return rows.map(s => metaAdsets.shapeAdset(s, { delivery: metaDelivery }));
+}
+
+// Resolve every custom/excluded audience across rows with batched ?ids= reads.
+async function metaAudienceMapFor(targetings, warnings) {
+    const ids = [...new Set(targetings.flatMap(t => metaAdsets.collectAudienceIds(t || {})))];
+    return ids.length ? metaAdsets.resolveAudienceNames(ids, metaGet, warnings) : new Map();
+}
+
+// list_adsets: filtering happens in Graph (effective_status, campaign.id,
+// name CONTAIN); only COMPLETED (past end_time) is checked locally, and paging
+// stops once `limit` rows are kept.
+async function listMetaAdsetsFiltered(accountId, { target, campaign, statusFilter, limit = 50 } = {}) {
+    const statuses = metaAdsets.normalizeStatusFilter(statusFilter);
+    const warnings = [];
+    let campaignIds = null;
+    let matchedCampaigns = null;
+    if (campaign) {
+        if (/^\d+$/.test(String(campaign))) {
+            campaignIds = [String(campaign)];
+        } else {
+            const camps = await metaGetAll(`${accountId}/campaigns`, {
+                fields: "id,name", limit: 200,
+                filtering: JSON.stringify([{ field: "name", operator: "CONTAIN", value: campaign }]),
+            });
+            matchedCampaigns = camps.map(c => ({ id: c.id, name: c.name }));
+            if (!camps.length) return { statuses, matched_campaigns: [], adsets: [], truncated: false, warnings: [`No campaign name contains '${campaign}'`] };
+            campaignIds = camps.map(c => c.id);
+        }
+    }
+    const max = Math.max(1, Math.min(Number(limit) || 50, 500));
+    const filtering = metaAdsets.buildAdsetFiltering({ nameContains: target, campaignIds, statuses });
+    const keep = new Set(statuses);
+    const kept = [];
+    let truncated = false;
+    let data = await metaGet(`${accountId}/adsets`, {
+        fields: metaAdsets.ADSET_LIST_FIELDS, limit: Math.min(max, 100), filtering: JSON.stringify(filtering),
     });
+    for (;;) {
+        if (!Array.isArray(data.data)) throw new Error("Meta API returned an incomplete paginated response");
+        for (const row of data.data) {
+            if (!keep.has(metaAdsets.adsetBucket(row))) continue;
+            if (kept.length >= max) { truncated = true; break; }
+            kept.push(row);
+        }
+        const next = data.paging?.next;
+        if (truncated || !next) break;
+        const resp = await fetchWithRetry(next);
+        data = await resp.json();
+        if (data.error) throw new Error(data.error.message);
+    }
+    const audienceMap = await metaAudienceMapFor(kept.map(r => r.targeting), warnings);
+    return {
+        statuses, matched_campaigns: matchedCampaigns, truncated, warnings,
+        adsets: kept.map(s => metaAdsets.shapeAdset(s, { audienceMap, includeRaw: true, delivery: metaDelivery })),
+    };
+}
+
+async function getMetaAdsetDetail(adsetId) {
+    const row = await metaGet(String(adsetId), { fields: metaAdsets.ADSET_DETAIL_FIELDS });
+    const warnings = [];
+    const audienceMap = await metaAudienceMapFor([row.targeting], warnings);
+    return { adset: metaAdsets.shapeAdsetDetail(row, { audienceMap, delivery: metaDelivery }), warnings };
 }
 
 async function getMetaAds(accountId, filterName) {
@@ -6857,17 +6937,26 @@ function makeServer() {
             name: "manage_meta",
             description: "View and manage Meta Ads campaigns, ad sets, and ads — list, pause, resume, archive, update budgets, or duplicate. " +
                 "Dry run by default. Set confirm=true to apply changes. " +
-                "Actions: list_campaigns, list_adsets, list_ads, list_creatives, get_creative_details, pause, resume, archive, set_daily_budget, duplicate.",
+                "Actions: list_campaigns, list_adsets, get_adset, list_ads, list_creatives, get_creative_details, pause, resume, archive, set_daily_budget, duplicate. " +
+                "list_adsets filters in Graph by campaign, target (ad set name), status_filter and limit, and returns targeting_raw (full spec) plus custom/excluded audiences as {id, name}. " +
+                "get_adset returns one ad set's full targeting, optimization/billing/bid settings, promoted_object, budgets, schedule and campaign.",
             inputSchema: {
                 type: "object",
                 properties: {
                     account_name: { type: "string", description: "Meta account name (partial match ok)" },
                     action: {
                         type: "string",
-                        description: "list_campaigns | list_adsets | list_ads | list_creatives | get_creative_details | pause | resume | archive | set_daily_budget | duplicate",
-                        enum: ["list_campaigns", "list_adsets", "list_ads", "list_creatives", "get_creative_details", "pause", "resume", "archive", "set_daily_budget", "duplicate"],
+                        description: "list_campaigns | list_adsets | get_adset | list_ads | list_creatives | get_creative_details | pause | resume | archive | set_daily_budget | duplicate",
+                        enum: ["list_campaigns", "list_adsets", "get_adset", "list_ads", "list_creatives", "get_creative_details", "pause", "resume", "archive", "set_daily_budget", "duplicate"],
                     },
-                    target: { type: "string", description: "Campaign, ad set, or ad name to target (partial match ok). Required for pause/resume/archive/set_daily_budget/duplicate." },
+                    target: { type: "string", description: "Campaign, ad set, or ad name to target (partial match ok). Required for pause/resume/archive/set_daily_budget/duplicate. For list_adsets: ad set name contains." },
+                    campaign: { type: "string", description: "list_adsets only: campaign ID, or campaign name (partial match; every matching campaign is included)." },
+                    status_filter: {
+                        type: "array", items: { type: "string", enum: ["ACTIVE", "PAUSED", "COMPLETED", "ARCHIVED", "ALL"] },
+                        description: "list_adsets only: which ad sets to return (default ['ACTIVE','PAUSED']; COMPLETED = past end date; ALL = everything but deleted).",
+                    },
+                    limit: { type: "number", description: "list_adsets only: max ad sets to return (default 50, max 500)." },
+                    adset_id: { type: "string", description: "get_adset: the ad set ID." },
                     level: {
                         type: "string",
                         description: "Whether target is a campaign, adset, or ad (default: campaign for duplicate, adset for others)",
@@ -7879,6 +7968,10 @@ function makeServer() {
                     stop_time:        { type: "string", description: "ISO 8601 end time for the new campaign. Omit to inherit from source." },
                     daily_budget:     { type: "number", description: "Daily budget in dollars for the new campaign. Omit to inherit from source." },
                     lifetime_budget:  { type: "number", description: "Lifetime budget in dollars for the new campaign. Omit to inherit from source." },
+                    objective:        { type: "string", enum: ["OUTCOME_TRAFFIC", "OUTCOME_LEADS", "OUTCOME_SALES", "OUTCOME_AWARENESS", "OUTCOME_ENGAGEMENT", "OUTCOME_APP_PROMOTION"],
+                                        description: "Objective override. Builds a NEW campaign with this objective (Meta won't change objective on a campaign with ad sets), re-creates each ad set in it, and copies the ads. Pair with optimization_goal." },
+                    optimization_goal: { type: "string", description: "With objective: optimization goal for every copied ad set (e.g. LANDING_PAGE_VIEWS for OUTCOME_TRAFFIC). Omit to keep each source goal." },
+                    billing_event:    { type: "string", description: "With objective: billing event for copied ad sets (default IMPRESSIONS when the goal changes)." },
                     confirm:          { type: "boolean", description: "Set true to create the copy. Omit for dry-run preview." },
                 },
                 required: ["account_name", "source_campaign"],
@@ -9980,8 +10073,28 @@ async function dispatchToolCall(name, args = {}) {
                     result = { account: acctInfo.name, campaigns };
 
                 } else if (action === "list_adsets") {
-                    const adsets = await getMetaAdsets(accountId);
-                    result = { account: acctInfo.name, adsets };
+                    const r = await listMetaAdsetsFiltered(accountId, {
+                        target: args.target, campaign: args.campaign, statusFilter: args.status_filter, limit: args.limit,
+                    });
+                    result = {
+                        account: acctInfo.name,
+                        filters: { target: args.target || null, campaign: args.campaign || null, status_filter: r.statuses, limit: args.limit || 50 },
+                        ...(r.matched_campaigns ? { matched_campaigns: r.matched_campaigns } : {}),
+                        count: r.adsets.length,
+                        truncated: r.truncated,
+                        ...(r.truncated ? { note: "More ad sets match — raise limit or narrow with campaign/target." } : {}),
+                        ...(r.warnings.length ? { warnings: r.warnings } : {}),
+                        adsets: r.adsets,
+                    };
+
+                } else if (action === "get_adset") {
+                    const adsetId = args.adset_id || (/^\d+$/.test(args.target || "") ? args.target : null);
+                    if (!adsetId) {
+                        result = { error: "get_adset needs adset_id (numeric ad set ID). Run list_adsets to find it." };
+                    } else {
+                        const r = await getMetaAdsetDetail(adsetId);
+                        result = { account: acctInfo.name, ...r.adset, ...(r.warnings.length ? { warnings: r.warnings } : {}) };
+                    }
 
                 } else if (action === "list_ads") {
                     const target = args.target || null;
@@ -11686,6 +11799,49 @@ async function dispatchToolCall(name, args = {}) {
                     }
                 } else {
                     const copyName = args.new_name || `Copy of ${camp.name}`;
+                    if (args.objective || args.optimization_goal) {
+                        if (!args.objective) throw new Error("optimization_goal override needs objective too (use the source objective to keep it).");
+                        const srcTree = await metaReadObjectiveDuplicateTree(camp.id);
+                        const plan = metaAdsets.planObjectiveDuplicate(srcTree, {
+                            objective: args.objective, optimization_goal: args.optimization_goal, billing_event: args.billing_event,
+                            new_name: copyName, status: dupStatus, start_time: args.start_time, stop_time: args.stop_time,
+                            daily_budget: args.daily_budget, lifetime_budget: args.lifetime_budget,
+                        });
+                        const totalAdsObj = plan.adsets.reduce((n, s) => n + s.ads.length, 0);
+                        const adsetView = plan.adsets.map(s => ({ name: s.name, optimization_goal: s.optimization_goal, dropped: s.dropped, ads: s.ads.map(a => a.name) }));
+                        if (!confirm) {
+                            result = {
+                                dry_run: true,
+                                message: "DRY RUN — set confirm=true to build the new-objective copy",
+                                account: acctInfo.name,
+                                source:  { id: camp.id, name: camp.name, status: camp.status, objective: plan.campaign.from_objective },
+                                mode:    "objective_override (new campaign; ad sets re-created, ads copied)",
+                                new_campaign: plan.campaign.body,
+                                objects_to_create: { campaigns: 1, ad_sets: plan.adsets.length, ads: totalAdsObj },
+                                ad_sets: adsetView,
+                                ...(plan.warnings.length ? { warnings: plan.warnings } : {}),
+                            };
+                        } else {
+                            const res = await metaDuplicateCampaignWithObjective(accountId, plan, dupStatus);
+                            const hasFailures = res.failures.length > 0;
+                            result = {
+                                success: !hasFailures, partial: hasFailures,
+                                account: acctInfo.name,
+                                source:  { id: camp.id, name: camp.name },
+                                new_campaign_id: res.new_campaign_id,
+                                new_name: copyName, new_status: plan.campaign.body.status,
+                                objective: args.objective,
+                                id_map: res.id_map,
+                                copied: { ad_sets: res.id_map.adsets.length, ads: res.id_map.ads.length },
+                                ad_sets: adsetView,
+                                ...(plan.warnings.length ? { warnings: plan.warnings } : {}),
+                            };
+                            if (hasFailures) {
+                                result.failures = res.failures;
+                                result.warning = `${res.failures.length} object(s) failed. The new campaign exists but is incomplete — review failures and finish manually.`;
+                            }
+                        }
+                    } else {
                     const tree = await metaReadCampaignTree(camp.id);
                     const totalAds = tree.adsets.reduce((sum, s) => sum + (s.ads?.length || 0), 0);
 
@@ -11740,6 +11896,7 @@ async function dispatchToolCall(name, args = {}) {
                             result.failures = res.failures;
                             result.warning = `${res.failures.length} object(s) failed to copy. The new campaign exists but is incomplete — review failures and finish manually.`;
                         }
+                    }
                     }
                 }
             } catch (e) {
@@ -12167,6 +12324,7 @@ async function dispatchToolCall(name, args = {}) {
                                             url_tags: ad.url_tags || adSetDef.url_tags || DEFAULT_META_URL_TAGS,
                                         };
                                     }
+                                    if (ad.creative_id) return metaAdsets.existingCreativePreview(ad);
                                     return {
                                         name: ad.name,
                                         headline: ad.headline,
@@ -12190,21 +12348,13 @@ async function dispatchToolCall(name, args = {}) {
                                 if (targetingSpec.age_min || targetingSpec.age_max) {
                                     targetingSummary.push(`ages ${targetingSpec.age_min || 18}-${targetingSpec.age_max || 65}`);
                                 }
-                                if (targetingSpec.flexible_spec?.[0]?.interests?.length) {
-                                    targetingSummary.push(`interests: ${targetingSpec.flexible_spec[0].interests.map(i => i.name).join(", ")}`);
-                                }
-                                if (targetingSpec.flexible_spec?.[0]?.behaviors?.length) {
-                                    targetingSummary.push(`behaviors: ${targetingSpec.flexible_spec[0].behaviors.map(b => b.name).join(", ")}`);
-                                }
-                                if (targetingSpec.custom_audiences?.length) {
-                                    targetingSummary.push(`audiences: ${targetingSpec.custom_audiences.length} included`);
-                                }
-                                if (targetingSpec.exclusions?.custom_audiences?.length) {
-                                    targetingSummary.push(`exclusions: ${targetingSpec.exclusions.custom_audiences.length} excluded`);
-                                }
-                                const placementNote = (!adSetDef.targeting?.placements || adSetDef.targeting?.placements === "advantage_plus")
-                                    ? "Advantage+ (auto)" : "Manual";
-                                targetingSummary.push(`placements: ${placementNote}`);
+                                const flexInterests = (targetingSpec.flexible_spec || []).flatMap(g => g.interests || []);
+                                const flexBehaviors = (targetingSpec.flexible_spec || []).flatMap(g => g.behaviors || []);
+                                if (flexInterests.length) targetingSummary.push(`interests: ${flexInterests.map(i => i.name || i.id).join(", ")}`);
+                                if (flexBehaviors.length) targetingSummary.push(`behaviors: ${flexBehaviors.map(b => b.name || b.id).join(", ")}`);
+                                targetingSummary.push(...metaAdsets.audienceLine(targetingSpec));
+                                // Derived from the final merged spec, so targeting_raw placements show up.
+                                targetingSummary.push(`placements: ${metaAdsets.placementSummary(targetingSpec)}`);
 
                                 return {
                                     name: adSetDef.name,
@@ -14293,8 +14443,8 @@ async function dispatchToolCall(name, args = {}) {
                         creativeSwap.warning = "This ad is ACTIVE. Swapping its creative counts as a significant edit: the ad set re-enters the learning phase and accumulated delivery optimization is reset. Consider pausing first or swapping during a low-stakes window.";
                     }
                 }
-                // Targeting is replaced wholesale by Meta, and list_adsets omits
-                // fields like custom_audiences — show the live spec and flag drops.
+                // Targeting is replaced wholesale by Meta — show the live spec
+                // (also available via manage_meta get_adset) and flag drops.
                 let targetingCheck = null;
                 if (args.level === "adset" && updates.targeting && !confirm) {
                     try {
