@@ -40,7 +40,8 @@ const fetchFn = (url, options = {}) => {
 // Set these in Railway → Variables, and in ./.env for local scripts (see local-env.js)
 // Locally, fall back to ./.env for anything the Claude Desktop config doesn't set
 // (Desktop can rewrite its config on quit and drop newly added vars). No-op on Railway.
-require("./local-env").loadLocalEnv();
+// Tests (MCP_TEST=1) stay hermetic: real .env credentials must not leak in.
+if (process.env.MCP_TEST !== "1") require("./local-env").loadLocalEnv();
 const GOOGLE_DEVELOPER_TOKEN = process.env.GOOGLE_DEVELOPER_TOKEN;
 const GOOGLE_CLIENT_ID       = process.env.GOOGLE_CLIENT_ID;
 const GOOGLE_CLIENT_SECRET   = process.env.GOOGLE_CLIENT_SECRET;
@@ -705,6 +706,74 @@ async function getGoogleAccessToken(customerId) {
     if (!data.access_token) return { token: null, error: data.error_description || JSON.stringify(data) };
     _googleTokenCache[cacheKey] = { token: data.access_token, expiry: Date.now() + (data.expires_in - 60) * 1000 };
     return { token: data.access_token, error: null };
+}
+
+// Google Drive (drive.readonly) for creative intake — a separate refresh token
+// so the Ads token's scopes stay untouched. Mint with:
+//   node get-refresh-token.js GOOGLE_DRIVE_REFRESH_TOKEN --drive
+async function getDriveAccessToken() {
+    const refreshToken = process.env.GOOGLE_DRIVE_REFRESH_TOKEN;
+    if (!refreshToken) return { token: null, error: "GOOGLE_DRIVE_REFRESH_TOKEN is not set" };
+    const cached = _googleTokenCache[refreshToken];
+    if (cached && Date.now() < cached.expiry) return { token: cached.token, error: null };
+    const resp = await fetchWithRetry("https://oauth2.googleapis.com/token", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+            client_id: GOOGLE_CLIENT_ID, client_secret: GOOGLE_CLIENT_SECRET,
+            refresh_token: refreshToken, grant_type: "refresh_token",
+        }),
+    });
+    const data = await resp.json();
+    if (!data.access_token) return { token: null, error: data.error_description || JSON.stringify(data) };
+    _googleTokenCache[refreshToken] = { token: data.access_token, expiry: Date.now() + (data.expires_in - 60) * 1000 };
+    return { token: data.access_token, error: null };
+}
+const driveCreative = require("./src/drive-creative");
+const driveClient = driveCreative.createDriveClient({ fetch: (...a) => fetchFn(...a), getToken: getDriveAccessToken });
+
+// Expand Drive inputs (a folder link, or file share links when Drive auth is
+// configured) into private-download entries. Other entries pass through.
+// filters: { match: substring on folder/name, aspects: ["1:1", ...] }
+async function expandDriveInputs({ folder, files = [], match, aspects, recursive = true }) {
+    const out = [];
+    const errors = [];
+    const hasDriveAuth = !!process.env.GOOGLE_DRIVE_REFRESH_TOKEN;
+    const keep = f => (!match || `${f.folder}/${f.name}`.toLowerCase().includes(String(match).toLowerCase()))
+        && (!aspects?.length || aspects.includes(f.fit.aspect));
+    if (folder) {
+        const link = driveCreative.parseDriveLink(folder);
+        if (!link || link.kind === "file") {
+            errors.push({ source: folder, error: "folder must be a Google Drive folder link or folder ID" });
+        } else {
+            try {
+                const listed = await driveClient.listMedia(link.id, { recursive });
+                for (const f of listed.files.filter(keep)) out.push({ drive_file: f, source: `drive:${f.folder ? f.folder + "/" : ""}${f.name}` });
+                if (!out.length) errors.push({ source: folder, error: `No matching images/videos in folder (${listed.files.length} media file(s) before filters)` });
+            } catch (e) { errors.push({ source: folder, error: e.message }); }
+        }
+    }
+    for (const f of files) {
+        const link = hasDriveAuth && f.source ? driveCreative.parseDriveLink(f.source) : null;
+        if (link && link.kind !== "unknown") {
+            if (link.kind === "folder") {
+                const nested = await expandDriveInputs({ folder: f.source, match, aspects, recursive });
+                out.push(...nested.entries); errors.push(...nested.errors);
+            } else {
+                try {
+                    const meta = driveCreative.describeFile(await driveClient.getFile(link.id), "");
+                    out.push({ drive_file: meta, source: f.source, name: f.name });
+                } catch (_) {
+                    // Not reachable privately (auth issue, or not shared with the Drive
+                    // account) — fall back to the public share-link download.
+                    out.push(f);
+                }
+            }
+        } else {
+            out.push(f);
+        }
+    }
+    return { entries: out, errors };
 }
 
 // ── Google Ads API ────────────────────────────────────────────────────────────
@@ -8275,6 +8344,7 @@ function makeServer() {
             description: "Upload images or videos to a Meta ad account's Media Library. " +
                 "Returns image hashes or video IDs for use in create_meta_campaign. " +
                 "Supports local file paths, public URLs, Google Drive / Dropbox share links (downloaded and content-type checked), and base64 data. " +
+                "Pass folder (a Google Drive folder link) to upload every image/video in it — private folders work via Drive auth; use list_drive_creative first to see what's there. " +
                 "For files too large for one base64 string (e.g. from Claude.ai's sandbox), use upload_meta_media_chunk. Returns image_hash, name, width and height for each image. " +
                 "Dry run by default — set confirm=true to upload.",
             inputSchema: {
@@ -8287,15 +8357,18 @@ function makeServer() {
                         items: {
                             type: "object",
                             properties: {
-                                source:      { type: "string", description: "Server-local file path, public URL, or a Google Drive (drive.google.com/file/d/…/view) or Dropbox share link — share links must be 'Anyone with the link'. Images: jpg/jpeg/png/gif/bmp/tiff. Videos: mp4/mov/avi/wmv/flv/mkv/webm." },
+                                source:      { type: "string", description: "Server-local file path, public URL, or a Google Drive (drive.google.com/file/d/…/view) or Dropbox share link. Drive links are read privately when Drive auth is set up; otherwise (and for Dropbox) they must be 'Anyone with the link'. Images: jpg/jpeg/png/gif/bmp/tiff. Videos: mp4/mov/avi/wmv/flv/mkv/webm." },
                                 base64_data: { type: "string", description: "Base64-encoded file content. Use when a file is dragged into chat — Claude encodes it and passes it here. Must also provide name with extension." },
                                 name:        { type: "string", description: "Display name in Media Library (with extension). Required when using base64_data, optional for source." },
                             },
                         },
                     },
+                    folder:  { type: "string", description: "Google Drive folder link or ID — uploads every image/video in it (and subfolders). Combine with match/aspects to narrow." },
+                    match:   { type: "string", description: "Only Drive files whose folder/name contains this text (case-insensitive)." },
+                    aspects: { type: "array", items: { type: "string", enum: ["1:1", "4:5", "9:16", "1.91:1", "16:9"] }, description: "Only Drive files with these aspect ratios." },
                     confirm: { type: "boolean", description: "Set true to upload. Omit for dry run (validates files and formats)." },
                 },
-                required: ["account_name", "files"],
+                required: ["account_name"],
             },
         },
         {
@@ -8316,6 +8389,54 @@ function makeServer() {
                     confirm:      { type: "boolean", description: "Set true to upload once all chunks are staged. Omit for dry run." },
                 },
                 required: ["account_name", "upload_id"],
+            },
+        },
+        {
+            name: "list_drive_creative",
+            description: "List the images and videos in a Google Drive creative folder (private — read with Drive auth, no public sharing needed). " +
+                "Returns each file's size, dimensions, aspect ratio, which Meta placements and Google Ads image fields it fits, grouped by concept (sizes of the same creative together) with missing Meta sizes flagged. " +
+                "Pass folder (link or ID), or account_name to open that client's folder under the creative root (Creative/<Client>/<Campaign>). " +
+                "Then upload with upload_meta_media or upload_google_image_assets using the same folder link.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    folder:       { type: "string", description: "Google Drive folder link or folder ID" },
+                    account_name: { type: "string", description: "Client name — opens Creative/<Client> under the creative root folder (CREATIVE_DRIVE_ROOT_ID)" },
+                    subfolder:    { type: "string", description: "With account_name: campaign/flight subfolder name (partial match ok)" },
+                    recursive:    { type: "boolean", description: "Include subfolders (default true, up to 3 levels)" },
+                    match:        { type: "string", description: "Only files whose folder/name contains this text" },
+                },
+            },
+        },
+        {
+            name: "upload_google_image_assets",
+            description: "Upload images to a Google Ads account as image assets (for PMax / Demand Gen / Display). " +
+                "Takes a Google Drive folder link (private OK with Drive auth), Drive/Dropbox file links, public URLs, local paths or base64. " +
+                "Checks each image against Google's specs (1.91:1 ≥600x314 marketing, 1:1 ≥300x300 square, 4:5 ≥480x600 portrait, 1:1 ≥128 logo, 4:1 ≥512x128 landscape logo, ≤5 MB) and skips ones that fit none. " +
+                "Returns asset resource names with the field each fits, ready for create_pmax_campaign (marketing_images, square_marketing_images, logo_assets). " +
+                "Dry run by default — set confirm=true to upload.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    account_name: { type: "string", description: "Client name (partial match ok)" },
+                    folder:  { type: "string", description: "Google Drive folder link or ID — every image in it (and subfolders)" },
+                    files: {
+                        type: "array",
+                        description: "Individual images. Provide source OR base64_data.",
+                        items: {
+                            type: "object",
+                            properties: {
+                                source:      { type: "string", description: "Drive/Dropbox share link, public URL, or server-local path" },
+                                base64_data: { type: "string", description: "Base64 image content (requires name)" },
+                                name:        { type: "string", description: "Asset name (defaults to the file name)" },
+                            },
+                        },
+                    },
+                    match:   { type: "string", description: "Only Drive files whose folder/name contains this text" },
+                    aspects: { type: "array", items: { type: "string", enum: ["1:1", "4:5", "1.91:1", "4:1"] }, description: "Only images with these aspect ratios" },
+                    confirm: { type: "boolean", description: "Set true to upload. Omit for dry run." },
+                },
+                required: ["account_name"],
             },
         },
         {
@@ -11946,8 +12067,8 @@ async function dispatchToolCall(name, args = {}) {
         const IMAGE_EXTS = new Set(["jpg", "jpeg", "png", "gif", "bmp", "tiff"]);
         const VIDEO_EXTS = new Set(["mp4", "mov", "avi", "wmv", "flv", "mkv", "webm"]);
 
-        if (!args.files?.length) {
-            result = { error: "files array is required and must contain at least one item." };
+        if (!args.files?.length && !args.folder) {
+            result = { error: "Provide files (at least one) or a Google Drive folder link." };
         } else {
             const { match: acctMatch, error: acctMatchErr } = resolveAccount(META_ACCOUNTS, search, { confirmed: args.confirm === true });
             if (!acctMatch) {
@@ -11956,8 +12077,21 @@ async function dispatchToolCall(name, args = {}) {
                 const [accountId, acctInfo] = acctMatch;
                 try {
                     const fileMeta = [];
-                    const errors = [];
-                    for (const f of args.files) {
+                    const { entries, errors } = await expandDriveInputs({ folder: args.folder, files: args.files || [], match: args.match, aspects: args.aspects });
+                    for (const f of entries) {
+                        // Private Drive files (folder listing or file link with Drive auth):
+                        // metadata now, bytes downloaded only on confirm.
+                        if (f.drive_file) {
+                            const d = f.drive_file;
+                            if (d.type === "image" && d.size > metaMedia.MAX_IMAGE_BYTES) { errors.push({ source: f.source, error: `Image is ${d.size_label}; Meta's limit is 30 MB` }); continue; }
+                            fileMeta.push({
+                                source: f.source, name: f.name || d.name, type: d.type, isUrl: false, isBase64: false,
+                                drive_id: d.id, drive_file: d, provider: "google_drive", content_type: d.mime_type,
+                                width: d.width, height: d.height, aspect: d.fit.aspect, placements: d.fit.meta,
+                                size: d.size, sizeLabel: d.size_label || "(unknown)",
+                            });
+                            continue;
+                        }
                         const isBase64 = !!f.base64_data;
                         const isUrl = !isBase64 && f.source && (f.source.startsWith("http://") || f.source.startsWith("https://"));
                         const isLocal = !isBase64 && !isUrl;
@@ -12051,6 +12185,7 @@ async function dispatchToolCall(name, args = {}) {
                                 name: f.name, source: f.source, type: f.type, size: f.sizeLabel,
                                 ...(f.type === "image" ? { width: f.width, height: f.height } : {}),
                                 ...(f.provider ? { provider: f.provider, content_type: f.content_type } : {}),
+                                ...(f.aspect ? { aspect: f.aspect, placements: f.placements } : {}),
                                 status: "ready",
                             })),
                             message: `${fileMeta.length} file(s) ready to upload. Set confirm=true to proceed.`,
@@ -12073,6 +12208,7 @@ async function dispatchToolCall(name, args = {}) {
 
                         for (const f of fileMeta) {
                             try {
+                                if (f.drive_id && !f.buffer) f.buffer = (await driveClient.download(f.drive_id, { known: f.drive_file, maxBytes: f.type === "image" ? metaMedia.MAX_IMAGE_BYTES : undefined })).buffer;
                                 if (f.type === "image") {
                                     if (f.isUrl) {
                                         const res = await metaPost(`${accountId}/adimages`, { url: f.source });
@@ -12178,6 +12314,133 @@ async function dispatchToolCall(name, args = {}) {
                             summary: "Uploaded. Use image_hash in create_meta_campaign.",
                         };
                     }
+                }
+            } catch (e) {
+                result = { error: e.message };
+            }
+        }
+
+    } else if (name === "list_drive_creative") {
+        try {
+            let folderId, folderLabel;
+            if (args.folder) {
+                const link = driveCreative.parseDriveLink(args.folder);
+                if (!link || link.kind === "file") throw new Error("folder must be a Google Drive folder link or folder ID");
+                folderId = link.id; folderLabel = args.folder;
+            } else if (args.account_name) {
+                const root = process.env.CREATIVE_DRIVE_ROOT_ID;
+                if (!root) throw new Error("CREATIVE_DRIVE_ROOT_ID is not set — pass a folder link instead, or set it to the Drive ID of the Creative root folder.");
+                const q = args.account_name.toLowerCase();
+                const acct = [...Object.values(META_ACCOUNTS), ...Object.values(GOOGLE_ACCOUNTS)].find(i => i.name?.toLowerCase().includes(q));
+                const clientName = acct?.name || args.account_name;
+                let { folder, candidates } = await driveClient.findChildFolder(root, clientName);
+                if (!folder && acct) ({ folder, candidates } = await driveClient.findChildFolder(root, args.account_name));
+                if (!folder) throw new Error(`No single client folder matching '${clientName}' in the creative root. Folders: ${(candidates || []).slice(0, 40).join(", ") || "(none)"}`);
+                folderId = folder.id; folderLabel = `Creative/${folder.name}`;
+                if (args.subfolder) {
+                    const sub = await driveClient.findChildFolder(folder.id, args.subfolder);
+                    if (!sub.folder) throw new Error(`No single subfolder matching '${args.subfolder}' in ${folderLabel}. Subfolders: ${(sub.candidates || []).join(", ") || "(none)"}`);
+                    folderId = sub.folder.id; folderLabel += `/${sub.folder.name}`;
+                }
+            } else {
+                throw new Error("Provide folder (Drive link/ID) or account_name.");
+            }
+            const listed = await driveClient.listMedia(folderId, { recursive: args.recursive !== false });
+            const files = args.match ? listed.files.filter(f => `${f.folder}/${f.name}`.toLowerCase().includes(args.match.toLowerCase())) : listed.files;
+            const byAspect = {};
+            for (const f of files) byAspect[f.fit.aspect || "unknown"] = (byAspect[f.fit.aspect || "unknown"] || 0) + 1;
+            result = {
+                folder: folderLabel, folder_id: folderId,
+                total_files: files.length, by_aspect: byAspect,
+                subfolders: listed.subfolders,
+                concepts: driveCreative.groupByConcept(files).map(g => ({
+                    concept: g.concept, aspects: g.aspects,
+                    ...(g.missing_meta.length ? { missing_meta_sizes: g.missing_meta } : {}),
+                    files: g.files.map(f => ({ name: f.name, type: f.type, width: f.width, height: f.height, size: f.size_label,
+                        ...(f.duration_sec ? { duration_sec: f.duration_sec } : {}),
+                        aspect: f.fit.aspect, meta: f.fit.meta, google: f.fit.google,
+                        ...(f.fit.display_banner ? { display_banner: f.fit.display_banner } : {}),
+                        ...(f.fit.warning ? { warning: f.fit.warning } : {}), ...(f.fit.google_note ? { google_note: f.fit.google_note } : {}),
+                        drive_id: f.id, modified: f.modified })),
+                })),
+                ...(listed.skipped_non_media ? { skipped_non_media: listed.skipped_non_media } : {}),
+                next: `Upload with upload_meta_media / upload_google_image_assets: folder="${folderId}" (add match/aspects to narrow).`,
+            };
+        } catch (e) {
+            result = { error: e.message };
+        }
+
+    } else if (name === "upload_google_image_assets") {
+        const confirm = args.confirm === true;
+        const { match: acctMatch, error: acctMatchErr } = resolveAccount(GOOGLE_ACCOUNTS, (args.account_name || "").toLowerCase(), { confirmed: confirm });
+        if (!args.files?.length && !args.folder) {
+            result = { error: "Provide files (at least one) or a Google Drive folder link." };
+        } else if (!acctMatch) {
+            result = { error: acctMatchErr };
+        } else {
+            const [cid, info] = acctMatch;
+            try {
+                const { entries, errors } = await expandDriveInputs({ folder: args.folder, files: args.files || [], match: args.match, aspects: args.aspects });
+                const items = [];
+                for (const f of entries) {
+                    try {
+                        let item;
+                        if (f.drive_file) {
+                            const d = f.drive_file;
+                            if (d.type !== "image") throw new Error("Not an image (Google video assets must be YouTube)");
+                            item = { source: f.source, name: f.name || d.name, drive_id: d.id, drive_file: d, width: d.width, height: d.height, size: d.size, size_label: d.size_label };
+                        } else {
+                            let buffer, fname = f.name;
+                            if (f.base64_data) {
+                                if (!f.name) throw new Error("name is required with base64_data");
+                                buffer = Buffer.from(f.base64_data, "base64");
+                            } else if (/^https?:\/\//.test(f.source || "")) {
+                                const dl = await metaMedia.downloadMedia(metaMedia.resolveShareLink(f.source)?.url || f.source, { fetch: fetchFn, maxBytes: driveCreative.GOOGLE_MAX_IMAGE_BYTES * 4 });
+                                if (dl.mediaType !== "image") throw new Error("Not an image");
+                                buffer = dl.buffer; fname = fname || dl.filename || path.basename(new URL(f.source).pathname);
+                            } else if (f.source) {
+                                const resolved = path.isAbsolute(f.source) ? f.source : path.resolve(f.source);
+                                if (!fs.existsSync(resolved)) throw new Error("File not found");
+                                buffer = fs.readFileSync(resolved); fname = fname || path.basename(resolved);
+                            } else throw new Error("source or base64_data is required");
+                            const dims = await metaMedia.describeImage(buffer);
+                            item = { source: f.source || "(base64)", name: fname, buffer, width: dims.width, height: dims.height, size: buffer.length,
+                                size_label: buffer.length > 1048576 ? `${(buffer.length / 1048576).toFixed(1)} MB` : `${Math.round(buffer.length / 1024)} KB` };
+                        }
+                        const fit = driveCreative.placementFit({ width: item.width, height: item.height, mediaType: "image", size: item.size });
+                        if (!fit.google.length) throw new Error(`${item.width}x${item.height} (${fit.aspect}) fits no Google image spec`);
+                        if (item.size > driveCreative.GOOGLE_MAX_IMAGE_BYTES) throw new Error(`${item.size_label} is over Google's 5 MB image limit`);
+                        items.push({ ...item, aspect: fit.aspect, fields: fit.google });
+                    } catch (e) {
+                        errors.push({ source: f.source || f.name || "(base64)", error: e.message });
+                    }
+                }
+                const view = i => ({ name: i.name, source: i.source, width: i.width, height: i.height, size: i.size_label, aspect: i.aspect, fits: i.fields });
+                if (!items.length) {
+                    result = { error: "No uploadable images", details: errors };
+                } else if (!confirm) {
+                    result = { dry_run: true, account: info.name, images: items.map(view),
+                        message: `${items.length} image(s) ready. Set confirm=true to create the assets.`, ...(errors.length ? { skipped: errors } : {}) };
+                } else {
+                    const { token, error: authErr } = await getGoogleAccessToken(cid);
+                    if (authErr) throw new Error(`Auth: ${authErr}`);
+                    const uploaded = [], failed = [];
+                    for (const i of items) {
+                        try {
+                            const buffer = i.buffer || (await driveClient.download(i.drive_id, { known: i.drive_file, maxBytes: driveCreative.GOOGLE_MAX_IMAGE_BYTES })).buffer;
+                            const res = await googleMutateOps(token, cid, info.mcc, [{
+                                assetOperation: { create: { name: i.name, type: "IMAGE", imageAsset: { data: buffer.toString("base64") } } },
+                            }]);
+                            uploaded.push({ ...view(i), resource_name: res[0]?.assetResult?.resourceName || null });
+                        } catch (e) {
+                            failed.push({ name: i.name, source: i.source, error: e.message });
+                        }
+                    }
+                    result = {
+                        success: failed.length === 0, account: info.name, uploaded,
+                        summary: `${uploaded.length} image asset(s) created. MARKETING_IMAGE → marketing_images, SQUARE_MARKETING_IMAGE → square_marketing_images, LOGO → logo_assets in create_pmax_campaign.`,
+                        ...(failed.length ? { failed } : {}), ...(errors.length ? { skipped: errors } : {}),
+                    };
                 }
             } catch (e) {
                 result = { error: e.message };

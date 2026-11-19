@@ -55,7 +55,20 @@ global.fetch = async (input, options = {}) => {
   const url = new URL(input);
   const method = options.method || 'GET';
   const body = requestBody(options);
-  fetches.push({ method, path: url.pathname, body });
+  fetches.push({ method, path: url.pathname, body, host: url.hostname, auth: options.headers?.Authorization });
+
+  // Google Drive creative folder fixture (private, OAuth bearer).
+  if (url.hostname === 'oauth2.googleapis.com') return response({ access_token: 'synthetic-drive-token', expires_in: 3600 });
+  if (url.hostname === 'www.googleapis.com' && url.pathname.startsWith('/drive/v3/')) {
+    if (url.pathname.endsWith('/files')) return response({ files: [
+      { id: 'drv1', name: 'Promo_A_1x1.jpg', mimeType: 'image/jpeg', size: '120000', imageMediaMetadata: { width: 1080, height: 1080 } },
+      { id: 'drv2', name: 'Promo_A_9x16.jpg', mimeType: 'image/jpeg', size: '150000', imageMediaMetadata: { width: 1080, height: 1920 } },
+      { id: 'drv3', name: 'brief.pdf', mimeType: 'application/pdf' },
+    ] });
+    const id = url.pathname.split('/').pop();
+    if (url.searchParams.get('alt') === 'media') return { status: 200, ok: true, json: async () => ({}), arrayBuffer: async () => new TextEncoder().encode(`img-${id}`).buffer };
+    return response({ id, name: `Promo_A_${id}.jpg`, mimeType: 'image/jpeg', size: '120000', imageMediaMetadata: { width: 1080, height: 1080 } });
+  }
 
   if (method === 'GET') {
     const id = url.pathname.split('/').filter(Boolean).at(-1);
@@ -162,9 +175,9 @@ async function flushHttp() {
   await new Promise(resolve => setImmediate(resolve));
 }
 
-test('registered catalog contains 97 tools with annotations and output schemas', async () => {
+test('registered catalog contains 99 tools with annotations and output schemas', async () => {
   const listed = await listHandler({ method: 'tools/list', params: {} }, {});
-  assert.equal(listed.tools.length, 97);
+  assert.equal(listed.tools.length, 99);
   for (const tool of listed.tools) {
     assert.ok(tool.annotations, `${tool.name} is missing annotations`);
     assert.equal(typeof tool.annotations.readOnlyHint, 'boolean');
@@ -472,4 +485,42 @@ test('update_meta_object creative swap dry run warns when the ad is ACTIVE', asy
   assert.equal(result.value.creative_swap.new_creative_id, '902');
   assert.match(result.value._meta.warnings[0], /ACTIVE.*learning phase/);
   assert.equal(fetches.filter(x => x.method === 'POST').length, 0);
+});
+
+test('upload_meta_media takes a private Drive folder: dry run lists, confirm downloads with OAuth', async () => {
+  process.env.GOOGLE_DRIVE_REFRESH_TOKEN = 'synthetic-drive-refresh';
+  try {
+    resetFetches();
+    const dry = (await invoke('upload_meta_media', {
+      account_name: 'Audit Client A', folder: 'https://drive.google.com/drive/folders/synthFolder123', aspects: ['9:16'],
+    })).value;
+    assert.equal(dry.dry_run, true);
+    assert.deepEqual(dry.files.map(f => [f.name, f.aspect]), [['Promo_A_9x16.jpg', '9:16']]);
+    assert.equal(fetches.some(f => f.path.includes('drv2') ), false, 'dry run must not download bytes');
+
+    resetFetches();
+    const done = (await invoke('upload_meta_media', {
+      account_name: 'Audit Client A', folder: 'synthFolder123', match: 'promo_a', confirm: true,
+    })).value;
+    assert.equal(done.uploaded.length, 2, JSON.stringify(done));
+    const downloads = fetches.filter(f => f.host === 'www.googleapis.com' && f.path.match(/drv\d$/));
+    assert.equal(downloads.length, 2);
+    assert.ok(downloads.every(f => f.auth === 'Bearer synthetic-drive-token'));
+  } finally {
+    delete process.env.GOOGLE_DRIVE_REFRESH_TOKEN;
+  }
+});
+
+test('list_drive_creative groups a folder by concept with placement fit', async () => {
+  process.env.GOOGLE_DRIVE_REFRESH_TOKEN = 'synthetic-drive-refresh';
+  try {
+    const r = (await invoke('list_drive_creative', { folder: 'https://drive.google.com/drive/folders/synthFolder123' })).value;
+    assert.equal(r.total_files, 2);
+    assert.equal(r.skipped_non_media, 1);
+    assert.deepEqual(r.by_aspect, { '1:1': 1, '9:16': 1 });
+    assert.equal(r.concepts.length, 1);
+    assert.deepEqual(r.concepts[0].files[0].google, ['SQUARE_MARKETING_IMAGE', 'LOGO']);
+  } finally {
+    delete process.env.GOOGLE_DRIVE_REFRESH_TOKEN;
+  }
 });

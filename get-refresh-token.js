@@ -5,7 +5,9 @@ const { loadLocalEnv, writeEnvVar } = require("./local-env");
 
 // Optional: env var name to save the token under in ./.env, e.g.
 //   node get-refresh-token.js GOOGLE_REFRESH_TOKEN_3
-const SAVE_AS = process.argv[2];
+//   node get-refresh-token.js GOOGLE_DRIVE_REFRESH_TOKEN --drive   (drive.readonly, for creative intake)
+const DRIVE = process.argv.includes("--drive");
+const SAVE_AS = process.argv.slice(2).find(a => !a.startsWith("--"));
 loadLocalEnv();
 
 const CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
@@ -18,7 +20,7 @@ if (!CLIENT_ID || !CLIENT_SECRET) {
 
 const PORT = 3847;
 const REDIRECT_URI = `http://localhost:${PORT}`;
-const SCOPE = "https://www.googleapis.com/auth/adwords";
+const SCOPE = DRIVE ? "https://www.googleapis.com/auth/drive.readonly" : "https://www.googleapis.com/auth/adwords";
 
 const authUrl =
   `https://accounts.google.com/o/oauth2/v2/auth?` +
