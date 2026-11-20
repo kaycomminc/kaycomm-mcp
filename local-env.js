@@ -39,4 +39,31 @@ function writeEnvVar(key, value) {
     fs.chmodSync(ENV_PATH, 0o600);
 }
 
-module.exports = { ENV_PATH, readEnvFile, loadLocalEnv, writeEnvVar };
+// Claude Desktop launches the local MCP with the env block in its config, and
+// those values WIN over ./.env (loadLocalEnv never overrides). So a token
+// renewed only in .env leaves the running MCP on the stale one. This updates
+// the key in every MCP server env block that already defines it.
+// Returns the names of the servers updated ([] if config or key not found).
+const DESKTOP_CONFIG_PATH = path.join(
+    process.env.HOME || "", "Library", "Application Support", "Claude", "claude_desktop_config.json");
+
+function writeDesktopConfigVar(key, value) {
+    let cfg;
+    try { cfg = JSON.parse(fs.readFileSync(DESKTOP_CONFIG_PATH, "utf8")); }
+    catch (_) { return []; }
+    const updated = [];
+    for (const [name, server] of Object.entries(cfg.mcpServers || {})) {
+        if (server && server.env && Object.prototype.hasOwnProperty.call(server.env, key)) {
+            server.env[key] = value;
+            updated.push(name);
+        }
+    }
+    if (updated.length) {
+        const tmp = DESKTOP_CONFIG_PATH + ".tmp";
+        fs.writeFileSync(tmp, JSON.stringify(cfg, null, 2) + "\n", { mode: 0o600 });
+        fs.renameSync(tmp, DESKTOP_CONFIG_PATH);
+    }
+    return updated;
+}
+
+module.exports = { ENV_PATH, DESKTOP_CONFIG_PATH, readEnvFile, loadLocalEnv, writeEnvVar, writeDesktopConfigVar };

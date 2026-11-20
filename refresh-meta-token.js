@@ -29,7 +29,7 @@ const fs   = require("fs");
 const path = require("path");
 const { execFileSync } = require("child_process");
 
-const { ENV_PATH, loadLocalEnv, writeEnvVar } = require("./local-env");
+const { ENV_PATH, DESKTOP_CONFIG_PATH, loadLocalEnv, writeEnvVar, writeDesktopConfigVar } = require("./local-env");
 
 // Pull creds from ./.env when not already in the environment
 loadLocalEnv();
@@ -92,6 +92,14 @@ async function main() {
     // 3. Save it to the local .env
     writeEnvVar("META_ACCESS_TOKEN", newToken);
     console.log(`Updated META_ACCESS_TOKEN in ${ENV_PATH}`);
+
+    // 3b. Claude Desktop's config env overrides .env for the local MCP — keep it in sync
+    const servers = writeDesktopConfigVar("META_ACCESS_TOKEN", newToken);
+    if (servers.length) {
+        console.log(`Updated META_ACCESS_TOKEN in Claude Desktop config (${servers.join(", ")}) — restart Claude Desktop to load it.`);
+    } else {
+        console.log(`Note: no META_ACCESS_TOKEN found in ${DESKTOP_CONFIG_PATH} — nothing to update there.`);
+    }
 
     // 4. Push to Railway automatically
     await syncToRailway({ META_ACCESS_TOKEN: newToken });
