@@ -328,6 +328,20 @@
         }
       ],
       "cpv_goal": 0.025
+    },
+    "7561614735": {
+      "name": "PCL Construction",
+      "budget": 15010.8,
+      "mcc": "7631184147",
+      "flight_start": "2026-11-16",
+      "flight_end": "2026-12-31",
+      "notes": [
+        {
+          "text": "Budget $15,010.80 CAD (account in CAD), hard cap through 12/31; overspend lands on V9's card. Flight starts 11/16, the day 'V9 - Edmonton Special Projects - Search' was enabled. This is PCL's own corporate account, so PCL's in-house campaigns (Recruitment etc., run by ctritz@pcl.com) also spend here and are NOT part of the V9 budget.",
+          "added": "2026-11-20",
+          "expires": "2026-12-20"
+        }
+      ]
     }
   },
   "meta": {
@@ -399,6 +413,12 @@
           "expires": "2026-12-03"
         }
       ]
+    },
+    "act_711993740163670": {
+      "name": "PCL Construction",
+      "budget": 6000,
+      "flight_start": "2026-11-20",
+      "flight_end": "2026-12-31"
     }
   },
   "stackadapt": {},
