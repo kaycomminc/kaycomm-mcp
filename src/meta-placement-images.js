@@ -49,7 +49,11 @@ async function fetchMetaImage(url, fetcher) {
   }
   return Buffer.concat(chunks);
 }
-function placementCreative(source, variants, hashes) {
+const CTA_OVERRIDES = ['LEARN_MORE', 'SHOP_NOW', 'SIGN_UP', 'APPLY_NOW', 'BUY_TICKETS', 'BOOK_NOW', 'BOOK_TRAVEL', 'CONTACT_US', 'GET_OFFER', 'NO_BUTTON'];
+// ctaOverride: Meta rejects some CTAs in PLACEMENT asset feeds that it accepts on
+// single-image ads (e.g. BOOK_NOW on OUTCOME_SALES, subcode 1885396).
+function placementCreative(source, variants, hashes, ctaOverride) {
+  if (ctaOverride !== undefined && !CTA_OVERRIDES.includes(ctaOverride)) throw new Error(`cta must be one of ${CTA_OVERRIDES.join(', ')}.`);
   const creative = buildImageEnhancementCreative(source, { image_auto_crop: 'OPT_OUT' });
   const link = source.object_story_spec.link_data;
   const supported = new Set(['image_hash', 'link', 'message', 'name', 'description', 'caption', 'call_to_action', 'image_crops']);
@@ -86,7 +90,7 @@ function placementCreative(source, variants, hashes) {
     bodies: [{ text: link.message }], titles: [{ text: link.name }],
     descriptions: [{ text: link.description || '' }],
     link_urls: [{ website_url: link.link, ...(link.caption ? { display_url: link.caption } : {}) }],
-    call_to_action_types: [cta.type], asset_customization_rules: rules,
+    call_to_action_types: [ctaOverride || cta.type], asset_customization_rules: rules,
   };
   creative.contextual_multi_ads = { enroll_status: 'OPT_OUT' };
   creative.name = `${source.name || source.id} - placement sizes`.slice(0, 255);
@@ -95,7 +99,7 @@ function placementCreative(source, variants, hashes) {
 async function preparePlacementImages(args, deps) {
   const variants = validateVariants(args.variants);
   const source = await deps.get(args.creative_id, { fields: 'id,name,object_story_id,object_story_spec,instagram_user_id,asset_feed_spec,url_tags,degrees_of_freedom_spec,image_crops,authorization_category,applink_treatment,link_deep_link_url,product_set_id' });
-  const plan = placementCreative(source, variants, variants.map(v => v.image_hash || `<new image: ${v.label}>`));
+  const plan = placementCreative(source, variants, variants.map(v => v.image_hash || `<new image: ${v.label}>`), args.cta);
   const hash = source.object_story_spec.link_data.image_hash;
   const library = await deps.get(`${deps.accountId}/adimages`, { hashes: JSON.stringify([...new Set([hash, ...variants.map(v => v.image_hash).filter(Boolean)])]), fields: 'hash,url,width,height' });
   const original = library.data?.find(x => x.hash === hash);
@@ -124,7 +128,7 @@ async function preparePlacementImages(args, deps) {
       if (!image?.hash) throw new Error('Image upload returned no hash.');
       result.uploaded_images.push({ hash: image.hash, url: image.url ?? null, width: variants[i].width, height: variants[i].height, placements: variants[i].placements });
     }
-    const created = await deps.post(`${deps.accountId}/adcreatives`, placementCreative(source, variants, result.uploaded_images.map(x => x.hash)));
+    const created = await deps.post(`${deps.accountId}/adcreatives`, placementCreative(source, variants, result.uploaded_images.map(x => x.hash), args.cta));
     if (!created.id) throw new Error('Creative creation returned no ID.');
     result.creative_id = created.id;
     const readback = await deps.get(created.id, { fields: 'id,asset_feed_spec,degrees_of_freedom_spec,contextual_multi_ads' });
@@ -143,4 +147,4 @@ async function preparePlacementImages(args, deps) {
   }
   return result;
 }
-module.exports = { PLACEMENTS, validateVariants, resizePlacementImage, fetchMetaImage, placementCreative, preparePlacementImages };
+module.exports = { PLACEMENTS, CTA_OVERRIDES,validateVariants, resizePlacementImage, fetchMetaImage, placementCreative, preparePlacementImages };

@@ -8646,7 +8646,7 @@ function makeServer() {
                                             description:  { type: "string", description: "Short description / link description" },
                                             cta: {
                                                 type: "string",
-                                                enum: ["LEARN_MORE", "SHOP_NOW", "SIGN_UP", "APPLY_NOW", "BUY_TICKETS", "BOOK_NOW", "CONTACT_US", "GET_OFFER", "NO_BUTTON"],
+                                                enum: ["LEARN_MORE", "SHOP_NOW", "SIGN_UP", "APPLY_NOW", "BUY_TICKETS", "BOOK_NOW", "BOOK_TRAVEL", "CONTACT_US", "GET_OFFER", "NO_BUTTON"],
                                                 description: "Call-to-action button (default: LEARN_MORE)",
                                             },
                                             url:        { type: "string", description: "Destination URL" },
@@ -8665,7 +8665,7 @@ function makeServer() {
                                                     titles:       { type: "array", items: { type: "string" }, description: "Headlines (max 5)" },
                                                     descriptions: { type: "array", items: { type: "string" }, description: "Link descriptions (max 5)" },
                                                     link_urls:    { type: "array", items: { type: "string" }, description: "Destination URLs (usually one). Defaults to the ad's url." },
-                                                    call_to_action_types: { type: "array", items: { type: "string", enum: ["LEARN_MORE", "SHOP_NOW", "SIGN_UP", "APPLY_NOW", "BUY_TICKETS", "BOOK_NOW", "CONTACT_US", "GET_OFFER", "GET_QUOTE", "SUBSCRIBE", "DOWNLOAD", "ORDER_NOW", "NO_BUTTON"] }, description: "CTA buttons (max 5). Defaults to the ad's cta." },
+                                                    call_to_action_types: { type: "array", items: { type: "string", enum: ["LEARN_MORE", "SHOP_NOW", "SIGN_UP", "APPLY_NOW", "BUY_TICKETS", "BOOK_NOW", "BOOK_TRAVEL", "CONTACT_US", "GET_OFFER", "GET_QUOTE", "SUBSCRIBE", "DOWNLOAD", "ORDER_NOW", "NO_BUTTON"] }, description: "CTA buttons (max 5). Defaults to the ad's cta." },
                                                     ad_formats:   { type: "array", items: { type: "string", enum: metaBuild.AD_FORMATS }, description: "Default: SINGLE_IMAGE for images, SINGLE_VIDEO for videos, AUTOMATIC_FORMAT for both." },
                                                 },
                                             },
@@ -8692,7 +8692,7 @@ function makeServer() {
                                                         image_hash:  { type: "string", description: "Image hash from the Media Library" },
                                                         headline:    { type: "string" },
                                                         description: { type: "string" },
-                                                        cta:         { type: "string", enum: ["LEARN_MORE", "SHOP_NOW", "SIGN_UP", "APPLY_NOW", "BUY_TICKETS", "BOOK_NOW", "CONTACT_US", "GET_OFFER", "NO_BUTTON"] },
+                                                        cta:         { type: "string", enum: ["LEARN_MORE", "SHOP_NOW", "SIGN_UP", "APPLY_NOW", "BUY_TICKETS", "BOOK_NOW", "BOOK_TRAVEL", "CONTACT_US", "GET_OFFER", "NO_BUTTON"] },
                                                         url:         { type: "string" },
                                                     },
                                                     required: ["image_hash"],
@@ -8731,6 +8731,7 @@ function makeServer() {
                             padding: { type: "integer", minimum: 0, description: "Inset all artwork by this many output pixels on every edge." }
                         }, required: ["width", "height", "placements"]
                     } },
+                    cta: { type: "string", enum: require('./src/meta-placement-images').CTA_OVERRIDES, description: "Override the source creative's CTA in the placement creative. Use BOOK_TRAVEL when the source uses BOOK_NOW on a Sales campaign — Meta rejects BOOK_NOW in placement asset feeds there." },
                     confirm: { type: "boolean" }
                 }, required: ["account_name", "creative_id", "variants"]
             }

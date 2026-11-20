@@ -107,3 +107,9 @@ test('Instagram identity returned as a top-level creative field is carried into 
   assert.deepEqual(creative.object_story_spec, { page_id: '1', instagram_user_id: '17841464743844550' });
   assert.equal(creative.instagram_user_id, undefined);
 });
+test('cta override replaces the source CTA in the placement feed and rejects unknown CTAs', () => {
+  const bookNow = { ...source, object_story_spec: { ...source.object_story_spec, link_data: { ...source.object_story_spec.link_data, call_to_action: { type: 'BOOK_NOW' } } } };
+  assert.deepEqual(placementCreative(bookNow, validateVariants(variants), ['feed', 'story']).asset_feed_spec.call_to_action_types, ['BOOK_NOW']);
+  assert.deepEqual(placementCreative(bookNow, validateVariants(variants), ['feed', 'story'], 'BOOK_TRAVEL').asset_feed_spec.call_to_action_types, ['BOOK_TRAVEL']);
+  assert.throws(() => placementCreative(bookNow, validateVariants(variants), ['feed', 'story'], 'BOGUS'));
+});
