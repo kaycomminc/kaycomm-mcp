@@ -343,11 +343,11 @@
       "name": "PCL Construction",
       "budget": 15010.8,
       "mcc": "7631184147",
-      "flight_start": "2026-11-16",
+      "flight_start": "2026-11-17",
       "flight_end": "2026-12-31",
       "notes": [
         {
-          "text": "Budget $15,010.80 CAD (account in CAD), hard cap through 12/31; overspend lands on V9's card. Flight starts 11/16, the day 'V9 - Edmonton Special Projects - Search' was enabled. This is PCL's own corporate account, so PCL's in-house campaigns (Recruitment etc., run by ctritz@pcl.com) also spend here and are NOT part of the V9 budget.",
+          "text": "Budget $15,010.80 CAD (account in CAD), hard cap through 12/31; overspend lands on V9's card. Flight starts 11/17 (per Jason 11/20). Only 'V9 - Edmonton Special Projects - Search' ($357/day) is ours. This is PCL's own corporate account, so PCL's in-house campaigns (Recruitment, Secondary Markets, Insights Display etc., run by ctritz@pcl.com) also spend here and are NOT part of the V9 budget — account-level flight spend and current_daily_budget include them, so judge pacing on the V9 campaign.",
           "added": "2026-11-20",
           "expires": "2026-12-20"
         }
@@ -432,8 +432,15 @@
     "act_711993740163670": {
       "name": "PCL Construction",
       "budget": 6000,
-      "flight_start": "2026-11-20",
-      "flight_end": "2026-12-31"
+      "flight_start": "2026-11-17",
+      "flight_end": "2026-12-31",
+      "notes": [
+        {
+          "text": "Flight 11/17–12/31 (per Jason 11/20), $6,000 CAD lifetime, hard cap. Only 'V9 - Edmonton Special Projects - Meta' (120249446930290532, built PAUSED; Liza adds funds and launches) is ours. PCL's in-house Meta campaigns also run in this ad account and are NOT part of the V9 budget.",
+          "added": "2026-11-20",
+          "expires": "2026-12-31"
+        }
+      ]
     }
   },
   "stackadapt": {},
