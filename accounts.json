@@ -325,6 +325,11 @@
           "text": "YouTube flight start moved up from 11/15 to 11/8 (set in Ads UI by Jason, 2026-11-08); campaigns ENABLED. Earlier note saying 'live ~11/15' is superseded.",
           "added": "2026-11-08",
           "expires": "2026-12-08"
+        },
+        {
+          "text": "11/20: YouTube 6s split into own campaigns (EN 6s $300, ES 6s $100 total, 11/21-12/31); originals now 15s-only at EN $1,800 / ES $800. Total still $3K net. 120K guarantee = completed :15 views only; check get_campaign_performance segment_by=ad_group est_completed_views on the 15s groups.",
+          "added": "2026-11-20",
+          "expires": "2026-12-31"
         }
       ],
       "cpv_goal": 0.025

@@ -2649,6 +2649,62 @@ async function fetchGoogleCampaignPerf(token, customerId, mccId, dateRange, star
     const allConvs     = segmentBy === "all_conversion_action";
     const byConvAction = segmentBy === "conversion_action" || allConvs;
 
+    if (segmentBy === "ad_group") {
+        const [rows, videoRows] = await Promise.all([
+            googleSearch(token, customerId, mccId, `
+                SELECT campaign.name, campaign.status, campaign.advertising_channel_type,
+                       ad_group.id, ad_group.name, ad_group.status,
+                       metrics.cost_micros, metrics.impressions, metrics.clicks,
+                       metrics.conversions, metrics.conversions_value
+                FROM ad_group
+                WHERE segments.date ${dateClause}
+                  AND metrics.impressions > 0
+                ORDER BY metrics.cost_micros DESC`),
+            googleSearch(token, customerId, mccId, `
+                SELECT ad_group.id, ${VIDEO_METRIC_FIELDS}
+                FROM ad_group
+                WHERE segments.date ${dateClause}
+                  AND campaign.advertising_channel_type = 'VIDEO'
+                  AND metrics.impressions > 0`).catch(() => []),
+        ]);
+        const videoAgg = {};
+        for (const r of videoRows) {
+            const id = r.adGroup.id;
+            addVideoAgg(videoAgg[id] || (videoAgg[id] = emptyVideoAgg()), r.metrics);
+        }
+        return rows.map(r => {
+            const m      = r.metrics;
+            const spend  = parseInt(m.costMicros || 0) / 1_000_000;
+            const impr   = parseInt(m.impressions || 0);
+            const clicks = parseInt(m.clicks || 0);
+            const convs  = parseFloat(m.conversions || 0);
+            const val    = parseFloat(m.conversionsValue || 0);
+            const out = {
+                campaign:        r.campaign.name,
+                campaign_status: r.campaign.status,
+                type:            r.campaign.advertisingChannelType,
+                ad_group:        r.adGroup.name,
+                ad_group_id:     r.adGroup.id,
+                status:          r.adGroup.status,
+                spend:           Math.round(spend * 100) / 100,
+                impressions:     impr,
+                clicks,
+                ctr:             impr > 0 ? (clicks / impr * 100).toFixed(2) + "%" : "0.00%",
+                avg_cpc:         clicks > 0 ? "$" + (spend / clicks).toFixed(2) : null,
+                conversions:     convs,
+                conv_value:      Math.round(val * 100) / 100,
+                cpa:             convs > 0 ? Math.round(spend / convs * 100) / 100 : null,
+            };
+            const v = videoAgg[r.adGroup.id];
+            if (v) {
+                Object.assign(out, shapeVideoAgg(v, spend));
+                // Impressions that played to 100% (Google's p100 rate x impressions).
+                out.est_completed_views = Math.round(v.q100);
+            }
+            return out;
+        });
+    }
+
     if (byConvAction) {
         const convMetric = allConvs ? "all_conversions" : "conversions";
         const [rows, primary] = await Promise.all([
@@ -6928,8 +6984,8 @@ function makeServer() {
                     end_date:   { type: "string", description: "End date YYYY-MM-DD (only with CUSTOM)" },
                     segment_by: {
                         type: "string",
-                        description: "Optional segmentation (Google only). 'conversion_action' breaks out conversions and conv_value by individual conversion action per campaign — primary (bidding) actions only. 'all_conversion_action' uses all_conversions instead, so secondary actions (retailer click-outs, GA4 events, etc.) are included, each flagged primary true/false.",
-                        enum: ["conversion_action", "all_conversion_action"],
+                        description: "Optional segmentation (Google only). 'ad_group' returns one row per ad group (campaign, ad_group, spend, impressions, clicks, CTR, CPC, conversions, CPA); VIDEO ad groups also get views, view_rate, avg_cpv, cpv, quartile rates and est_completed_views (impressions that played to 100%). 'conversion_action' breaks out conversions and conv_value by individual conversion action per campaign — primary (bidding) actions only. 'all_conversion_action' uses all_conversions instead, so secondary actions (retailer click-outs, GA4 events, etc.) are included, each flagged primary true/false.",
+                        enum: ["ad_group", "conversion_action", "all_conversion_action"],
                     },
                 },
                 required: ["account_name"],
