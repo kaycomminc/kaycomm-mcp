@@ -74,6 +74,8 @@ const API_VERSION_INFO = {
 //                health? (object of threshold overrides, or false to exclude from health checks),
 //                cpv_goal? (number, $ per view — get_google_pacing shows VIDEO-campaign CPV vs goal)
 // Meta fields:   name, budget, budget_schedule?, flight_start?, flight_end?, health?
+// Both:          campaign_prefix? (string) - pacing counts only campaigns whose name starts with it
+//                (shared client accounts where in-house campaigns also spend)
 // Both:          inactive? ("<reason>" skips API calls), notes? [{text, added, expires?}]
 //                — notes are the shared "known context" every routine reads via
 //                manage_accounts action=context, so status lives here, not in prompts.
@@ -116,7 +118,7 @@ const BUILTIN_HEALTH_DEFAULTS = {
 const KNOWN_ACCOUNT_KEYS = new Set([
     "name", "budget", "mcc", "nc_budget", "ga4", "health", "refresh_token_env",
     "flight_start", "flight_end", "budget_schedule", "campaign_budgets",
-    "page_id", "instagram_account_id", "inactive", "notes", "cpv_goal",
+    "page_id", "instagram_account_id", "inactive", "notes", "cpv_goal", "campaign_prefix",
 ]);
 
 // Per-account health overrides beyond BUILTIN_HEALTH_DEFAULTS that
@@ -252,7 +254,7 @@ function manageAccounts(args) {
             } else {
                 const entry = { name: args.name, budget: args.budget };
                 if (platform === "google") entry.mcc = args.mcc || id;
-                for (const f of ["ga4", "nc_budget", "flight_start", "flight_end", "budget_schedule", "campaign_budgets", "health", "page_id", "cpv_goal"]) {
+                for (const f of ["ga4", "nc_budget", "flight_start", "flight_end", "budget_schedule", "campaign_budgets", "health", "page_id", "cpv_goal", "campaign_prefix"]) {
                     if (args[f] != null) entry[f] = args[f];
                 }
                 if (!confirm) {
@@ -269,7 +271,7 @@ function manageAccounts(args) {
                 result = { error: `${id} not found in ${platform} accounts.`, available: Object.entries(store).map(([k, a]) => `${k} (${a.name})`) };
             } else {
                 const changes = {};
-                for (const f of ["name", "budget", "mcc", "ga4", "nc_budget", "flight_start", "flight_end", "budget_schedule", "campaign_budgets", "health", "page_id", "cpv_goal"]) {
+                for (const f of ["name", "budget", "mcc", "ga4", "nc_budget", "flight_start", "flight_end", "budget_schedule", "campaign_budgets", "health", "page_id", "cpv_goal", "campaign_prefix"]) {
                     if (args[f] != null) changes[f] = args[f];
                 }
                 if (args.inactive != null) changes.inactive = args.inactive || null;
@@ -381,6 +383,7 @@ function buildAccountContext(stores, today, rules = []) {
             if (info.budget != null) row.budget = getEffectiveBudget(info, today).budget;
             if (info.flight_start) row.flight = `${info.flight_start} → ${info.flight_end || "?"}`;
             if (info.campaign_budgets?.length) row.campaign_budgets = info.campaign_budgets.map(c => `${c.label}: $${c.budget}/mo`);
+            if (info.campaign_prefix) row.campaign_scope = `paces only campaigns starting "${info.campaign_prefix}"`;
             if (info.inactive) row.inactive = typeof info.inactive === "string" ? info.inactive : true;
             if (info.health === false) row.health_check = "excluded";
             entry.platforms.push(row);
@@ -823,12 +826,18 @@ async function googleSearch(token, customerId, mccId, query) {
     return results;
 }
 
-async function fetchGoogleMTD(token, customerId, mccId, monthStart, yesterday) {
+// campaign_prefix scope: an account entry with `campaign_prefix` (e.g. "V9 - ")
+// paces only campaigns whose name starts with it — for shared client accounts
+// where the client's in-house campaigns spend alongside ours.
+const inCampaignScope = (name, prefix) => !prefix || String(name || "").startsWith(prefix);
+
+async function fetchGoogleMTD(token, customerId, mccId, monthStart, yesterday, prefix = null) {
     // Pull spend from 1st of month through yesterday (complete days only — excludes today's partial data)
     try {
         const rows = await googleSearch(token, customerId, mccId,
-            `SELECT metrics.cost_micros FROM campaign WHERE segments.date BETWEEN '${monthStart}' AND '${yesterday}'`);
-        const micros = rows.reduce((sum, r) => sum + parseInt(r?.metrics?.costMicros || 0), 0);
+            `SELECT campaign.name, metrics.cost_micros FROM campaign WHERE segments.date BETWEEN '${monthStart}' AND '${yesterday}'`);
+        const micros = rows.filter(r => inCampaignScope(r?.campaign?.name, prefix))
+            .reduce((sum, r) => sum + parseInt(r?.metrics?.costMicros || 0), 0);
         return { spend: micros / 1_000_000, error: null };
     } catch (e) {
         return { spend: null, error: e.message };
@@ -856,7 +865,7 @@ async function fetchGoogleMTDbyNC(token, customerId, mccId, monthStart, yesterda
 
 // Sum of enabled campaigns' daily budgets, deduped by budget resource so shared
 // budgets count once. NC split follows the same rule as fetchGoogleMTDbyNC.
-async function fetchGoogleDailyBudgets(token, customerId, mccId) {
+async function fetchGoogleDailyBudgets(token, customerId, mccId, prefix = null) {
     const rows = await googleSearch(token, customerId, mccId, `
         SELECT campaign.name, campaign.advertising_channel_type, campaign.end_date_time,
                campaign_budget.resource_name, campaign_budget.amount_micros
@@ -870,6 +879,7 @@ async function fetchGoogleDailyBudgets(token, customerId, mccId) {
     for (const row of rows) {
         const end = row.campaign?.endDateTime;
         if (end && end.slice(0, 10) < today) continue;
+        if (!inCampaignScope(row.campaign?.name, prefix)) continue;
         campaigns++;
         const res = row.campaignBudget?.resourceName;
         if (res && seen.has(res)) continue;
@@ -883,8 +893,21 @@ async function fetchGoogleDailyBudgets(token, customerId, mccId) {
 }
 
 // ── Meta API ──────────────────────────────────────────────────────────────────
-async function fetchMetaMTD(accountId, monthStart, yesterday) {
+async function fetchMetaMTD(accountId, monthStart, yesterday, prefix = null) {
     // Pull spend from 1st of month through yesterday (complete days only)
+    if (prefix) {
+        try {
+            const rows = await metaGetAll(`${accountId}/insights`, {
+                fields: "campaign_name,spend", level: "campaign", limit: 500,
+                time_range: JSON.stringify({ since: monthStart, until: yesterday }),
+            });
+            const spend = rows.filter(r => inCampaignScope(r.campaign_name, prefix))
+                .reduce((sum, r) => sum + parseFloat(r.spend || 0), 0);
+            return { spend, error: null };
+        } catch (e) {
+            return { spend: null, error: e.message };
+        }
+    }
     const params = new URLSearchParams({
         access_token: META_ACCESS_TOKEN,
         fields: "spend",
@@ -916,25 +939,30 @@ function metaLifetimeDailyEquivalent(lifetimeBudgetCents, lifetimeSpend, end, no
 // budget / days left) and counted too, so an account running on lifetime
 // budgets doesn't read as $0/day. `lifetime_converted` is false when any of
 // them couldn't be converted; callers then keep the reduced-confidence wording.
-async function fetchMetaDailyBudgets(accountId) {
+async function fetchMetaDailyBudgets(accountId, prefix = null) {
     const [camps, adsets] = await Promise.all([
         // metaGetAll follows Graph's paging.next cursor. A single metaGet here
         // silently dropped campaigns/ad sets after the first page and could
         // turn an under-counted current budget into a misleading RAISE.
-        metaGetAll(`${accountId}/campaigns`, { fields: "id,effective_status,daily_budget,lifetime_budget,stop_time", limit: 200 }),
+        metaGetAll(`${accountId}/campaigns`, { fields: "id,name,effective_status,daily_budget,lifetime_budget,stop_time", limit: 200 }),
         metaGetAll(`${accountId}/adsets`,    { fields: "id,campaign_id,effective_status,daily_budget,lifetime_budget,end_time", limit: 500 }),
     ]);
     let daily = 0;
     const lifetime = [];
     const campHasBudget = new Set();
+    // Out-of-scope campaigns (campaign_prefix) and their ad sets are skipped.
+    const outOfScope = new Set(camps.filter(c => !inCampaignScope(c.name, prefix)).map(c => c.id));
     for (const c of camps) {
+        if (outOfScope.has(c.id)) continue;
         if (c.effective_status !== "ACTIVE" || metaEnded(c.stop_time)) continue;
         if (c.daily_budget)    { daily += parseInt(c.daily_budget) / 100; campHasBudget.add(c.id); }
         if (c.lifetime_budget) { lifetime.push({ id: c.id, budget: c.lifetime_budget, end: c.stop_time }); campHasBudget.add(c.id); }
     }
     for (const s of adsets) {
         if (s.effective_status !== "ACTIVE" || metaEnded(s.end_time)) continue;
-        if (campHasBudget.has(s.campaign_id)) continue;
+        if (campHasBudget.has(s.campaign_id) || outOfScope.has(s.campaign_id)) continue;
+        // With a prefix, an ad set whose campaign wasn't returned can't be scoped — skip it.
+        if (prefix && !camps.some(c => c.id === s.campaign_id)) continue;
         if (s.daily_budget)    daily += parseInt(s.daily_budget) / 100;
         if (s.lifetime_budget) lifetime.push({ id: s.id, budget: s.lifetime_budget, end: s.end_time });
     }
@@ -1340,18 +1368,19 @@ async function buildGoogleRowCore(defaultToken, pace_dom, dim, today, monthStart
             token = t;
         }
         const { budget, nc_budget } = getEffectiveBudget(info, today);
-        const budgetsPromise = budgetFetchState(() => fetchGoogleDailyBudgets(token, cid, info.mcc));
+        const budgetsPromise = budgetFetchState(() => fetchGoogleDailyBudgets(token, cid, info.mcc, info.campaign_prefix));
 
         if (info.flight_start && info.flight_end) {
             // Flight-based budget: spend over the flight window, paced against flight days
             const until = yesterday < info.flight_end ? yesterday : info.flight_end;
             const [{ spend, error }, budgetState] = await Promise.all([
                 emptyWindow(info.flight_start, until) ? { spend: 0, error: null }
-                    : fetchGoogleMTD(token, cid, info.mcc, info.flight_start, until), budgetsPromise]);
+                    : fetchGoogleMTD(token, cid, info.mcc, info.flight_start, until, info.campaign_prefix), budgetsPromise]);
             if (error) return { account: info.name, error };
             const tolerance = getHealthConfig(info)?.pacing_tolerance_pct ?? PACING_TOLERANCE_PCT;
             const pacing = getFlightPacing(spend, budget, info.flight_start, info.flight_end, yesterday, tolerance);
             const row = { account: info.name, flight_spend: Math.round(spend * 100) / 100, ...pacing };
+            if (info.campaign_prefix) row.campaign_scope = `only campaigns starting "${info.campaign_prefix}"`;
             const { budgets, budgetError } = budgetState;
             if (budgetError) row.daily_budget_error = budgetError;
             else if (budgets && pacing.days_remaining > 0) {
@@ -1390,7 +1419,7 @@ async function buildGoogleRowCore(defaultToken, pace_dom, dim, today, monthStart
 
         const [{ spend, error }, budgetState] = await Promise.all([
             emptyWindow(monthStart, yesterday) ? { spend: 0, error: null }
-                : fetchGoogleMTD(token, cid, info.mcc, monthStart, yesterday), budgetsPromise]);
+                : fetchGoogleMTD(token, cid, info.mcc, monthStart, yesterday, info.campaign_prefix), budgetsPromise]);
         if (error) return { account: info.name, error };
         const tolerance = getHealthConfig(info)?.pacing_tolerance_pct ?? PACING_TOLERANCE_PCT;
         const row = {
@@ -1422,18 +1451,19 @@ async function buildGoogleRows(defaultToken, pace_dom, dim, today, monthStart, y
 async function buildMetaRow(pace_dom, dim, today, monthStart, yesterday, id, info) {
         if (info.inactive) return skippedRow(info);
         const { budget } = getEffectiveBudget(info, today);
-        const budgetsPromise = budgetFetchState(() => fetchMetaDailyBudgets(id));
+        const budgetsPromise = budgetFetchState(() => fetchMetaDailyBudgets(id, info.campaign_prefix));
 
         if (info.flight_start && info.flight_end) {
             // Flight-based budget: spend over the flight window, paced against flight days
             const until = yesterday < info.flight_end ? yesterday : info.flight_end;
             const [{ spend, error }, budgetState] = await Promise.all([
                 emptyWindow(info.flight_start, until) ? { spend: 0, error: null }
-                    : fetchMetaMTD(id, info.flight_start, until), budgetsPromise]);
+                    : fetchMetaMTD(id, info.flight_start, until, info.campaign_prefix), budgetsPromise]);
             if (error) return { account: info.name, error };
             const tolerance = getHealthConfig(info)?.pacing_tolerance_pct ?? PACING_TOLERANCE_PCT;
             const pacing = getFlightPacing(spend, budget, info.flight_start, info.flight_end, yesterday, tolerance);
             const row = { account: info.name, flight_spend: Math.round(spend * 100) / 100, ...pacing };
+            if (info.campaign_prefix) row.campaign_scope = `only campaigns starting "${info.campaign_prefix}"`;
             const { budgets, budgetError } = budgetState;
             if (budgetError) row.daily_budget_error = budgetError;
             else if (budgets?.complete && pacing.days_remaining > 0) {
@@ -1444,7 +1474,7 @@ async function buildMetaRow(pace_dom, dim, today, monthStart, yesterday, id, inf
 
         const [{ spend, error }, budgetState] = await Promise.all([
             emptyWindow(monthStart, yesterday) ? { spend: 0, error: null }
-                : fetchMetaMTD(id, monthStart, yesterday), budgetsPromise]);
+                : fetchMetaMTD(id, monthStart, yesterday, info.campaign_prefix), budgetsPromise]);
         if (error) return { account: info.name, error };
         const tolerance = getHealthConfig(info)?.pacing_tolerance_pct ?? PACING_TOLERANCE_PCT;
         const row = {
@@ -7443,6 +7473,7 @@ function makeServer() {
                     page_id:  { type: "string", pattern: "^[0-9]+$", description: "Meta only: Facebook Page ID ads run as (used by create_meta_campaign and manage_meta_leads). Can be set from the cloud server." },
                     nc_budget: { type: "number", description: "Google only: NC sub-budget (Boulevard Carroll pattern)" },
                     cpv_goal:  { type: "number", description: "Google only: CPV goal in $ per view (e.g. 0.025) for YouTube/VIDEO accounts — get_google_pacing shows actual CPV vs this goal" },
+                    campaign_prefix: { type: "string", description: "Google or Meta: pace only campaigns whose name starts with this text (e.g. 'V9 - '), for shared client accounts where in-house campaigns also spend. Applies to spend, current daily budgets and health-check pacing drift. Pass \"\" to clear." },
                     flight_start: { type: "string", description: "YYYY-MM-DD — set with flight_end for flight-based pacing instead of monthly" },
                     flight_end:   { type: "string", description: "YYYY-MM-DD — last day of the flight" },
                     budget_schedule: {
@@ -13025,7 +13056,7 @@ async function dispatchToolCall(name, args = {}) {
                     // MTD spend comes from its own query (same as get_full_pacing): batchRows
                     // only reaches back 8 days and excludes paused/removed campaigns.
                     const { spend: mtdSpend, error: mtdErr } = (monthlyBudget > 0 && !isFlight && pace_dom > 0)
-                        ? await fetchGoogleMTD(token, cid, gAcct.mcc, month_start, yesterday)
+                        ? await fetchGoogleMTD(token, cid, gAcct.mcc, month_start, yesterday, gAcct.campaign_prefix)
                         : { spend: null, error: null };
                     if (mtdErr) errors.push(`${gAcct.name} (Google) pacing: ${mtdErr}`);
                     if (monthlyBudget > 0 && !isFlight && pace_dom > 0 && mtdSpend != null) {
@@ -13383,7 +13414,7 @@ async function dispatchToolCall(name, args = {}) {
                     // Pacing drift (Meta) — flight accounts pace in get_full_pacing, not
                     // monthly; skipped on the 1st — no complete days to project from yet
                     if (metaBudget > 0 && !isFlight && pace_dom > 0) {
-                        const { spend, error: spendErr } = await fetchMetaMTD(metaId, month_start, yesterday);
+                        const { spend, error: spendErr } = await fetchMetaMTD(metaId, month_start, yesterday, mAcct.campaign_prefix);
                         if (!spendErr && spend != null) {
                             const budget = metaBudget;
                             const projected = pace_dom > 0 ? Math.round((spend / pace_dom) * dim * 100) / 100 : spend;
@@ -15095,6 +15126,7 @@ module.exports = {
     clampTopN, shapeAgg, emptyAgg, addAgg, mergeAgg, listingCaseValueLabel, SHOPPING_GROUP_DIMENSIONS,
     buildPmaxChannelReport, pmaxChannelName,
     matchByName, skippedRow, partitionSkipped, reportingPeriod, selectDetailAccounts, fetchMetaDailyBudgets, metaLifetimeDailyEquivalent,
+    fetchMetaMTD, fetchGoogleDailyBudgets, inCampaignScope,
     resolveAccount, buildAccountContext, addDays,
     collectPolicyViolations, googleAdsError, createGoogleCampaignFull, addKeywordsToAdGroup,
     buildCampaignBudgetLines,

@@ -351,7 +351,8 @@
           "added": "2026-11-20",
           "expires": "2026-12-20"
         }
-      ]
+      ],
+      "campaign_prefix": "V9 - "
     }
   },
   "meta": {
@@ -439,6 +440,21 @@
           "text": "Flight 11/17–12/31 (per Jason 11/20), $6,000 CAD lifetime, hard cap. Only 'V9 - Edmonton Special Projects - Meta' (120249446930290532, built PAUSED; Liza adds funds and launches) is ours. PCL's in-house Meta campaigns also run in this ad account and are NOT part of the V9 budget.",
           "added": "2026-11-20",
           "expires": "2026-12-31"
+        }
+      ],
+      "campaign_prefix": "V9 - "
+    },
+    "act_2103614670289271": {
+      "name": "Charlie's Soap",
+      "budget": 2557,
+      "flight_start": "2026-11-23",
+      "flight_end": "2026-11-30",
+      "page_id": "64218964971",
+      "notes": [
+        {
+          "text": "2026-11-20 BFCM build, ALL PAUSED (not client-approved): 'CS | BFCM26 | Initial Awareness' 120257038893260102 (Reach, 11/23–11/26, $179 Amazon 43 states+DC → storefront / $178 onsite 7 states → /our-products/); 'CS | BFCM26 | Amazon Traffic' 120257038885830102 ($1,100, 11/27–11/30, 4 product ads w/ Amazon Attribution FB tags, 7 onsite states excluded); 'CS | BFCM26 | Website Conversions' 120257038879800102 ($1,100, 11/27–11/30, onsite 7 states, Purchase on PLACEHOLDER CS Marketing Pixel 1172678468942373 — site actually fires pixel 880102250915612 which we can't access; duplicate/swap if client wants that one). Split follows doc's $1,100/$1,100 allocation, pending Liza confirm (doc also says $1,650/$550).",
+          "added": "2026-11-20",
+          "expires": "2026-12-05"
         }
       ]
     }
