@@ -858,13 +858,18 @@ async function fetchGoogleMTDbyNC(token, customerId, mccId, monthStart, yesterda
 // budgets count once. NC split follows the same rule as fetchGoogleMTDbyNC.
 async function fetchGoogleDailyBudgets(token, customerId, mccId) {
     const rows = await googleSearch(token, customerId, mccId, `
-        SELECT campaign.name, campaign.advertising_channel_type,
+        SELECT campaign.name, campaign.advertising_channel_type, campaign.end_date_time,
                campaign_budget.resource_name, campaign_budget.amount_micros
         FROM campaign
         WHERE campaign.status = 'ENABLED'`);
+    // An ENABLED campaign whose end date has passed can't spend, so its budget
+    // must not count toward the daily total.
+    const today = getDateInfo().today;
     const seen = new Set();
     let total = 0, nc = 0, campaigns = 0;
     for (const row of rows) {
+        const end = row.campaign?.endDateTime;
+        if (end && end.slice(0, 10) < today) continue;
         campaigns++;
         const res = row.campaignBudget?.resourceName;
         if (res && seen.has(res)) continue;
