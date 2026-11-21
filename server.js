@@ -2673,6 +2673,76 @@ function shapeVideoAgg(a, spend = a.spend) {
     };
 }
 
+// ── Placements (YouTube / Display) ────────────────────────────────────────────
+// group_placement_view = channel/domain/app level; detail_placement_view = individual
+// YouTube videos and pages. Both carry video metrics, so VIDEO campaigns report views/CPV.
+const PLACEMENT_VIEWS = {
+    channel: { resource: "group_placement_view",  extra: "" },
+    detail:  { resource: "detail_placement_view", extra: ", detail_placement_view.group_placement_target_url" },
+};
+
+async function fetchPlacementPerformance(token, customerId, mccId, dateClause, view, campaignFilter, topN, minImpressions) {
+    const v = PLACEMENT_VIEWS[view];
+    const nameClause = campaignFilter
+        ? `AND campaign.name LIKE '%${String(campaignFilter).replace(/[\\'%_]/g, c => "\\" + c)}%'`
+        : "";
+    const rows = await googleSearch(token, customerId, mccId, `
+        SELECT ${v.resource}.display_name, ${v.resource}.placement, ${v.resource}.placement_type,
+               ${v.resource}.target_url${v.extra},
+               ${VIDEO_METRIC_FIELDS}, metrics.clicks, metrics.conversions
+        FROM ${v.resource}
+        WHERE segments.date ${dateClause}
+          AND metrics.impressions > 0 ${nameClause}`);
+
+    // One row per placement per day-range; roll up by placement key.
+    const byKey = new Map();
+    const totals = { agg: emptyVideoAgg(), clicks: 0, conversions: 0 };
+    for (const r of rows) {
+        const p = r[v.resource === "group_placement_view" ? "groupPlacementView" : "detailPlacementView"] || {};
+        const key = p.placement || p.displayName || "(unknown)";
+        if (!byKey.has(key)) {
+            byKey.set(key, {
+                name: p.displayName || key, placement: key, type: p.placementType || null,
+                url: p.targetUrl || null,
+                ...(p.groupPlacementTargetUrl ? { channel_url: p.groupPlacementTargetUrl } : {}),
+                agg: emptyVideoAgg(), clicks: 0, conversions: 0,
+            });
+        }
+        const e = byKey.get(key);
+        addVideoAgg(e.agg, r.metrics || {});
+        addVideoAgg(totals.agg, r.metrics || {});
+        const c = parseInt(r.metrics?.clicks || 0), cv = parseFloat(r.metrics?.conversions || 0);
+        e.clicks += c; e.conversions += cv; totals.clicks += c; totals.conversions += cv;
+    }
+
+    const all = [...byKey.values()]
+        .filter(e => e.agg.impressions >= minImpressions)
+        .sort((a, b) => b.agg.spend - a.agg.spend);
+    const shown = all.slice(0, topN);
+    const shape = e => ({
+        spend:       Math.round(e.agg.spend * 100) / 100,
+        impressions: e.agg.impressions,
+        clicks:      e.clicks,
+        ctr:         e.agg.impressions > 0 ? (e.clicks / e.agg.impressions * 100).toFixed(2) + "%" : "0.00%",
+        conversions: Math.round(e.conversions * 100) / 100,
+        ...shapeVideoAgg(e.agg),
+    });
+    return {
+        placements: shown.map(e => ({
+            name: e.name, type: e.type, placement: e.placement, url: e.url,
+            ...(e.channel_url ? { channel_url: e.channel_url } : {}),
+            ...shape(e),
+        })),
+        totals: { ...shape(totals), placements_total: byKey.size },
+        returned: {
+            rows_returned:  shown.length,
+            rows_matching:  all.length,
+            truncated:      all.length > shown.length,
+            spend_returned: Math.round(shown.reduce((s, e) => s + e.agg.spend, 0) * 100) / 100,
+        },
+    };
+}
+
 async function fetchGoogleCampaignPerf(token, customerId, mccId, dateRange, startDate, endDate, segmentBy) {
     const dateClause = resolveGaqlDateClause(dateRange, startDate, endDate);
     // all_conversion_action uses all_conversions so secondary (non-bidding) actions show up too
@@ -8247,6 +8317,31 @@ function makeServer() {
             },
         },
         {
+            name: "get_placements",
+            description: "Where Google Ads (YouTube / Display / Demand Gen) ads actually showed — placement report. " +
+                "view=channel (default) rolls up to YouTube channel, website domain or app; view=detail lists individual YouTube videos and pages (with their parent channel URL). " +
+                "Returns spend, impressions, clicks, CTR, conversions, and for video: views, view_rate, avg_cpv, cpv, quartile_p25-p100 completion. Sorted by spend, capped by top_n. " +
+                "Use to spot junk placements (kids content, apps, MFA sites) or low-completion channels to exclude. PMax is not covered (use get_pmax_channel_performance).",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    account_name:  { type: "string", description: "Client name (partial match ok)" },
+                    campaign_name: { type: "string", description: "Campaign name filter (substring). Omit for all campaigns." },
+                    view:          { type: "string", enum: ["channel", "detail"], description: "channel (default) = channel/domain/app level; detail = individual videos/pages" },
+                    date_range: {
+                        type: "string",
+                        description: "THIS_MONTH (default), LAST_7_DAYS, LAST_30_DAYS, LAST_90_DAYS, LAST_MONTH, YEAR_TO_DATE, or CUSTOM (requires start_date + end_date)",
+                        enum: ["THIS_MONTH", "LAST_7_DAYS", "LAST_30_DAYS", "LAST_90_DAYS", "LAST_MONTH", "YEAR_TO_DATE", "CUSTOM"],
+                    },
+                    start_date:      { type: "string", description: "Start date YYYY-MM-DD (only with CUSTOM)" },
+                    end_date:        { type: "string", description: "End date YYYY-MM-DD (only with CUSTOM)" },
+                    top_n:           { type: "integer", description: "Max placements to return, by spend desc (default 50, max 500)" },
+                    min_impressions: { type: "integer", description: "Drop placements below this many impressions (default 0)" },
+                },
+                required: ["account_name"],
+            },
+        },
+        {
             name: "get_shopping_performance",
             description: "Product-level performance for Shopping and Performance Max retail campaigns, from shopping_performance_view. " +
                 "Group by item_id, title, product_type, brand, or custom_label_0-4 to find which products or merchandising buckets carry the spend and the return. " +
@@ -13595,6 +13690,36 @@ async function dispatchToolCall(name, args = {}) {
             }
         }
 
+    } else if (name === "get_placements") {
+        const search    = (args.account_name || "").toLowerCase();
+        const dateRange = args.date_range || "THIS_MONTH";
+        const view      = args.view || "channel";
+        const match     = Object.entries(GOOGLE_ACCOUNTS).find(([, i]) => i.name.toLowerCase().includes(search));
+        if (!match) {
+            result = { error: `No Google account found matching '${args.account_name}'` };
+        } else if (!PLACEMENT_VIEWS[view]) {
+            result = { error: `Unknown view '${view}'. Valid: ${Object.keys(PLACEMENT_VIEWS).join(", ")}.` };
+        } else if (dateRange === "CUSTOM" && !(args.start_date && args.end_date)) {
+            result = { error: "date_range CUSTOM requires both start_date and end_date (YYYY-MM-DD)." };
+        } else {
+            const [cid, info] = match;
+            const { token, error: authErr } = await getGoogleAccessToken(cid);
+            if (authErr) { result = { error: `Auth: ${authErr}` }; }
+            else {
+                try {
+                    const dateClause = resolveGaqlDateClause(dateRange, args.start_date, args.end_date);
+                    const minImpr = Math.max(0, parseInt(args.min_impressions, 10) || 0);
+                    const report = await fetchPlacementPerformance(token, cid, info.mcc, dateClause, view, args.campaign_name, clampTopN(args.top_n, 50), minImpr);
+                    result = {
+                        account: info.name, date_range: dateRange, date_clause: dateClause, view,
+                        ...(args.campaign_name ? { campaign_filter: args.campaign_name } : {}),
+                        ...report,
+                        ...(report.totals.placements_total === 0 ? { note: "No placement data in this range (placement views only cover Display/Video/Demand Gen delivery)." } : {}),
+                    };
+                } catch (e) { result = { error: e.message }; }
+            }
+        }
+
     } else if (name === "get_shopping_performance") {
         const search    = (args.account_name || "").toLowerCase();
         const dateRange = args.date_range || "LAST_30_DAYS";
@@ -15123,7 +15248,7 @@ module.exports = {
     handleToolCall, makeServer, main,
     getPacingLabel, getFlightPacing, buildDailyBudgetRec, getDateInfo, getEffectiveBudget, pctChange,
     // Exported for tests
-    clampTopN, shapeAgg, emptyAgg, addAgg, mergeAgg, listingCaseValueLabel, SHOPPING_GROUP_DIMENSIONS,
+    clampTopN, fetchPlacementPerformance, PLACEMENT_VIEWS, shapeAgg, emptyAgg, addAgg, mergeAgg, listingCaseValueLabel, SHOPPING_GROUP_DIMENSIONS,
     buildPmaxChannelReport, pmaxChannelName,
     matchByName, skippedRow, partitionSkipped, reportingPeriod, selectDetailAccounts, fetchMetaDailyBudgets, metaLifetimeDailyEquivalent,
     fetchMetaMTD, fetchGoogleDailyBudgets, inCampaignScope,
