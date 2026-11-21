@@ -15,6 +15,26 @@ API versions are pinned at the top of `server.js`
 
 ---
 
+## Placement reporting
+
+### `get_placements`
+
+Where YouTube / Display / Demand Gen ads showed. Not for PMax (use
+`get_pmax_channel_performance`).
+
+| Param | Notes |
+| --- | --- |
+| `account_name` | required, partial match |
+| `campaign_name` | optional substring filter |
+| `view` | `channel` (default: YouTube channel / domain / app, `group_placement_view`) or `detail` (individual videos/pages, `detail_placement_view`) |
+| `date_range` | `THIS_MONTH` (default), `LAST_7_DAYS`, `LAST_30_DAYS`, `LAST_90_DAYS`, `LAST_MONTH`, `YEAR_TO_DATE`, `CUSTOM` |
+| `top_n` / `min_impressions` | default 50 (max 500) / 0 |
+
+Rows: spend, impressions, clicks, CTR, conversions, plus video views, view rate,
+CPV and quartile completion. Sorted by spend; `totals` covers every placement.
+
+---
+
 ## Shopping / product-level reporting
 
 These tools answer product-level questions on ecommerce accounts, where
