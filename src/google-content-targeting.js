@@ -3,13 +3,14 @@
  * Pure planners (rows in, operations out), same shape as google-placements.js.
  *
  *  topics         campaign / ad group level. exclude (negative) or include (ad group, positive)
- *  content_labels exclusions only, at account (customer_negative_criterion), campaign or ad group level
+ *  content_labels exclusions only, at account (customer_negative_criterion) or campaign level
+ *                 (ad_group_criterion has no content_label field, so ad groups take topics only)
  */
 
 // Common content labels. The list is advisory: the dry run validates every
 // label against Google, so a label missing here is warned about, not blocked.
 const KNOWN_CONTENT_LABELS = [
-    "JUVENILE", "GAME", "PROFANITY", "TRAGEDY", "SEXUALLY_SUGGESTIVE", "BELOW_THE_FOLD", "PARKED_DOMAIN",
+    "JUVENILE", "PROFANITY", "TRAGEDY", "SEXUALLY_SUGGESTIVE", "BELOW_THE_FOLD", "PARKED_DOMAIN",
     "EMBEDDED_VIDEO", "LIVE_STREAMING_VIDEO", "SOCIAL_ISSUES", "VIDEO", "VIDEO_NOT_YET_RATED",
     "VIDEO_RATING_DV_Y", "VIDEO_RATING_DV_G", "VIDEO_RATING_DV_PG", "VIDEO_RATING_DV_T", "VIDEO_RATING_DV_MA",
 ];
@@ -103,9 +104,10 @@ function contentQuery(scope, { campaignId, adGroupId } = {}) {
                 WHERE campaign_criterion.type IN ${TYPE_FILTER} AND campaign_criterion.status != 'REMOVED'
                   ${campaignId ? `AND campaign.id = ${Number(campaignId)}` : ""}`;
     }
-    return `SELECT campaign.name, ad_group.name, ad_group_criterion.negative, ${FIELDS("ad_group_criterion")}
+    return `SELECT campaign.name, ad_group.name, ad_group_criterion.negative, ad_group_criterion.resource_name,
+                   ad_group_criterion.type, ad_group_criterion.topic.topic_constant, ad_group_criterion.topic.path
             FROM ad_group_criterion
-            WHERE ad_group_criterion.type IN ${TYPE_FILTER} AND ad_group_criterion.status != 'REMOVED'
+            WHERE ad_group_criterion.type = 'TOPIC' AND ad_group_criterion.status != 'REMOVED'
               ${adGroupId ? `AND ad_group.id = ${Number(adGroupId)}` : ""}
               ${campaignId ? `AND campaign.id = ${Number(campaignId)}` : ""}`;
 }

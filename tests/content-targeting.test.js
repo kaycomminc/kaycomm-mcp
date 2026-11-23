@@ -34,8 +34,8 @@ test("planAdd: topic + label operations per scope, existing skipped", () => {
     assert.equal(camp.ops.length, 1);
     assert.deepEqual(camp.ops[0].campaignCriterionOperation.create, { contentLabel: { type: "JUVENILE" }, campaign: "customers/1/campaigns/9", negative: true });
     assert.equal(camp.skipped_already_present.length, 2);
-    const acct = CT.planAdd({ scope: "account", targets: [CT.parseContentLabel("GAME")], existing: [], negative: true });
-    assert.deepEqual(acct.ops[0], { customerNegativeCriterionOperation: { create: { contentLabel: { type: "GAME" } } } });
+    const acct = CT.planAdd({ scope: "account", targets: [CT.parseContentLabel("PROFANITY")], existing: [], negative: true });
+    assert.deepEqual(acct.ops[0], { customerNegativeCriterionOperation: { create: { contentLabel: { type: "PROFANITY" } } } });
     const inc = CT.planAdd({ scope: "ad_group", parentResource: "customers/1/adGroups/5", targets: [CT.resolveTopic("20", CONSTS)], existing: [], negative: false });
     assert.deepEqual(inc.ops[0].adGroupCriterionOperation.create, { topic: { topicConstant: "topicConstants/20" }, adGroup: "customers/1/adGroups/5", negative: false });
 });
@@ -44,10 +44,13 @@ test("planRemove + mapRow round trip", () => {
     const row = CT.mapRow("campaign", { campaignCriterion: { resourceName: "customers/1/campaignCriteria/9~4", negative: true, topic: { topicConstant: "topicConstants/20", path: ["Games", "Roleplaying Games"] } }, campaign: { name: "C" } });
     assert.equal(row.key, "TOPIC:20");
     assert.equal(row.label, "/Games/Roleplaying Games");
-    const plan = CT.planRemove({ scope: "campaign", targets: [CT.resolveTopic("20", CONSTS), CT.parseContentLabel("GAME")], existing: [row] });
+    const plan = CT.planRemove({ scope: "campaign", targets: [CT.resolveTopic("20", CONSTS), CT.parseContentLabel("PROFANITY")], existing: [row] });
     assert.deepEqual(plan.ops, [{ campaignCriterionOperation: { remove: "customers/1/campaignCriteria/9~4" } }]);
-    assert.deepEqual(plan.not_found, ["CONTENT_LABEL: GAME"]);
+    assert.deepEqual(plan.not_found, ["CONTENT_LABEL: PROFANITY"]);
     assert.match(CT.contentQuery("account"), /customer_negative_criterion/);
+    const ag = CT.contentQuery("ad_group", { adGroupId: 5 });
+    assert.doesNotMatch(ag, /content_label/);
+    assert.match(ag, /ad_group_criterion\.type = 'TOPIC'/);
 });
 
 // ── handler ─────────────────────────────────────────────────────────────────
@@ -89,10 +92,12 @@ test("manage_content_targeting: dry run validates, confirm applies, topics resol
 test("manage_content_targeting: guards (topics at account, label inclusion, inclusion level) and search_topics", async () => {
     const a = await handleToolCall("manage_content_targeting", { account_name: account, action: "exclude", level: "account", topics: ["19"] });
     assert.match(a.error, /Topics can't be set at account level/);
-    const b = await handleToolCall("manage_content_targeting", { account_name: account, action: "include", level: "ad_group", content_labels: ["GAME"] });
+    const b = await handleToolCall("manage_content_targeting", { account_name: account, action: "include", level: "ad_group", content_labels: ["PROFANITY"] });
     assert.match(b.error, /only be excluded/);
     const c = await handleToolCall("manage_content_targeting", { account_name: account, action: "include", level: "campaign", topics: ["19"] });
     assert.match(c.error, /ad_group level only/);
+    const d = await handleToolCall("manage_content_targeting", { account_name: account, action: "exclude", level: "ad_group", ad_group_name: "x", content_labels: ["JUVENILE"] });
+    assert.match(d.error, /Content labels can't be set at ad_group level/);
     const s = await handleToolCall("manage_content_targeting", { account_name: account, action: "search_topics", query: "games" });
     assert.equal(s.topics.length, 3);
 });
