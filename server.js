@@ -6085,6 +6085,100 @@ async function handleCampaignSettingsTool(name, args) {
     } catch (e) { return { error: e.message }; }
 }
 
+// ── Placement exclusions / inclusions (manage_placements) ────────────────────
+// Planning in src/google-placements.js. Dry runs validate against the API
+// (validateOnly); confirm=true applies in one atomic mutate.
+async function handlePlacementsTool(args) {
+    const PL = require("./src/google-placements");
+    const action  = args.action || "list";
+    const confirm = args.confirm === true;
+    const kind    = args.kind || (action === "include" ? "inclusion" : "exclusion");
+    const { match, error: acctErr } = resolveAccount(GOOGLE_ACCOUNTS, (args.account_name || "").toLowerCase(), { confirmed: confirm });
+    if (!match) return { error: acctErr };
+    if (!["list", "exclude", "include", "remove"].includes(action)) return { error: `Unknown action '${action}'. Valid: list, exclude, include, remove.` };
+    if (!["exclusion", "inclusion"].includes(kind)) return { error: "kind must be 'exclusion' or 'inclusion'." };
+    // exclude/include fix the polarity; kind only matters for list/remove
+    const negative = action === "exclude" ? true : action === "include" ? false : kind === "exclusion";
+    const scope = args.level || (action === "include" || (action === "remove" && !negative) ? "ad_group" : "campaign");
+    if (!["account", "campaign", "ad_group"].includes(scope)) return { error: "level must be account, campaign or ad_group." };
+    if (!negative && scope !== "ad_group") return { error: "Inclusions (positive placement targeting) are set at ad_group level only." };
+    if (scope === "account" && !negative) return { error: "Account level supports exclusions only." };
+
+    let placements = [];
+    if (action !== "list") {
+        if (!(args.placements || []).length) return { error: "Provide placements (YouTube channel IDs/URLs, video IDs/URLs, domains, or app IDs)." };
+        try { placements = args.placements.map(x => PL.parsePlacement(x, args.placement_type)); }
+        catch (e) { return { error: e.message }; }
+    }
+
+    const { token, error: authErr } = await getGoogleAccessToken(match[0]);
+    if (authErr) return { error: `Auth: ${authErr}` };
+    const [cid, info] = match;
+    try {
+        // Resolve campaign / ad group scope
+        let camp = null, adGroup = null;
+        if (scope !== "account") {
+            {
+                const campaigns = await listGoogleCampaignsFull(token, cid, info.mcc);
+                if (!args.campaign_name) {
+                    if (action === "list") { /* list across all campaigns */ }
+                    else return { error: "campaign_name is required.", available: campaigns.map(c => c.name) };
+                } else {
+                    const sel = matchByName(campaigns, c => c.name, args.campaign_name.toLowerCase(), { confirmed: confirm, label: "campaign" });
+                    camp = sel.item;
+                    if (!camp) return sel.error ? { error: sel.error, candidates: sel.candidates } : { error: `No campaign matching '${args.campaign_name}'`, available: campaigns.map(c => c.name) };
+                }
+            }
+            if (scope === "ad_group" && (action !== "list" || args.ad_group_name)) {
+                if (!args.ad_group_name) return { error: "ad_group_name is required for level=ad_group." };
+                const groups = await listAdGroupsFull(token, cid, info.mcc, camp?.name);
+                const sel = matchByName(groups, g => g.name, args.ad_group_name.toLowerCase(), { confirmed: confirm, label: "ad group" });
+                adGroup = sel.item;
+                if (!adGroup) return sel.error ? { error: sel.error, candidates: sel.candidates } : { error: `No ad group matching '${args.ad_group_name}'`, available: groups.map(g => g.name) };
+            }
+        }
+        const campId = camp ? camp.resource_name.split("/").pop() : null;
+        const rows = (await googleSearch(token, cid, info.mcc, PL.placementQuery(scope, { campaignId: campId, adGroupId: adGroup?.ad_group_id })))
+            .map(r => PL.mapRow(scope, r)).filter(Boolean);
+        const existing = rows.filter(r => r.negative === negative);
+        const scopeInfo = { level: scope, ...(camp ? { campaign: camp.name } : {}), ...(adGroup ? { ad_group: adGroup.name } : {}) };
+
+        if (action === "list") {
+            const top = clampTopN(args.top_n, 200);
+            const shown = rows.filter(r => args.kind ? r.negative === negative : true).slice(0, top);
+            return {
+                account: info.name, ...scopeInfo,
+                exclusions: shown.filter(r => r.negative).map(({ negative: _n, key: _k, ...r }) => r),
+                inclusions: shown.filter(r => !r.negative).map(({ negative: _n, key: _k, ...r }) => r),
+                totals: { exclusions: rows.filter(r => r.negative).length, inclusions: rows.filter(r => !r.negative).length },
+            };
+        }
+
+        const plan = action === "remove"
+            ? PL.planRemove({ scope, placements, existing })
+            : PL.planAdd({
+                scope, parentResource: scope === "ad_group" ? adGroup.ad_group_resource : camp?.resource_name,
+                placements, existing, negative,
+                cpcBidMicros: args.cpc_bid ? Math.round(Number(args.cpc_bid) * 1_000_000) : null,
+            });
+        const summary = {
+            account: info.name, ...scopeInfo, action, kind: negative ? "exclusion" : "inclusion",
+            ...(action === "remove" ? { removing: plan.removing, not_found: plan.not_found }
+                                    : { adding: plan.adding, skipped_already_present: plan.skipped_already_present }),
+            operations: plan.ops.length,
+        };
+        if (!plan.ops.length) return { ...summary, message: "Nothing to change." };
+        if (!confirm) {
+            let validation;
+            try { await googleMutateOps(token, cid, info.mcc, plan.ops, { validateOnly: true }); validation = { status: "PASSES" }; }
+            catch (e) { validation = { status: "FAILS", error: e.message }; }
+            return { validation, dry_run: true, message: "DRY RUN — set confirm=true to apply", ...summary };
+        }
+        await googleMutateOps(token, cid, info.mcc, plan.ops);
+        return { success: true, ...summary };
+    } catch (e) { return { error: e.message }; }
+}
+
 // ── Standard Shopping listing groups (manage_shopping_listing_groups) ────────
 // Planning lives in src/google-listing-groups.js; this does the lookups and
 // runs the single atomic mutate (validateOnly for dry runs).
@@ -8313,6 +8407,35 @@ function makeServer() {
                     },
                     start_date: { type: "string", description: "Start date YYYY-MM-DD (only with CUSTOM)" },
                     end_date:   { type: "string", description: "End date YYYY-MM-DD (only with CUSTOM)" },
+                },
+                required: ["account_name"],
+            },
+        },
+        {
+            name: "manage_placements",
+            description: "Add, remove or list placement EXCLUSIONS and INCLUSIONS for YouTube / Display / Demand Gen. " +
+                "Placements can be YouTube channel IDs or URLs (UC…, youtube.com/channel/UC…), video IDs or URLs, website domains, or mobile app IDs (mobileapp::1-com.x.y); the type is auto-detected (override with placement_type). " +
+                "Find channel IDs with get_placements. YouTube @handle URLs are rejected (the API needs the channel ID). " +
+                "action=exclude adds negative placements at level=campaign (default), ad_group, or account (all campaigns). " +
+                "action=include adds positive placement targeting on an ad group (level=ad_group only; optional cpc_bid). " +
+                "action=remove deletes existing exclusions (kind=exclusion, default) or inclusions (kind=inclusion) matching the placements. " +
+                "action=list shows what is set at the chosen level. " +
+                "Already-present placements are skipped. Dry run by default (validated against Google without writing) — set confirm=true to apply atomically. " +
+                "Note: placement exclusions apply to future delivery only and do not remove past spend.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    account_name:   { type: "string", description: "Client name (partial match ok)" },
+                    action:         { type: "string", enum: ["list", "exclude", "include", "remove"], description: "Default list" },
+                    level:          { type: "string", enum: ["account", "campaign", "ad_group"], description: "Scope. Default campaign (ad_group for include). account = exclusions across all campaigns." },
+                    campaign_name:  { type: "string", description: "Campaign (partial match). Required for level campaign/ad_group writes; optional filter for list." },
+                    ad_group_name:  { type: "string", description: "Ad group (partial match). Required for level=ad_group." },
+                    placements:     { type: "array", items: { type: "string" }, description: "Channel IDs/URLs, video IDs/URLs, domains, or app IDs. Required except for list." },
+                    placement_type: { type: "string", enum: ["YOUTUBE_CHANNEL", "YOUTUBE_VIDEO", "WEBSITE", "MOBILE_APP"], description: "Force the type for every placement instead of auto-detecting." },
+                    kind:           { type: "string", enum: ["exclusion", "inclusion"], description: "For action=remove (default exclusion) and to filter list." },
+                    cpc_bid:        { type: "number", description: "Optional max CPC bid in dollars for included placements (include only)." },
+                    top_n:          { type: "integer", description: "list: max rows (default 200, max 500)" },
+                    confirm:        { type: "boolean", description: "Set true to apply. Omit for a validated dry run." },
                 },
                 required: ["account_name"],
             },
@@ -13690,6 +13813,9 @@ async function dispatchToolCall(name, args = {}) {
                 } catch (e) { result = { error: e.message }; }
             }
         }
+
+    } else if (name === "manage_placements") {
+        result = await handlePlacementsTool(args);
 
     } else if (name === "get_placements") {
         const search    = (args.account_name || "").toLowerCase();
