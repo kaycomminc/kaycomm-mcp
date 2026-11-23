@@ -6203,6 +6203,7 @@ async function handleContentTargetingTool(args) {
     if (!negative && scope !== "ad_group") return { error: "Inclusions (positive topic targeting) are set at ad_group level only." };
     const topicsIn = args.topics || [], labelsIn = args.content_labels || [];
     if (!negative && labelsIn.length) return { error: "Content labels can only be excluded, not targeted." };
+    if (scope === "ad_group" && labelsIn.length) return { error: "Content labels can't be set at ad_group level — use level=campaign or account." };
     if (scope === "account" && topicsIn.length) return { error: "Topics can't be set at account level — use level=campaign or ad_group. Content labels support account level." };
     if (["exclude", "include", "remove"].includes(action) && !topicsIn.length && !labelsIn.length) return { error: "Provide topics and/or content_labels." };
 
@@ -8502,9 +8503,9 @@ function makeServer() {
         },
         {
             name: "manage_content_targeting",
-            description: "Content exclusions and topic targeting for YouTube / Display / Demand Gen: TOPICS (exclude, or include on an ad group) and CONTENT LABELS (exclude only, e.g. JUVENILE, GAME, PROFANITY, TRAGEDY, SEXUALLY_SUGGESTIVE, EMBEDDED_VIDEO, LIVE_STREAMING_VIDEO, VIDEO_NOT_YET_RATED). " +
+            description: "Content exclusions and topic targeting for YouTube / Display / Demand Gen: TOPICS (exclude, or include on an ad group) and CONTENT LABELS (exclude only, e.g. JUVENILE, PROFANITY, TRAGEDY, SEXUALLY_SUGGESTIVE, EMBEDDED_VIDEO, LIVE_STREAMING_VIDEO, VIDEO_NOT_YET_RATED). " +
                 "action=search_topics browses Google's topic tree (query=text); topics[] accepts a numeric ID, full path (/Games/Roleplaying Games) or a unique name. " +
-                "action=exclude adds negatives at level=campaign (default), ad_group, or account (content labels only — topics can't be account-level). " +
+                "action=exclude adds negatives at level=campaign (default), ad_group (topics only), or account (content labels only). Video campaigns may reject campaign-level criteria (MUTATE_NOT_ALLOWED) — use ad_group for topics there. " +
                 "action=include adds topic targeting on an ad group (level=ad_group only). " +
                 "action=remove deletes matching exclusions (kind=exclusion, default) or inclusions. action=list shows what is set. " +
                 "Already-present items are skipped. Dry run by default (validated against Google without writing) — set confirm=true to apply atomically. " +
@@ -8518,7 +8519,7 @@ function makeServer() {
                     campaign_name:  { type: "string", description: "Campaign (partial match). Required for campaign/ad_group writes; optional filter for list." },
                     ad_group_name:  { type: "string", description: "Ad group (partial match). Required for level=ad_group." },
                     topics:         { type: "array", items: { type: "string" }, description: "Topic IDs, full paths or unique names (see search_topics)." },
-                    content_labels: { type: "array", items: { type: "string" }, description: "Content label names to exclude, e.g. JUVENILE, GAME." },
+                    content_labels: { type: "array", items: { type: "string" }, description: "Content label names to exclude, e.g. JUVENILE, PROFANITY." },
                     query:          { type: "string", description: "search_topics: text to match in topic paths." },
                     kind:           { type: "string", enum: ["exclusion", "inclusion"], description: "For action=remove (default exclusion) and to filter list." },
                     top_n:          { type: "integer", description: "search_topics: max rows (default 50, max 500)" },
