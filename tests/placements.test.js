@@ -16,7 +16,7 @@ test.after(() => { global.fetch = realFetch; });
 const row = (name, placement, cost, impr, views, clicks = 0) => ({
     groupPlacementView: { displayName: name, placement, placementType: "YOUTUBE_CHANNEL", targetUrl: `https://youtube.com/${placement}` },
     metrics: { costMicros: String(cost * 1e6), impressions: String(impr), clicks: String(clicks), conversions: 0,
-               videoTrueviewViews: String(views), videoQuartileP100Rate: 0.3 },
+               videoTrueviewViews: String(views), },
 });
 
 test("placements: rolls up duplicate placements, sorts by spend, computes CPV", async () => {
@@ -45,4 +45,10 @@ test("placements: campaign filter is escaped in GAQL and view selects resource",
     assert.match(lastQuery, /group_placement_target_url/);
     assert.ok(lastQuery.includes("O\\'Brien\\_\\%"));
     assert.ok(PLACEMENT_VIEWS.channel);
+});
+
+test("placements: query omits quartile metrics (unsupported on placement views)", async () => {
+    mockRows([]);
+    await fetchPlacementPerformance("t", "1", "2", "DURING THIS_MONTH", "channel", null, 50, 0);
+    assert.doesNotMatch(lastQuery, /quartile/);
 });

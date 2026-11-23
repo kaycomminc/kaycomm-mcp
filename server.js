@@ -2689,7 +2689,8 @@ async function fetchPlacementPerformance(token, customerId, mccId, dateClause, v
     const rows = await googleSearch(token, customerId, mccId, `
         SELECT ${v.resource}.display_name, ${v.resource}.placement, ${v.resource}.placement_type,
                ${v.resource}.target_url${v.extra},
-               ${VIDEO_METRIC_FIELDS}, metrics.clicks, metrics.conversions
+               metrics.cost_micros, metrics.impressions, metrics.clicks, metrics.conversions,
+               metrics.video_trueview_views, metrics.video_trueview_view_rate, metrics.trueview_average_cpv
         FROM ${v.resource}
         WHERE segments.date ${dateClause}
           AND metrics.impressions > 0 ${nameClause}`);
@@ -2725,7 +2726,7 @@ async function fetchPlacementPerformance(token, customerId, mccId, dateClause, v
         clicks:      e.clicks,
         ctr:         e.agg.impressions > 0 ? (e.clicks / e.agg.impressions * 100).toFixed(2) + "%" : "0.00%",
         conversions: Math.round(e.conversions * 100) / 100,
-        ...shapeVideoAgg(e.agg),
+        ...(({ views, view_rate, avg_cpv, cpv }) => ({ views, view_rate, avg_cpv, cpv }))(shapeVideoAgg(e.agg)),
     });
     return {
         placements: shown.map(e => ({
@@ -8320,7 +8321,7 @@ function makeServer() {
             name: "get_placements",
             description: "Where Google Ads (YouTube / Display / Demand Gen) ads actually showed — placement report. " +
                 "view=channel (default) rolls up to YouTube channel, website domain or app; view=detail lists individual YouTube videos and pages (with their parent channel URL). " +
-                "Returns spend, impressions, clicks, CTR, conversions, and for video: views, view_rate, avg_cpv, cpv, quartile_p25-p100 completion. Sorted by spend, capped by top_n. " +
+                "Returns spend, impressions, clicks, CTR, conversions, and for video: views, view_rate, avg_cpv, cpv (quartile completion is not available on placement views). Sorted by spend, capped by top_n. " +
                 "Use to spot junk placements (kids content, apps, MFA sites) or low-completion channels to exclude. PMax is not covered (use get_pmax_channel_performance).",
             inputSchema: {
                 type: "object",
