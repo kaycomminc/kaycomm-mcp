@@ -33,6 +33,24 @@ Where YouTube / Display / Demand Gen ads showed. Not for PMax (use
 Rows: spend, impressions, clicks, CTR, conversions, plus video views, view rate,
 and CPV (the API doesn't offer quartile completion on placement views). Sorted by spend; `totals` covers every placement.
 
+### `manage_placements`
+
+Add, remove or list placement **exclusions** and **inclusions** (YouTube
+channels/videos, websites, apps). Dry run by default (validated against Google
+with `validateOnly`); `confirm=true` applies atomically. Already-present
+placements are skipped. Exclusions only affect future delivery.
+
+| Param | Notes |
+| --- | --- |
+| `account_name` | required |
+| `action` | `list` (default), `exclude`, `include`, `remove` |
+| `level` | `campaign` (default), `ad_group`, `account` (exclusions across all campaigns). Inclusions are `ad_group` only |
+| `campaign_name` / `ad_group_name` | partial match; required for campaign / ad group writes |
+| `placements` | channel IDs/URLs (`UC…`), video IDs/URLs, domains, app IDs (`mobileapp::1-com.x.y`). Type is auto-detected; `@handle` URLs are rejected (use `get_placements` for IDs) |
+| `placement_type` | optional override: `YOUTUBE_CHANNEL`, `YOUTUBE_VIDEO`, `WEBSITE`, `MOBILE_APP` |
+| `kind` | `exclusion` (default) / `inclusion` for `remove` and `list` filtering |
+| `cpc_bid` | optional max CPC ($) for included placements |
+
 ---
 
 ## Shopping / product-level reporting
