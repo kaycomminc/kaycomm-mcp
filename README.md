@@ -53,6 +53,22 @@ placements are skipped. Exclusions only affect future delivery.
 
 ---
 
+### `manage_content_targeting`
+
+Content exclusions and topic targeting for YouTube / Display / Demand Gen.
+Same dry-run / `confirm=true` / idempotency behaviour as `manage_placements`.
+
+| Param | Notes |
+| --- | --- |
+| `action` | `list` (default), `exclude`, `include`, `remove`, `search_topics` |
+| `level` | `campaign` (default), `ad_group`, `account` (content labels only). Topic inclusions are `ad_group` only |
+| `topics` | numeric ID, full path (`/Games/Roleplaying Games`) or unique name; browse with `search_topics` + `query` |
+| `content_labels` | exclusions only, e.g. `JUVENILE`, `GAME`, `PROFANITY`, `TRAGEDY`, `EMBEDDED_VIDEO`, `LIVE_STREAMING_VIDEO`. Labels outside the common list are warned about; Google validates them on the dry run |
+
+For specific channels, videos, sites or apps use `manage_placements`.
+
+---
+
 ## Shopping / product-level reporting
 
 These tools answer product-level questions on ecommerce accounts, where
