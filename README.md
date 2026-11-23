@@ -31,7 +31,7 @@ Where YouTube / Display / Demand Gen ads showed. Not for PMax (use
 | `top_n` / `min_impressions` | default 50 (max 500) / 0 |
 
 Rows: spend, impressions, clicks, CTR, conversions, plus video views, view rate,
-CPV and quartile completion. Sorted by spend; `totals` covers every placement.
+and CPV (the API doesn't offer quartile completion on placement views). Sorted by spend; `totals` covers every placement.
 
 ---
 
