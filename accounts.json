@@ -53,7 +53,7 @@
     },
     "2944254697": {
       "name": "Charlie's Soap",
-      "budget": 5500,
+      "budget": 4500,
       "mcc": "7631184147",
       "health": {
         "conversion_type": "sale"
@@ -73,6 +73,17 @@
           "text": "2026-10-26: Search_G_Amazon_US (ID 24405048409) built PAUSED. $90/day, Max Clicks, 44 non-onsite states (geo copied from Brand_US_Other), 8 product ad groups → Amazon product pages, 57 keywords. Liza (V9) is making Amazon Attribution links from keyword IDs; do NOT reword or rebuild keywords (that changes the IDs). Don't launch until Liza approves. Swap in attribution URLs when received.",
           "added": "2026-10-26",
           "expires": "2026-11-30"
+        },
+        {
+          "text": "2026-11-23 (Liza): $1,000 of Google's Nov budget moved to the Meta BFCM push, so Nov Google = $4,500 (was $5,500). Daily budgets cut 11/23 to $38/day total (Amazon_US $15, Shopping $7, Brand_Other $10, Brand_Onsite $6) to land ≤$4,500. From 12/1 Google reverts to $3,000/mo and Meta gets $2,500/mo — raise Google daily budgets back to ~$95–100/day total on 12/1.",
+          "added": "2026-11-23",
+          "expires": "2026-12-05"
+        }
+      ],
+      "budget_schedule": [
+        {
+          "from": "2026-12-01",
+          "budget": 3000
         }
       ]
     },
@@ -452,8 +463,8 @@
       "page_id": "64218964971",
       "notes": [
         {
-          "text": "2026-11-20 BFCM build, ALL PAUSED (not client-approved): 'CS | BFCM26 | Initial Awareness' 120257038893260102 (Reach, 11/23–11/26, $179 Amazon 43 states+DC → storefront / $178 onsite 7 states → /our-products/); 'CS | BFCM26 | Amazon Traffic' 120257038885830102 ($1,100, 11/27–11/30, 4 product ads w/ Amazon Attribution FB tags, 7 onsite states excluded); 'CS | BFCM26 | Website Conversions' 120257038879800102 ($1,100, 11/27–11/30, onsite 7 states, Purchase on PLACEHOLDER CS Marketing Pixel 1172678468942373 — site actually fires pixel 880102250915612 which we can't access; duplicate/swap if client wants that one). Split follows doc's $1,100/$1,100 allocation, pending Liza confirm (doc also says $1,650/$550).",
-          "added": "2026-11-20",
+          "text": "BFCM 2026 (Liza confirmed 11/23), all PAUSED until Jason enables: 'CS | BFCM26 | Initial Awareness' 120257038893260102 ($179 Amazon 43 states+DC → attribution-tagged storefront ad 120257079151430102 / $178 onsite 7 states, 11/23–11/26); 'CS | BFCM26 | Amazon Traffic' 120257038885830102 ($1,650, 11/27–11/30, 4 product ads, no Liquid: out of stock); 'CS | BFCM26 | Website Conversions' 120257038879900102 ad set ($550, 11/27–11/30, Purchase on new CS Marketing Pixel 1172678468942373 — Liza installing; old site pixel 880102250915612 intentionally NOT used, ban risk). UTMs utm_source=paid_social&utm_medium=meta&utm_campaign=v9traffic. Dec: Meta $2.5K/mo (new ads from Liza). 'Boosted Posts' + 'CS: Test Campaign' are V9's, not ours.",
+          "added": "2026-11-23",
           "expires": "2026-12-05"
         }
       ]
