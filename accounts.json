@@ -361,6 +361,11 @@
           "text": "Budget $15,010.80 CAD (account in CAD), hard cap through 12/31; overspend lands on V9's card. Flight starts 11/17 (per Jason 11/20). Only 'V9 - Edmonton Special Projects - Search' ($357/day) is ours. This is PCL's own corporate account, so PCL's in-house campaigns (Recruitment, Secondary Markets, Insights Display etc., run by ctritz@pcl.com) also spend here and are NOT part of the V9 budget — account-level flight spend and current_daily_budget include them, so judge pacing on the V9 campaign.",
           "added": "2026-11-20",
           "expires": "2026-12-20"
+        },
+        {
+          "text": "2026-11-24: Design-Build and Industry campaigns still showing $0 spend (QS ramp, lost_is_rank ~75-100%, not budget-limited). Added PHRASE \"building construction contractor\" to Commercial GC ad group and PHRASE \"edmonton construction companies\" to General Contractor ad group (V9 - Edmonton SP - Commercial GC) — both were the top historical performers on the old paused campaign ($253.93 and $534.35 spend respectively) and were previously only EXACT match in the new structure. Did not touch the old \"V9 - Edmonton Special Projects - Search\" campaign — every one of its ad groups (Custom Builds, Retail, Hospitality/Restaurant, Healthcare) duplicates a vertical already live in the new Commercial GC/Design-Build/Industry split, so re-enabling any of it would self-compete rather than add volume. Also note: new campaign daily budgets are now $260 (Commercial GC) + $100 (Design-Build) + $100 (Industry) = $460/day, raised by Jason from the originally documented $357/day.",
+          "added": "2026-11-24",
+          "expires": "2026-12-15"
         }
       ],
       "campaign_prefix": "V9 - "
