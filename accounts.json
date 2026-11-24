@@ -448,14 +448,19 @@
     },
     "act_711993740163670": {
       "name": "PCL Construction",
-      "budget": 6000,
+      "budget": 3186,
       "flight_start": "2026-11-17",
       "flight_end": "2026-12-31",
       "notes": [
         {
-          "text": "Flight 11/17–12/31 (per Jason 11/20), $6,000 CAD lifetime, hard cap. Only 'V9 - Edmonton Special Projects - Meta' (120249446930290532, built PAUSED; Liza adds funds and launches) is ours. PCL's in-house Meta campaigns also run in this ad account and are NOT part of the V9 budget.",
+          "text": "Flight 11/17–12/31 (per Jason 11/20), $3,186 CAD lifetime (cut from $6,000 on 11/24), hard cap. Only 'V9 - Edmonton Special Projects - Meta' (120249446930290532, built PAUSED; Liza adds funds and launches) is ours. PCL's in-house Meta campaigns also run in this ad account and are NOT part of the V9 budget.",
           "added": "2026-11-20",
           "expires": "2026-12-31"
+        },
+        {
+          "text": "Meta launches at 15% of total media (half the $6,371 CAD allocation) = $3,186 CAD lifetime through 12/31 (Prospecting $2,549 / Retargeting $637). Early Dec: keep 15% or shift more to Google. Hard cap.",
+          "added": "2026-11-24",
+          "expires": "2026-12-07"
         }
       ],
       "campaign_prefix": "V9 - "
