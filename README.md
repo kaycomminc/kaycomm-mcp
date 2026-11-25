@@ -214,6 +214,33 @@ disapproved or out of stock rather than just low-spend.
 
 ---
 
+## Drive creative intake: REST vs MCP
+
+Drive tools (`list_drive_creative`, Drive folders in the Meta/Google upload
+tools) read Drive with `GOOGLE_DRIVE_REFRESH_TOKEN` (`drive.readonly`).
+`DRIVE_BACKEND` picks the transport:
+
+- `rest` (default) — Drive REST v3.
+- `mcp` — Google's remote Drive MCP server, `https://drivemcp.googleapis.com/mcp/v1`.
+  Google requires AI agents to reach Workspace data via MCP, enforced
+  **2027-02-01** (Workspace AI Tools Addendum). Switch before then.
+
+Before setting `DRIVE_BACKEND=mcp` on Railway, in Cloud project
+`agency-ads-api-495700`:
+
+1. `gcloud services enable drive.googleapis.com drivemcp.googleapis.com`
+2. Google Auth Platform → Clients → the client behind `GOOGLE_CLIENT_ID` →
+   tick **Use this client for an AI-powered agent** (requests are rejected otherwise).
+3. Test with `DRIVE_BACKEND=mcp` locally, then set it on Railway.
+
+Differences on MCP (Drive MCP is Developer Preview):
+
+- No image/video dimensions in metadata. Images are measured by downloading
+  them (bytes discarded, ≤150 per listing); videos use a `1080x1920`-style
+  size in the filename when present (`dims_source: "filename"`), else unknown.
+- Shortcuts are skipped (no target info). Shared-drive support is undocumented.
+- Listing does not document a trashed filter.
+
 ## Google Ads API v24 notes
 
 Field availability changes between versions; verify against the resource

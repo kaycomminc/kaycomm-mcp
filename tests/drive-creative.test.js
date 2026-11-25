@@ -116,3 +116,78 @@ test('download returns bytes privately; missing auth and 404 give actionable err
     const noAuth = D.createDriveClient({ fetch: mockDrive(TREE).fetch, getToken: async () => ({ token: null, error: 'GOOGLE_DRIVE_REFRESH_TOKEN is not set' }) });
     await assert.rejects(noAuth.listMedia('c1'), /get-refresh-token\.js GOOGLE_DRIVE_REFRESH_TOKEN --drive/);
 });
+
+// ── MCP backend ──────────────────────────────────────────────────────────────
+function mockDriveMcp(tree, { sse = false } = {}) {
+    const calls = [];
+    const mcpFile = f => ({ id: f.id, title: f.name, mimeType: f.mimeType, ...(f.size ? { fileSize: f.size } : {}), viewUrl: `https://drive.google.com/file/d/${f.id}` });
+    const fetch = async (url, opts = {}) => {
+        const body = JSON.parse(opts.body);
+        calls.push({ url, auth: opts.headers?.Authorization, name: body.params.name, args: body.params.arguments });
+        const { name, arguments: args } = body.params;
+        let payload, isError = false;
+        if (name === 'search_files') {
+            const parent = args.query.match(/parentId = '([^']+)'/)[1];
+            const all = (tree.children[parent] || []).map(mcpFile);
+            const start = args.pageToken ? Number(args.pageToken) : 0;
+            payload = { files: all.slice(start, start + 2), ...(start + 2 < all.length ? { nextPageToken: String(start + 2) } : {}) };
+        } else if (name === 'get_file_metadata') {
+            const f = tree.files[args.fileId];
+            if (f) payload = mcpFile(f); else { isError = true; payload = 'File not found: ' + args.fileId; }
+        } else if (name === 'download_file_content') {
+            payload = { id: args.fileId, content: Buffer.from(`bytes-${args.fileId}`).toString('base64') };
+        }
+        const text = typeof payload === 'string' ? payload : JSON.stringify(payload);
+        const rpc = { jsonrpc: '2.0', id: body.id, result: { content: [{ type: 'text', text }], isError } };
+        const headers = { get: h => h.toLowerCase() === 'content-type' ? (sse ? 'text/event-stream' : 'application/json') : null };
+        return { ok: true, status: 200, headers, json: async () => rpc, text: async () => `event: message\ndata: ${JSON.stringify(rpc)}\n\n` };
+    };
+    return { fetch, calls };
+}
+
+// Stand-in for sharp: dimensions keyed by file id, read back from the mock bytes.
+const DIMS = { a1: [1080, 1080], a2: [1080, 1920], a4: [512, 512] };
+const describeImage = async buf => { const [width, height] = DIMS[buf.toString().replace('bytes-', '')]; return { width, height }; };
+
+test('MCP backend: lists via search_files with paging, measures images, skips shortcuts, uses filename dims for video', async () => {
+    const tree = JSON.parse(JSON.stringify(TREE));
+    tree.children.sub[0].name = 'Promo_1080x1350.mp4';
+    const { fetch, calls } = mockDriveMcp(tree, { sse: true });
+    const client = D.createDriveClient({ fetch, getToken: async () => ({ token: 'tok' }), backend: 'mcp', describeImage });
+    assert.equal(client.backend, 'mcp');
+    const r = await client.listMedia('c1');
+    assert.equal(r.backend, 'mcp');
+    assert.deepEqual(r.files.map(f => `${f.folder}|${f.name}`).sort(), ['Nov|Promo_1080x1350.mp4', '|Hiring_A_1x1.jpg', '|Hiring_A_9x16.jpg'].sort());
+    assert.equal(r.skipped_non_media, 2);   // pdf + shortcut (no target info over MCP)
+    assert.deepEqual(r.subfolders, ['Nov']);
+    assert.equal(r.files.find(f => f.name === 'Hiring_A_9x16.jpg').fit.aspect, '9:16');
+    const video = r.files.find(f => f.type === 'video');
+    assert.equal(video.fit.aspect, '4:5');
+    assert.equal(video.dims_source, 'filename');
+    assert.ok(calls.every(c => c.url === D.DRIVE_MCP_URL && c.auth === 'Bearer tok'));
+    assert.ok(calls.filter(c => c.name === 'search_files' && c.args.query === "parentId = 'c1'").length >= 2, 'paginates');
+    assert.ok(!calls.some(c => /in parents|trashed/.test(c.args.query || '')), 'no REST q syntax');
+});
+
+test('MCP backend: download decodes base64, enforces limits, maps not-found', async () => {
+    const client = D.createDriveClient({ fetch: mockDriveMcp(TREE).fetch, getToken: async () => ({ token: 't' }), backend: 'mcp', describeImage });
+    const dl = await client.download('a1');
+    assert.equal(dl.buffer.toString(), 'bytes-a1');
+    assert.equal(dl.name, 'Hiring_A_1x1.jpg');
+    assert.equal(dl.file.fit.aspect, '1:1');
+    await assert.rejects(client.download('a1', { maxBytes: 10 }), /limit/);
+    await assert.rejects(client.download('missing'), /not shared with the Drive-authorized account/);
+    assert.equal((await client.findChildFolder('root', 'summit express')).folder.id, 'c1');
+});
+
+test('MCP backend: HTTP 403 points at the AI-agent client setting', async () => {
+    const fetch = async () => ({ ok: false, status: 403, headers: { get: () => 'application/json' }, json: async () => ({ error: { message: 'PERMISSION_DENIED' } }) });
+    const client = D.createDriveClient({ fetch, getToken: async () => ({ token: 't' }), backend: 'mcp' });
+    await assert.rejects(client.listMedia('c1'), /AI-powered agent/);
+});
+
+test('dimsFromName', () => {
+    assert.deepEqual(D.dimsFromName('Promo 1080x1920 story.mp4'), { width: 1080, height: 1920 });
+    assert.deepEqual(D.dimsFromName('banner_300×250.png'), { width: 300, height: 250 });
+    assert.equal(D.dimsFromName('Hiring_A_1x1.jpg'), null);
+});

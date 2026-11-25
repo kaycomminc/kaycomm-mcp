@@ -733,7 +733,13 @@ async function getDriveAccessToken() {
     return { token: data.access_token, error: null };
 }
 const driveCreative = require("./src/drive-creative");
-const driveClient = driveCreative.createDriveClient({ fetch: (...a) => fetchFn(...a), getToken: getDriveAccessToken });
+// DRIVE_BACKEND=mcp routes Drive through Google's Drive MCP server (required for
+// AI-agent access from 2027-02-01); default "rest" calls Drive REST v3.
+const DRIVE_BACKEND = (process.env.DRIVE_BACKEND || "rest").toLowerCase() === "mcp" ? "mcp" : "rest";
+const driveClient = driveCreative.createDriveClient({
+    fetch: (...a) => fetchFn(...a), getToken: getDriveAccessToken,
+    backend: DRIVE_BACKEND, describeImage: metaMedia.describeImage,
+});
 
 // Expand Drive inputs (a folder link, or file share links when Drive auth is
 // configured) into private-download entries. Other entries pass through.
