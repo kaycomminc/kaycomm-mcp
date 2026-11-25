@@ -107,6 +107,10 @@ function annotateResult(result, context) {
     if (v.error) errors.push(errorInfo({ message: typeof v.error === 'string' ? v.error : JSON.stringify(v.error), code: v.code }, at, a));
     for (const [key, child] of Object.entries(v)) {
       if (key === '_meta' || key === 'error') continue;
+      if (/_error$/.test(key) && typeof child === 'string') {
+        errors.push(errorInfo(child, `${at}.${key}`, a));
+        continue;
+      }
       if (key === 'errors' && Array.isArray(child)) {
         child.forEach((error, i) => {
           if (typeof error === 'string' || error?.message) errors.push(errorInfo(error, `${at}.errors.${i}`, a));
@@ -121,17 +125,34 @@ function annotateResult(result, context) {
   let status = result.error ? 'error' : errors.length ? 'partial_success' : 'success';
   const asRows = value => Array.isArray(value) ? value : [];
   const rows = result.accounts || result.results || (result.google || result.meta ? [...asRows(result.google), ...asRows(result.meta), ...asRows(result.stackadapt), ...asRows(result.linkedin)] : null);
-  let coverage;
-  if (Array.isArray(rows) && rows.length) {
-    const failed = rows.filter(r => r.error).length;
-    const skipped = asRows(result.skipped).length;
-    coverage = { total: rows.length + skipped, succeeded: rows.length - failed, failed, ...(skipped ? { skipped } : {}) };
-    if (failed === rows.length) status = 'error';
-  }
+  const platformRows = Array.isArray(result.google) || Array.isArray(result.meta)
+    ? [...asRows(result.google), ...asRows(result.meta), ...asRows(result.stackadapt), ...asRows(result.linkedin)]
+    : [];
+  const platformErrors = platformRows.filter(row => row.error && !row.account).length;
+  const accountRows = Array.isArray(rows) ? rows.filter(row => row.account) : [];
+  const failed = accountRows.filter(row => row.error).length;
+  const skipped = asRows(result.skipped).length;
+  const campaignPlatforms = ['google', 'meta', 'stackadapt'].filter(platform =>
+    result[platform] !== undefined || result[`${platform}_error`] !== undefined);
+  const failedCampaignPlatforms = campaignPlatforms.filter(platform => result[`${platform}_error`]);
+  const isCampaignReport = typeof result.date_range === 'string' && campaignPlatforms.length > 0;
+  const coverage = Array.isArray(rows) || isCampaignReport ? {
+    total: isCampaignReport ? campaignPlatforms.length : accountRows.length + skipped,
+    succeeded: isCampaignReport ? campaignPlatforms.length - failedCampaignPlatforms.length : accountRows.length - failed,
+    failed: isCampaignReport ? failedCampaignPlatforms.length : failed,
+    skipped,
+    platform_errors: isCampaignReport ? failedCampaignPlatforms.length : platformErrors,
+    empty: isCampaignReport ? false : accountRows.length === 0 && skipped === 0 && platformErrors === 0,
+  } : null;
+  if (!accountRows.length && platformErrors && !result.error) status = 'error';
+  if (accountRows.length && failed === accountRows.length && platformErrors === 0) status = 'error';
+  if (accountRows.length && failed === accountRows.length && platformErrors > 0) status = 'error';
+  if (isCampaignReport && failedCampaignPlatforms.length === campaignPlatforms.length) status = 'error';
   return { ...result, _meta: { status, request_id: context.requestId || randomUUID(),
     duration_ms: Date.now() - context.started, timezone: process.env.REPORT_TIMEZONE || 'America/New_York',
     build_sha: process.env.RAILWAY_GIT_COMMIT_SHA || process.env.BUILD_SHA || 'local',
-    ...(coverage ? { coverage } : {}), ...(warnings.length ? { warnings } : {}), errors } };
+    ...(coverage ? { coverage: { ...coverage, complete: status === 'success' } } : {}),
+    ...(warnings.length ? { warnings } : {}), errors } };
 }
 
 module.exports = { fault, decorateTool, validateArgs, uniqueName, writeIdentity, annotateResult, validDate };

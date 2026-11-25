@@ -19,7 +19,7 @@ const { runDigest } = require('./digest');
 
 let task = null;
 
-function registerDigest({ resolve = null, schedule = CONFIG.schedule } = {}) {
+function registerDigest({ resolve = null, getConfig = null, schedule = CONFIG.schedule } = {}) {
   if (task) task.stop();
 
   task = cron.schedule(
@@ -27,7 +27,7 @@ function registerDigest({ resolve = null, schedule = CONFIG.schedule } = {}) {
     async () => {
       const started = Date.now();
       try {
-        await runDigest({ resolve });
+        await runDigest({ resolve, getConfig });
         console.log(`[digest] delivered in ${Date.now() - started}ms`);
       } catch (err) {
         console.error('[digest] run failed:', err);
@@ -46,7 +46,7 @@ function registerDigest({ resolve = null, schedule = CONFIG.schedule } = {}) {
  *
  *   app.post('/digest/run', digestRoute());
  */
-function digestRoute({ resolve = null, token = process.env.DIGEST_TRIGGER_TOKEN } = {}) {
+function digestRoute({ resolve = null, getConfig = null, token = process.env.DIGEST_TRIGGER_TOKEN } = {}) {
   return async (req, res) => {
     // Fails closed. An unset token must not mean "no auth required" — this
     // endpoint spends money (Anthropic call) and sends mail, so an open one is
@@ -60,6 +60,7 @@ function digestRoute({ resolve = null, token = process.env.DIGEST_TRIGGER_TOKEN 
     try {
       const result = await runDigest({
         resolve,
+        getConfig,
         dryRun: req.query.dry === '1',
       });
       res.json({ ok: true, subject: result.subject, text: result.text });
@@ -74,7 +75,7 @@ function digestRoute({ resolve = null, token = process.env.DIGEST_TRIGGER_TOKEN 
  * digestRoute()'s req/res shape does not apply there.
  * Returns true if it handled the request.
  */
-async function handleDigestRequest(req, res, url, { resolve = null, token = process.env.DIGEST_TRIGGER_TOKEN } = {}) {
+async function handleDigestRequest(req, res, url, { resolve = null, getConfig = null, token = process.env.DIGEST_TRIGGER_TOKEN } = {}) {
   if (url.pathname !== '/digest/run') return false;
 
   const send = (code, body) => {
@@ -91,7 +92,7 @@ async function handleDigestRequest(req, res, url, { resolve = null, token = proc
   if (!authed) return send(401, { error: 'unauthorized' }), true;
 
   try {
-    const result = await runDigest({ resolve, dryRun: url.searchParams.get('dry') === '1' });
+    const result = await runDigest({ resolve, getConfig, dryRun: url.searchParams.get('dry') === '1' });
     send(200, { ok: true, subject: result.subject, text: result.text, delivery: result.delivery ?? null });
   } catch (err) {
     send(500, { ok: false, error: err.message });

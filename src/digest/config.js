@@ -16,30 +16,27 @@
 
 const fs = require('fs');
 
-// Build ACCOUNTS from accounts.json at require time
-function buildAccountsFromConfig() {
-    const accountsData = JSON.parse(fs.readFileSync(`${__dirname}/../../accounts.json`, 'utf8'));
-    const today = new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
+const OVERRIDES = {
+    'Summit Express': {
+        ecommerce: true,
+        note: 'Ecommerce. Report conversion value and ROAS alongside spend.',
+    },
+    'Eye Associates of NF': {
+        note: 'Media cap only. The $500 management fee is separate and not part of pacing.',
+    },
+    'Childrens Therapy Services of Colorado': {
+        label: 'CTSC',
+        note: '$250/week or $1,000/month Google. No Meta account.',
+    },
+    'Boulevard Carroll': {
+        label: 'BLVD Carroll',
+        note: 'Reported as a total plus the NC / other budget split.',
+    },
+};
 
+function buildAccountsFromData(accountsData, now = new Date()) {
+    const today = now.toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
     // Per-account overrides beyond name/platforms/flight
-    const OVERRIDES = {
-        'Summit Express': {
-            ecommerce: true,
-            note: 'Ecommerce. Report conversion value and ROAS alongside spend.',
-        },
-        'Eye Associates of NF': {
-            note: 'Media cap only. The $500 management fee is separate and not part of pacing.',
-        },
-        'Childrens Therapy Services of Colorado': {
-            label: 'CTSC',
-            note: '$250/week or $1,000/month Google. No Meta account.',
-        },
-        'Boulevard Carroll': {
-            label: 'BLVD Carroll',
-            note: 'Reported as a total plus the NC / other budget split.',
-        },
-    };
-
     // Collect all unique account names and their platforms
     const accountsByName = {};
     for (const [platform, accounts] of Object.entries(accountsData).filter(([k]) => k === 'google' || k === 'meta')) {
@@ -76,6 +73,10 @@ function buildAccountsFromConfig() {
     return accounts;
 }
 
+function buildAccountsFromConfig({ filePath = process.env.ACCOUNTS_FILE || `${__dirname}/../../accounts.json`, now = new Date() } = {}) {
+    return buildAccountsFromData(JSON.parse(fs.readFileSync(filePath, 'utf8')), now);
+}
+
 const ACCOUNTS = buildAccountsFromConfig();
 
 const CONFIG = {
@@ -102,4 +103,4 @@ const CONFIG = {
   includeStackAdapt: false,
 };
 
-module.exports = { CONFIG, ACCOUNTS };
+module.exports = { CONFIG, ACCOUNTS, buildAccountsFromConfig, buildAccountsFromData };

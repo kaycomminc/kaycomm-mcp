@@ -11,7 +11,7 @@
  * does not calculate them.
  */
 
-const { CONFIG } = require('./config');
+const { CONFIG, buildAccountsFromConfig } = require('./config');
 const { shapeRow, money, localParts } = require('./pacing');
 const { createClient } = require('./mcp-client');
 const { deliver } = require('./notify');
@@ -45,9 +45,9 @@ function indexPacing(raw) {
  * about yet. Keyed per platform on purpose: an account configured for Google
  * only should still flag its live Meta side rather than dropping it silently.
  */
-function unlistedAccounts(byPlatform) {
-  const known = new Set(CONFIG.ignoreUnlisted);
-  for (const a of CONFIG.accounts) {
+function unlistedAccounts(byPlatform, config = CONFIG) {
+  const known = new Set(config.ignoreUnlisted);
+  for (const a of config.accounts) {
     for (const p of a.platforms) known.add(`${p}:${a.name}`);
   }
   const out = [];
@@ -72,7 +72,7 @@ function unlistedAccounts(byPlatform) {
  * extra call. Note this range is month to date INCLUDING today, while pacing
  * spend stops at yesterday, so the two spend figures will not match.
  */
-async function gatherEcommerce(client, acct) {
+async function gatherEcommerce(client, acct, config) {
   try {
     const perf = await client.callToolWithRetry('get_campaign_performance', {
       account_name: acct.name,
@@ -112,12 +112,33 @@ async function gatherEcommerce(client, acct) {
   }
 }
 
-async function gatherAccounts(client) {
-  const raw = await client.callToolWithRetry('get_full_pacing', {});
+async function gatherAccounts(client, config = CONFIG) {
+  let raw;
+  try {
+    raw = await client.callToolWithRetry('get_full_pacing', {});
+  } catch (error) {
+    raw = { error: error.message || String(error) };
+  }
+  if (raw?.error || raw?._isError || raw?._meta?.status === 'error') {
+    const detail = raw.error || raw._meta?.errors?.map(error => error.message).filter(Boolean).join('; ') || 'MCP tool failed';
+    return {
+      date: raw?.date ?? localParts().iso,
+      spendThrough: raw?.spend_through ?? null,
+      day: raw?.day ?? null,
+      daysInMonth: raw?.days_in_month ?? null,
+      accounts: config.accounts.map(acct => ({
+        label: acct.label, account: acct.name, note: acct.note || null, flight: !!acct.flight,
+        platforms: acct.platforms.map(platform => ({ platform: platform === 'google' ? 'Google' : 'Meta', error: detail })),
+      })),
+      platformErrors: [{ platform: 'all', error: detail }],
+      unlisted: [],
+      pullStatus: 'error',
+    };
+  }
   const { byPlatform, platformErrors } = indexPacing(raw);
   const results = [];
 
-  for (const acct of CONFIG.accounts) {
+  for (const acct of config.accounts) {
     const entry = {
       label: acct.label,
       account: acct.name,
@@ -128,12 +149,12 @@ async function gatherAccounts(client) {
 
     for (const platform of acct.platforms) {
       const row = byPlatform[platform][acct.name];
-      const shaped = shapeRow(row, platform === 'google' ? 'Google' : 'Meta', CONFIG.thresholds);
+      const shaped = shapeRow(row, platform === 'google' ? 'Google' : 'Meta', config.thresholds);
       if (!row) shaped.missing = true;
       entry.platforms.push(shaped);
     }
 
-    if (acct.ecommerce) entry.performance = await gatherEcommerce(client, acct);
+    if (acct.ecommerce) entry.performance = await gatherEcommerce(client, acct, config);
 
     results.push(entry);
   }
@@ -145,7 +166,8 @@ async function gatherAccounts(client) {
     daysInMonth: raw?.days_in_month ?? null,
     accounts: results,
     platformErrors,
-    unlisted: unlistedAccounts(byPlatform),
+    unlisted: unlistedAccounts(byPlatform, config),
+    pullStatus: raw?._meta?.status || (platformErrors.length ? 'partial_success' : 'success'),
   };
 }
 
@@ -166,10 +188,13 @@ function buildSubject(data) {
   }
 
   const parts = [`Pacing digest ${data.date}`];
-  if (data.platformErrors?.length) {
-    parts.push(`${data.platformErrors.map((e) => e.platform).join(' + ')} data unavailable`);
+  if (data.pullStatus === 'error' || data.platformErrors?.length) {
+    const platforms = data.platformErrors?.map((e) => e.platform).filter(Boolean) || [];
+    parts.push(`${platforms.length ? [...new Set(platforms)].join(' + ') : 'Pacing'} data unavailable`);
   } else if (needsAction) {
     parts.push(`${needsAction} need${needsAction === 1 ? 's' : ''} attention`);
+  } else if (broken) {
+    parts.push('data incomplete');
   } else {
     parts.push('all on pace');
   }
@@ -197,6 +222,7 @@ ${JSON.stringify(data, null, 2)}
 
 Write the digest with these rules:
 - Open with a single line saying how many accounts need action today and how many are fine.
+- Count missing, errored, or unknown rows as unknown, not fine. If data is incomplete, say how many accounts could not be verified.
 - Then a "Needs attention" section listing only accounts with status "alert" or "warn", or where "exhausted" is true. For each: the account, platform, spend, budget, how far off pace, and the recommended daily budget. If a recommendation string is present, use it.
 - Then a "Flight accounts" section for accounts with flight: true — flight to date spend vs flight budget and recommended daily.
 - Then a one line "Everything else on pace" roll up naming the remaining accounts with no detail.
@@ -305,38 +331,45 @@ function fallbackDigest(data) {
   return lines.join('\n');
 }
 
-async function runDigest({ resolve = null, dryRun = false } = {}) {
+function buildStandaloneConfig(now = new Date()) {
+  return { ...CONFIG, accounts: buildAccountsFromConfig({ now }) };
+}
+
+async function runDigest({ resolve = null, getConfig = null, dryRun = false, now = new Date() } = {}) {
   const client = createClient({ resolve });
-  const data = await gatherAccounts(client);
-
-  let text;
   try {
-    text = await writeDigest(data);
-  } catch (err) {
-    console.error('Digest write failed, using fallback:', err.message);
-    text = fallbackDigest(data);
+    const config = getConfig ? await getConfig() : buildStandaloneConfig(now);
+    const data = await gatherAccounts(client, config);
+
+    let text;
+    try {
+      text = await writeDigest(data);
+    } catch (err) {
+      console.error('Digest write failed, using fallback:', err.message);
+      text = fallbackDigest(data);
+    }
+
+    const subject = buildSubject(data);
+
+    if (dryRun) {
+      console.log(`Subject: ${subject}\n`);
+      console.log(text);
+      return { text, subject, data };
+    }
+
+    const delivery = await deliver(text, { subject });
+    if (!delivery.skipped && !delivery.delivered.length) {
+      throw new Error(
+        `Digest built but delivery failed: ${delivery.failed
+          .map((f) => `${f.channel} (${f.error})`)
+          .join(', ')}`
+      );
+    }
+
+    return { text, subject, data, delivery };
+  } finally {
+    await client.close();
   }
-
-  const subject = buildSubject(data);
-
-  if (dryRun) {
-    console.log(`Subject: ${subject}\n`);
-    console.log(text);
-    return { text, subject, data };
-  }
-
-  const delivery = await deliver(text, { subject });
-  // Every configured channel failing is a failed run; the cron logs it and the
-  // manual trigger route surfaces it. One of several failing is not.
-  if (!delivery.skipped && !delivery.delivered.length) {
-    throw new Error(
-      `Digest built but delivery failed: ${delivery.failed
-        .map((f) => `${f.channel} (${f.error})`)
-        .join(', ')}`
-    );
-  }
-
-  return { text, subject, data, delivery };
 }
 
 module.exports = {
@@ -346,6 +379,7 @@ module.exports = {
   fallbackDigest,
   buildPrompt,
   buildSubject,
+  buildStandaloneConfig,
 };
 
 // Allow running by hand: node src/digest/digest.js --dry-run
