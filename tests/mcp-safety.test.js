@@ -174,7 +174,7 @@ test('annotateResult reports top-level errors, nested partial failures, and all-
     ],
   }, context);
   assert.equal(partial._meta.status, 'partial_success');
-  assert.deepEqual(partial._meta.coverage, { total: 2, succeeded: 1, failed: 1 });
+  assert.deepEqual(partial._meta.coverage, { total: 2, succeeded: 1, failed: 1, skipped: 0, platform_errors: 0, empty: false, complete: false });
   assert.equal(partial._meta.errors[0].account, 'bad-account');
   assert.equal(partial._meta.errors[0].code, 'RATE_LIMIT');
   assert.equal(partial._meta.errors[0].path, '$.results.1');
@@ -186,7 +186,7 @@ test('annotateResult reports top-level errors, nested partial failures, and all-
     ],
   }, context);
   assert.equal(allFailed._meta.status, 'error');
-  assert.deepEqual(allFailed._meta.coverage, { total: 2, succeeded: 0, failed: 2 });
+  assert.deepEqual(allFailed._meta.coverage, { total: 2, succeeded: 0, failed: 2, skipped: 0, platform_errors: 0, empty: false, complete: false });
   assert.equal(allFailed._meta.errors.length, 2);
 
   const nestedErrors = annotateResult({
@@ -202,6 +202,49 @@ test('annotateResult reports top-level errors, nested partial failures, and all-
   assert.equal(nestedErrors._meta.errors[0].account, 'nested-account');
   assert.equal(nestedErrors._meta.errors[0].code, 'RATE_LIMIT');
   assert.equal(nestedErrors._meta.errors[1].path, '$.errors.1');
+});
+
+test('annotateResult separates platform failures from pacing account coverage', () => {
+  const result = annotateResult({
+    google: [{ account: 'Acme', spend: 10 }],
+    meta: [{ error: 'authentication failed' }],
+    skipped: [{ account: 'Archived' }],
+  }, { requestId: 'coverage-test', started: Date.now() });
+  assert.equal(result._meta.status, 'partial_success');
+  assert.deepEqual(result._meta.coverage, { total: 2, succeeded: 1, failed: 0, skipped: 1, platform_errors: 1, empty: false, complete: false });
+  assert.equal(result._meta.errors.length, 1);
+  assert.equal(result._meta.errors[0].path, '$.meta.0');
+});
+
+test('annotateResult reports campaign platform errors and distinguishes empty success', () => {
+  const partial = annotateResult({
+    date_range: 'THIS_MONTH',
+    google: { account: 'Acme', campaigns: [] },
+    meta_error: 'authentication failed',
+  }, { requestId: 'campaign-partial', started: Date.now() });
+  assert.equal(partial._meta.status, 'partial_success');
+  assert.deepEqual(partial._meta.coverage, { total: 2, succeeded: 1, failed: 1, skipped: 0, platform_errors: 1, empty: false, complete: false });
+  assert.equal(partial._meta.errors[0].path, '$.meta_error');
+
+  const empty = annotateResult({
+    date_range: 'THIS_MONTH',
+    google: { account: 'Acme', campaigns: [] },
+  }, { requestId: 'campaign-empty', started: Date.now() });
+  assert.equal(empty._meta.status, 'success');
+  assert.deepEqual(empty._meta.coverage, { total: 1, succeeded: 1, failed: 0, skipped: 0, platform_errors: 0, empty: false, complete: true });
+
+  const failed = annotateResult({
+    date_range: 'THIS_MONTH',
+    google_error: 'authentication failed',
+  }, { requestId: 'campaign-failed', started: Date.now() });
+  assert.equal(failed._meta.status, 'error');
+
+  const emptyPacing = annotateResult({ google: [], meta: [], skipped: [] }, { requestId: 'empty-pacing', started: Date.now() });
+  assert.equal(emptyPacing._meta.status, 'success');
+  assert.deepEqual(emptyPacing._meta.coverage, { total: 0, succeeded: 0, failed: 0, skipped: 0, platform_errors: 0, empty: true, complete: true });
+
+  const mutation = annotateResult({ success: true, campaign: 'Acme' }, { requestId: 'mutation', started: Date.now() });
+  assert.equal(Object.hasOwn(mutation._meta, 'coverage'), false);
 });
 
 test('FileWriteStore permits only one concurrent reservation for a key', async () => {

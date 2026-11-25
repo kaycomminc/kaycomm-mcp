@@ -4,10 +4,12 @@ Custom MCP server (Node.js, HTTP/SSE, deployed on Railway) connecting Claude to
 the Google Ads API and Meta Graph API across accounts under MCC `8621281595`.
 
 - Entry point: `server.js`
-- Account config: `accounts.json` — **committed to git**; Railway picks up config
-  changes on deploy, so an account edit is not live until it is pushed.
+- Account config: `accounts.json` — **committed to git**. With GitHub sync
+  configured, the running server refreshes changes (default every five minutes);
+  account-only commits do not trigger a Railway rebuild. Verify runtime refresh.
 - Local tool runs: `node test.js <tool_name> '<json args>'`
 - Unit tests: `npm test`
+- Development playbook: [AGENTS.md](AGENTS.md), shared by Codex and Claude.
 
 API versions are pinned at the top of `server.js`
 (`GOOGLE_API_VERSION`, `META_API_VERSION`) and surfaced with an age warning by
