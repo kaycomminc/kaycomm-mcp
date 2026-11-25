@@ -35,7 +35,7 @@ const LAL_TARGETING = {
 };
 const RT_TARGETING = { geo_locations: { countries: ['US'] }, custom_audiences: [{ id: '903' }], exclusions: { custom_audiences: [{ id: '902' }] } };
 const ADSETS = [
-    { id: '120249283942800240', name: 'Lookalike 1%', status: 'ACTIVE', effective_status: 'ACTIVE', end_time: FUTURE, campaign_id: 'c1', campaign: { id: 'c1', name: 'NSW | Prospecting | November 2026' }, targeting: LAL_TARGETING, optimization_goal: 'OFFSITE_CONVERSIONS' },
+    { id: '120249283942800240', name: 'Lookalike 1%', status: 'ACTIVE', effective_status: 'ACTIVE', end_time: FUTURE, campaign_id: 'c1', campaign: { id: 'c1', name: 'NSW | Prospecting | November 2026' }, targeting: LAL_TARGETING, optimization_goal: 'OFFSITE_CONVERSIONS', daily_min_spend_target: '500' },
     { id: '120249283952100240', name: 'Retargeting', status: 'PAUSED', effective_status: 'PAUSED', end_time: FUTURE, campaign_id: 'c2', campaign: { id: 'c2', name: 'NSW | Retargeting | November 2026' }, targeting: RT_TARGETING },
     { id: '3', name: 'Old Retargeting', status: 'ACTIVE', effective_status: 'ACTIVE', end_time: PAST, campaign_id: 'c2', campaign: { id: 'c2', name: 'NSW | Retargeting | November 2026' }, targeting: {} },
 ];
@@ -44,6 +44,9 @@ const AUDIENCES = {
     902: { id: '902', name: 'NSW Converters 180d', subtype: 'WEBSITE' },
     903: { id: '903', name: 'NSW Site Visitors 30d', subtype: 'WEBSITE' },
 };
+
+const SPEND = { '120249283942800240': { spend: '41.25', impressions: '1800' } };
+let failInsights = false;
 
 const calls = [];
 const json = (payload, status = 200) => ({ ok: status < 300, status, headers: { get: () => 'application/json' }, json: async () => payload });
@@ -65,6 +68,11 @@ global.fetch = async (input, options = {}) => {
             const name = f.find(x => x.field === 'name')?.value?.toLowerCase();
             const camps = [{ id: 'c1', name: 'NSW | Prospecting | November 2026' }, { id: 'c2', name: 'NSW | Retargeting | November 2026' }];
             return json({ data: camps.filter(c => !name || c.name.toLowerCase().includes(name)) });
+        }
+        if (parts[0] === 'act_nsw' && parts[1] === 'insights') {
+            if (failInsights) return json({ error: { message: 'insights down', code: 1 } }, 500);
+            const ids = JSON.parse(params.filtering || '[]').find(x => x.field === 'adset.id')?.value || [];
+            return json({ data: ids.filter(id => SPEND[id]).map(id => ({ adset_id: id, ...SPEND[id] })) });
         }
         if (parts[0] === 'act_nsw' && parts[1] === 'adsets') {
             const f = JSON.parse(params.filtering || '[]');
@@ -217,6 +225,50 @@ test('get_adset returns full raw targeting and resolved audiences in one lookup'
     assert.equal(r.daily_budget, 25);
     assert.deepEqual(r.campaign, { id: 'c1', name: 'NSW | Prospecting | November 2026', objective: 'OUTCOME_LEADS' });
     assert.equal(audienceLookups().length, 1);
+});
+
+test('list_adsets returns spend limits and this_month spend from one insights read', async () => {
+    calls.length = 0;
+    const r = await invoke('manage_meta', { account_name: 'Synthetic Southwest', action: 'list_adsets' });
+    const insights = calls.filter(c => c.path.endsWith('/act_nsw/insights'));
+    assert.equal(insights.length, 1);
+    assert.equal(insights[0].params.level, 'adset');
+    assert.equal(insights[0].params.date_preset, 'this_month');
+    const lal = r.adsets.find(a => a.name === 'Lookalike 1%');
+    const rt = r.adsets.find(a => a.name === 'Retargeting');
+    assert.equal(lal.daily_min_spend, 5);
+    assert.equal(lal.daily_spend_cap, null);
+    assert.deepEqual(lal.spend, { period: 'this_month', amount: 41.25, impressions: 1800 });
+    assert.deepEqual(rt.spend, { period: 'this_month', amount: 0, impressions: 0 });   // no row = $0
+    assert.equal(r.warnings, undefined);
+});
+
+test('get_adset spend_period maps to the Graph preset; none skips insights', async () => {
+    calls.length = 0;
+    const r = await invoke('manage_meta', { account_name: 'Synthetic Southwest', action: 'get_adset', adset_id: '120249283942800240', spend_period: 'lifetime' });
+    assert.equal(calls.find(c => c.path.endsWith('/act_nsw/insights')).params.date_preset, 'maximum');
+    assert.equal(r.daily_min_spend, 5);
+    assert.deepEqual(r.spend, { period: 'lifetime', amount: 41.25, impressions: 1800 });
+    calls.length = 0;
+    const none = await invoke('manage_meta', { account_name: 'Synthetic Southwest', action: 'get_adset', adset_id: '120249283942800240', spend_period: 'none' });
+    assert.ok(!calls.some(c => c.path.endsWith('/insights')));
+    assert.equal(none.spend, undefined);
+});
+
+test('ad set spend failure keeps the listing and marks spend as failed', async () => {
+    failInsights = true;
+    try {
+        const r = await invoke('manage_meta', { account_name: 'Synthetic Southwest', action: 'list_adsets' });
+        assert.ok(r.adsets.length > 0);
+        assert.ok(r.adsets.every(a => a.spend.amount === null && a.spend.error));
+        assert.ok(r.warnings.some(w => /spend lookup failed/.test(w)));
+    } finally { failInsights = false; }
+});
+
+test('resolveSpendPeriod defaults to this_month, none disables, unknown rejected', () => {
+    assert.equal(metaAdsets.resolveSpendPeriod(), 'this_month');
+    assert.equal(metaAdsets.resolveSpendPeriod('none'), null);
+    assert.throws(() => metaAdsets.resolveSpendPeriod('forever'), /Unknown spend_period/);
 });
 
 test('create_meta_campaign dry run: placements from targeting_raw, existing creative shown', async () => {

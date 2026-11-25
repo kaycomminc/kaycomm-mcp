@@ -5,10 +5,11 @@
 // campaign under a new objective.
 
 const ADSET_LIST_FIELDS = 'id,name,status,effective_status,start_time,end_time,daily_budget,lifetime_budget,' +
-  'optimization_goal,campaign_id,campaign{id,name},targeting';
+  'daily_min_spend_target,daily_spend_cap,optimization_goal,campaign_id,campaign{id,name},targeting';
 
 const ADSET_DETAIL_FIELDS = 'id,name,status,effective_status,targeting,optimization_goal,billing_event,' +
   'bid_strategy,bid_amount,bid_constraints,promoted_object,daily_budget,lifetime_budget,budget_remaining,' +
+  'daily_min_spend_target,daily_spend_cap,' +
   'start_time,end_time,destination_type,attribution_spec,is_dynamic_creative,' +
   'campaign_id,campaign{id,name,objective,bid_strategy,daily_budget,lifetime_budget}';
 
@@ -121,6 +122,8 @@ function shapeAdset(s, { audienceMap = null, includeRaw = false, delivery } = {}
     optimization_goal: s.optimization_goal || null,
     daily_budget: money(s.daily_budget),
     lifetime_budget: money(s.lifetime_budget),
+    daily_min_spend: money(s.daily_min_spend_target),
+    daily_spend_cap: money(s.daily_spend_cap),
     targeting: {
       age_min: t.age_min || null,
       age_max: t.age_max || null,
@@ -162,6 +165,8 @@ function shapeAdsetDetail(s, { audienceMap = null, delivery } = {}) {
     daily_budget: money(s.daily_budget),
     lifetime_budget: money(s.lifetime_budget),
     budget_remaining: money(s.budget_remaining),
+    daily_min_spend: money(s.daily_min_spend_target),
+    daily_spend_cap: money(s.daily_spend_cap),
     campaign_budget: (c.daily_budget || c.lifetime_budget)
       ? { daily_budget: money(c.daily_budget), lifetime_budget: money(c.lifetime_budget) } : null,
     start_time: s.start_time || null,
@@ -170,6 +175,34 @@ function shapeAdsetDetail(s, { audienceMap = null, delivery } = {}) {
     excluded_custom_audiences: aud.excluded_custom_audiences,
     targeting_raw: s.targeting || null,
   };
+}
+
+// ── ad set spend (manage_meta list_adsets / get_adset) ───────────────────────
+
+// spend_period → Graph insights date_preset. 'none' skips the insights call.
+const SPEND_PERIODS = {
+  today: 'today', yesterday: 'yesterday', this_month: 'this_month', last_month: 'last_month',
+  last_7d: 'last_7d', last_30d: 'last_30d', lifetime: 'maximum',
+};
+const DEFAULT_SPEND_PERIOD = 'this_month';
+
+function resolveSpendPeriod(input) {
+  const p = input == null || input === '' ? DEFAULT_SPEND_PERIOD : String(input);
+  if (p === 'none') return null;
+  if (!SPEND_PERIODS[p]) throw new Error(`Unknown spend_period '${p}'. Use ${Object.keys(SPEND_PERIODS).join(', ')} or none.`);
+  return p;
+}
+
+// Attach {period, amount, impressions} to each shaped ad set. Ad sets with no
+// insights row in the period spent $0; spendOk=false marks the lookup failed.
+function attachAdsetSpend(adsets, insightRows, period, { spendOk = true } = {}) {
+  const byId = new Map((insightRows || []).map(r => [String(r.adset_id), r]));
+  return adsets.map(a => ({
+    ...a,
+    spend: spendOk
+      ? { period, amount: parseFloat(byId.get(String(a.id))?.spend || 0), impressions: parseInt(byId.get(String(a.id))?.impressions || 0, 10) }
+      : { period, amount: null, impressions: null, error: 'spend lookup failed' },
+  }));
 }
 
 // ── create_meta_campaign dry-run display ─────────────────────────────────────
@@ -301,6 +334,7 @@ function planObjectiveDuplicate(tree, { objective, optimization_goal, billing_ev
 
 module.exports = {
   ADSET_LIST_FIELDS, ADSET_DETAIL_FIELDS, STATUS_BUCKETS, DEFAULT_STATUSES,
+  SPEND_PERIODS, DEFAULT_SPEND_PERIOD, resolveSpendPeriod, attachAdsetSpend,
   SOURCE_CAMPAIGN_FIELDS, SOURCE_ADSET_FIELDS,
   normalizeStatusFilter, buildAdsetFiltering, adsetBucket, collectAudienceIds, resolveAudienceNames,
   namedAudiences, shapeAdset, shapeAdsetDetail, placementSummary, audienceLine, existingCreativePreview,

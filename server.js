@@ -2013,6 +2013,23 @@ async function getMetaAdsetDetail(adsetId) {
     return { adset: metaAdsets.shapeAdsetDetail(row, { audienceMap, delivery: metaDelivery }), warnings };
 }
 
+// Ad set spend for one period: one insights read (level=adset, filtered to the
+// given ids) instead of one per ad set. Failure is returned, not thrown, so the
+// ad set listing still comes back with spend marked as failed.
+async function fetchAdsetSpend(accountId, adsetIds, period) {
+    if (!period || !adsetIds.length) return { rows: [], ok: true };
+    try {
+        const rows = await metaGetAll(`${metaActId(accountId)}/insights`, {
+            level: "adset", fields: "adset_id,spend,impressions",
+            date_preset: metaAdsets.SPEND_PERIODS[period], limit: 500,
+            filtering: JSON.stringify([{ field: "adset.id", operator: "IN", value: adsetIds.map(String) }]),
+        });
+        return { rows, ok: true };
+    } catch (e) {
+        return { rows: [], ok: false, error: e.message };
+    }
+}
+
 async function getMetaAds(accountId, filterName) {
     const params = {
         fields: "id,name,status,effective_status,creative{id,name,thumbnail_url,object_story_id},adset{id,name}",
@@ -7354,7 +7371,8 @@ function makeServer() {
                 "Dry run by default. Set confirm=true to apply changes. " +
                 "Actions: list_campaigns, list_adsets, get_adset, list_ads, list_creatives, get_creative_details, pause, resume, archive, set_daily_budget, duplicate. " +
                 "list_adsets filters in Graph by campaign, target (ad set name), status_filter and limit, and returns targeting_raw (full spec) plus custom/excluded audiences as {id, name}. " +
-                "get_adset returns one ad set's full targeting, optimization/billing/bid settings, promoted_object, budgets, schedule and campaign.",
+                "get_adset returns one ad set's full targeting, optimization/billing/bid settings, promoted_object, budgets, schedule and campaign. " +
+                "Both return daily_min_spend / daily_spend_cap (CBO ad set spend limits, dollars) and spend {period, amount, impressions} for spend_period (default this_month).",
             inputSchema: {
                 type: "object",
                 properties: {
@@ -7372,6 +7390,10 @@ function makeServer() {
                     },
                     limit: { type: "number", description: "list_adsets only: max ad sets to return (default 50, max 500)." },
                     adset_id: { type: "string", description: "get_adset: the ad set ID." },
+                    spend_period: {
+                        type: "string", enum: ["today", "yesterday", "this_month", "last_month", "last_7d", "last_30d", "lifetime", "none"],
+                        description: "list_adsets / get_adset: period for each ad set's spend (default this_month, account timezone). none skips the insights read.",
+                    },
                     level: {
                         type: "string",
                         description: "Whether target is a campaign, adset, or ad (default: campaign for duplicate, adset for others)",
@@ -8557,31 +8579,7 @@ function makeServer() {
                 required: ["account_name"],
             },
         },
-        {
-            name: "get_placements",
-            description: "Where Google Ads (YouTube / Display / Demand Gen) ads actually showed — placement report. " +
-                "view=channel (default) rolls up to YouTube channel, website domain or app; view=detail lists individual YouTube videos and pages (with their parent channel URL). " +
-                "Returns spend, impressions, clicks, CTR, conversions, and for video: views, view_rate, avg_cpv, cpv (quartile completion is not available on placement views). Sorted by spend, capped by top_n. " +
-                "Use to spot junk placements (kids content, apps, MFA sites) or low-completion channels to exclude. PMax is not covered (use get_pmax_channel_performance).",
-            inputSchema: {
-                type: "object",
-                properties: {
-                    account_name:  { type: "string", description: "Client name (partial match ok)" },
-                    campaign_name: { type: "string", description: "Campaign name filter (substring). Omit for all campaigns." },
-                    view:          { type: "string", enum: ["channel", "detail"], description: "channel (default) = channel/domain/app level; detail = individual videos/pages" },
-                    date_range: {
-                        type: "string",
-                        description: "THIS_MONTH (default), LAST_7_DAYS, LAST_30_DAYS, LAST_90_DAYS, LAST_MONTH, YEAR_TO_DATE, or CUSTOM (requires start_date + end_date)",
-                        enum: ["THIS_MONTH", "LAST_7_DAYS", "LAST_30_DAYS", "LAST_90_DAYS", "LAST_MONTH", "YEAR_TO_DATE", "CUSTOM"],
-                    },
-                    start_date:      { type: "string", description: "Start date YYYY-MM-DD (only with CUSTOM)" },
-                    end_date:        { type: "string", description: "End date YYYY-MM-DD (only with CUSTOM)" },
-                    top_n:           { type: "integer", description: "Max placements to return, by spend desc (default 50, max 500)" },
-                    min_impressions: { type: "integer", description: "Drop placements below this many impressions (default 0)" },
-                },
-                required: ["account_name"],
-            },
-        },
+        require("./src/google-placements-tool").tool,
         {
             name: "get_shopping_performance",
             description: "Product-level performance for Shopping and Performance Max retail campaigns, from shopping_performance_view. " +
@@ -10629,9 +10627,15 @@ async function dispatchToolCall(name, args = {}) {
                     result = { account: acctInfo.name, campaigns };
 
                 } else if (action === "list_adsets") {
+                    const spendPeriod = metaAdsets.resolveSpendPeriod(args.spend_period);
                     const r = await listMetaAdsetsFiltered(accountId, {
                         target: args.target, campaign: args.campaign, statusFilter: args.status_filter, limit: args.limit,
                     });
+                    if (spendPeriod) {
+                        const sp = await fetchAdsetSpend(accountId, r.adsets.map(a => a.id), spendPeriod);
+                        r.adsets = metaAdsets.attachAdsetSpend(r.adsets, sp.rows, spendPeriod, { spendOk: sp.ok });
+                        if (!sp.ok) r.warnings.push(`Ad set spend lookup failed: ${sp.error}`);
+                    }
                     result = {
                         account: acctInfo.name,
                         filters: { target: args.target || null, campaign: args.campaign || null, status_filter: r.statuses, limit: args.limit || 50 },
@@ -10648,7 +10652,13 @@ async function dispatchToolCall(name, args = {}) {
                     if (!adsetId) {
                         result = { error: "get_adset needs adset_id (numeric ad set ID). Run list_adsets to find it." };
                     } else {
+                        const spendPeriod = metaAdsets.resolveSpendPeriod(args.spend_period);
                         const r = await getMetaAdsetDetail(adsetId);
+                        if (spendPeriod) {
+                            const sp = await fetchAdsetSpend(accountId, [r.adset.id], spendPeriod);
+                            r.adset = metaAdsets.attachAdsetSpend([r.adset], sp.rows, spendPeriod, { spendOk: sp.ok })[0];
+                            if (!sp.ok) r.warnings.push(`Ad set spend lookup failed: ${sp.error}`);
+                        }
                         result = { account: acctInfo.name, ...r.adset, ...(r.warnings.length ? { warnings: r.warnings } : {}) };
                     }
 
@@ -13944,34 +13954,14 @@ async function dispatchToolCall(name, args = {}) {
         result = await handlePlacementsTool(args);
 
     } else if (name === "get_placements") {
-        const search    = (args.account_name || "").toLowerCase();
-        const dateRange = args.date_range || "THIS_MONTH";
-        const view      = args.view || "channel";
-        const match     = Object.entries(GOOGLE_ACCOUNTS).find(([, i]) => i.name.toLowerCase().includes(search));
-        if (!match) {
-            result = { error: `No Google account found matching '${args.account_name}'` };
-        } else if (!PLACEMENT_VIEWS[view]) {
-            result = { error: `Unknown view '${view}'. Valid: ${Object.keys(PLACEMENT_VIEWS).join(", ")}.` };
-        } else if (dateRange === "CUSTOM" && !(args.start_date && args.end_date)) {
-            result = { error: "date_range CUSTOM requires both start_date and end_date (YYYY-MM-DD)." };
-        } else {
-            const [cid, info] = match;
-            const { token, error: authErr } = await getGoogleAccessToken(cid);
-            if (authErr) { result = { error: `Auth: ${authErr}` }; }
-            else {
-                try {
-                    const dateClause = resolveGaqlDateClause(dateRange, args.start_date, args.end_date);
-                    const minImpr = Math.max(0, parseInt(args.min_impressions, 10) || 0);
-                    const report = await fetchPlacementPerformance(token, cid, info.mcc, dateClause, view, args.campaign_name, clampTopN(args.top_n, 50), minImpr);
-                    result = {
-                        account: info.name, date_range: dateRange, date_clause: dateClause, view,
-                        ...(args.campaign_name ? { campaign_filter: args.campaign_name } : {}),
-                        ...report,
-                        ...(report.totals.placements_total === 0 ? { note: "No placement data in this range (placement views only cover Display/Video/Demand Gen delivery)." } : {}),
-                    };
-                } catch (e) { result = { error: e.message }; }
-            }
-        }
+        result = await require("./src/google-placements-tool").handleGetPlacements(args, {
+            googleAccounts: GOOGLE_ACCOUNTS,
+            getGoogleAccessToken,
+            resolveGaqlDateClause,
+            fetchPlacementPerformance,
+            clampTopN,
+            placementViews: PLACEMENT_VIEWS,
+        });
 
     } else if (name === "get_shopping_performance") {
         const search    = (args.account_name || "").toLowerCase();
@@ -15403,6 +15393,10 @@ async function main() {
                 const { handleDigestRequest } = require("./src/digest/schedule");
                 await handleDigestRequest(req, res, url, {
                     resolve: (name) => (args) => handleToolCall(name, args),
+                    getConfig: () => ({
+                        ...require("./src/digest/config").CONFIG,
+                        accounts: require("./src/digest/config").buildAccountsFromData({ google: GOOGLE_ACCOUNTS, meta: META_ACCOUNTS }),
+                    }),
                 });
 
             } else if (url.pathname === "/mcp" || url.pathname.startsWith("/mcp/")) {
@@ -15464,7 +15458,13 @@ async function main() {
         if (process.env.DIGEST_ENABLED !== "0") {
             try {
                 const { registerDigest } = require("./src/digest/schedule");
-                registerDigest({ resolve: (name) => (args) => handleToolCall(name, args) });
+                registerDigest({
+                    resolve: (name) => (args) => handleToolCall(name, args),
+                    getConfig: () => ({
+                        ...require("./src/digest/config").CONFIG,
+                        accounts: require("./src/digest/config").buildAccountsFromData({ google: GOOGLE_ACCOUNTS, meta: META_ACCOUNTS }),
+                    }),
+                });
             } catch (err) {
                 console.error("[digest] failed to register, server continues:", err.message);
             }
