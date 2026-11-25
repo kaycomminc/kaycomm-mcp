@@ -9481,6 +9481,12 @@ function makeServer() {
                     start_date: { type: "string", description: "Start date YYYY-MM-DD (use instead of date_preset for custom range)" },
                     end_date: { type: "string", description: "End date YYYY-MM-DD (use with start_date)" },
                     campaign_name: { type: "string", description: "Filter to campaigns matching this name (optional)" },
+                    adset_name: { type: "string", description: "Filter to ad sets whose name contains this (optional)" },
+                    attribution: {
+                        type: "string",
+                        enum: ["default", "click_7d", "click_1d", "view_1d", "click_7d_view_1d", "ad_set_setting"],
+                        description: "Conversion attribution window for actions. default = Meta's 7d click + 1d view (includes view-through). click_7d = click-only, use to judge placements/retargeting. ad_set_setting = each ad set's own attribution setting.",
+                    },
                     level: {
                         type: "string",
                         enum: ["account", "campaign", "adset", "ad"],
@@ -14903,27 +14909,39 @@ async function dispatchToolCall(name, args = {}) {
         } else {
             const [accountId, info] = acctMatch;
             try {
+                const level = args.level || "account";
+                // Meta rejects platform_position alone (with action fields); it must be paired with publisher_platform.
+                const breakdowns = args.breakdown === "platform_position" ? "publisher_platform,platform_position" : args.breakdown;
+                const nameFields = level === "ad" ? ",campaign_name,adset_name,ad_name"
+                    : level === "adset" ? ",campaign_name,adset_name"
+                    : level === "campaign" ? ",campaign_name" : "";
                 const params = {
-                    fields: "spend,impressions,clicks,ctr,cpc,cpm,actions,cost_per_action_type,reach,frequency",
-                    breakdowns: args.breakdown,
+                    fields: "spend,impressions,clicks,ctr,cpc,cpm,actions,cost_per_action_type,reach,frequency" + nameFields,
+                    breakdowns,
                 };
                 const datePreset = args.date_preset || (args.start_date ? undefined : "last_30d");
                 if (datePreset) params.date_preset = datePreset;
                 if (args.start_date && args.end_date) {
                     params.time_range = JSON.stringify({ since: args.start_date, until: args.end_date });
                 }
-                const level = args.level || "account";
-                let endpoint = `${metaActId(accountId)}/insights`;
-                if (level === "campaign") endpoint = `${metaActId(accountId)}/insights`;
-                if (args.campaign_name && level !== "account") {
-                    params.filtering = JSON.stringify([{ field: "campaign.name", operator: "CONTAIN", value: args.campaign_name }]);
-                }
+                const endpoint = `${metaActId(accountId)}/insights`;
+                const filters = [];
+                if (args.campaign_name) filters.push({ field: "campaign.name", operator: "CONTAIN", value: args.campaign_name });
+                if (args.adset_name) filters.push({ field: "adset.name", operator: "CONTAIN", value: args.adset_name });
+                if (filters.length) params.filtering = JSON.stringify(filters);
                 params.level = level;
                 params.limit = 200;
+                // Insights defaults to 7d_click + 1d_view regardless of the ad set's setting, so view-through
+                // conversions inflate retargeting/cheap-impression placements. Let callers pick the window.
+                const ATTRIBUTION_WINDOWS = { click_7d: ["7d_click"], click_1d: ["1d_click"], view_1d: ["1d_view"], click_7d_view_1d: ["7d_click", "1d_view"] };
+                const attribution = args.attribution || "default";
+                if (ATTRIBUTION_WINDOWS[attribution]) params.action_attribution_windows = JSON.stringify(ATTRIBUTION_WINDOWS[attribution]);
+                else if (attribution === "ad_set_setting") params.use_unified_attribution_setting = true;
 
                 const rows = await metaGetAll(endpoint, params);
                 const formatted = rows.map(r => {
                     const row = {
+                        ...(args.breakdown === "platform_position" ? { publisher_platform: r.publisher_platform } : {}),
                         [args.breakdown]: r[args.breakdown],
                         spend: parseFloat(r.spend || 0),
                         impressions: parseInt(r.impressions || 0),
@@ -14933,12 +14951,20 @@ async function dispatchToolCall(name, args = {}) {
                         cpm: parseFloat(r.cpm || 0),
                         reach: parseInt(r.reach || 0),
                     };
+                    // With action_attribution_windows, each action carries per-window keys (e.g. "7d_click");
+                    // `value` stays on Meta's default window, so sum the requested windows instead.
+                    const windows = ATTRIBUTION_WINDOWS[attribution];
+                    const windowValue = a => windows
+                        ? windows.reduce((s, w) => s + parseFloat(a[w] || 0), 0)
+                        : parseFloat(a.value);
                     if (r.actions) {
                         for (const a of r.actions) {
-                            row[`actions_${a.action_type}`] = parseInt(a.value);
+                            const n = windowValue(a);
+                            row[`actions_${a.action_type}`] = n;
+                            if (windows && n > 0) row[`cost_per_${a.action_type}`] = row.spend / n;
                         }
                     }
-                    if (r.cost_per_action_type) {
+                    if (r.cost_per_action_type && !windows) {
                         for (const a of r.cost_per_action_type) {
                             row[`cost_per_${a.action_type}`] = parseFloat(a.value);
                         }
@@ -14950,7 +14976,7 @@ async function dispatchToolCall(name, args = {}) {
                     }
                     return row;
                 });
-                result = { account: info.name, breakdown: args.breakdown, level, date_preset: datePreset, total_rows: formatted.length, rows: formatted };
+                result = { account: info.name, breakdown: args.breakdown, level, date_preset: datePreset, attribution, total_rows: formatted.length, rows: formatted };
             } catch (e) { result = { error: e.message }; }
         }
 
